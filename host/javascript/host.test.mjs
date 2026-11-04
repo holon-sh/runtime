@@ -355,6 +355,10 @@ test(
     assert.match(asset.headers.get("content-type"), /text\/css/);
     const head = await fetch(home, { method: "HEAD" });
     assert.equal(head.headers.get("content-length"), String(Buffer.byteLength(html)));
+    const partial = await fetch(home, { headers: { Range: "bytes=0-1" } });
+    assert.equal(partial.status, 206);
+    assert.equal(partial.headers.get("content-range"), `bytes 0-1/${Buffer.byteLength(html)}`);
+    assert.equal(await partial.text(), html.slice(0, 2));
     for (const path of [
       "/%2eprivate",
       "/%2findex.html",
