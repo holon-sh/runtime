@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 )
 
@@ -68,10 +67,7 @@ func frontend(directory string) (http.Handler, error) {
 		}
 		contentType := cmp.Or(mime.TypeByExtension(filepath.Ext(name)), "application/octet-stream")
 		w.Header().Set("Content-Type", contentType)
-		w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
 		w.Header().Set("X-Content-Type-Options", "nosniff")
-		if r.Method != http.MethodHead {
-			_, _ = file.WriteTo(w)
-		}
+		http.ServeContent(w, r, info.Name(), info.ModTime(), file)
 	}), nil
 }

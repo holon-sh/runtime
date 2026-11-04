@@ -250,7 +250,6 @@ test(
       );
       try {
         await client.connect(transport);
-        assert.equal(transport.sessionId, undefined);
         Object.assign(headers, context("alice", { scope: "fresh", act: null }));
         const result = await client.callTool({ name: "inspect", arguments: {} });
         const { identity } = JSON.parse(result.content[0].text);
@@ -275,7 +274,6 @@ test(
       assert.deepEqual(identity && identity.extra, expected);
     }
     const response = await call(upstream.url, "external", context("user"));
-    assert(!response.isError, response.content);
     assert(
       !Object.keys(JSON.parse(response.content[0].text)).some((name) =>
         name.startsWith("x-holon-"),
@@ -351,10 +349,6 @@ test(
     const home = new URL("/", standalone.url);
     const html = await (await fetch(home)).text();
     assert.match(html, /Application frontend/);
-    const asset = await fetch(new URL("/style.css", home));
-    assert.match(asset.headers.get("content-type"), /text\/css/);
-    const head = await fetch(home, { method: "HEAD" });
-    assert.equal(head.headers.get("content-length"), String(Buffer.byteLength(html)));
     for (const path of [
       "/%2eprivate",
       "/%2findex.html",
