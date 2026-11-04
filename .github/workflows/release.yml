@@ -1,0 +1,32 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: read
+jobs:
+  build:
+    uses: ./.github/workflows/ci.yml
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: runtime-payloads
+          path: dist
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          (cd dist && sha256sum --check SHA256SUMS)
+          prerelease=""
+          case "$TAG" in *-*) prerelease="--prerelease" ;; esac
+          gh release create "$TAG" --repo "$REPO" --title "runtime ${TAG#v}" --target "$GITHUB_SHA" $prerelease \
+            --notes "Application runtime for Holon app images. Import the host with \`go get github.com/holon-sh/runtime@$TAG\` or download the \`holon-mcp-runtime\` payloads below." \
+            dist/holon-mcp-runtime-linux-amd64 dist/holon-mcp-runtime-linux-arm64 dist/SHA256SUMS
