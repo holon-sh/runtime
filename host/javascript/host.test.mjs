@@ -31,6 +31,9 @@ async function app(t, peers = {}, extra = {}) {
       "--transport=hosted-http",
       "--",
       runtime,
+      ...(runtime.endsWith("deno")
+        ? ["run", "--allow-all", "--node-modules-dir=manual"]
+        : []),
       fileURLToPath(new URL(python ? "../python/testdata/entry.py" : "./testdata/entry.mjs", import.meta.url)),
     ],
     {
