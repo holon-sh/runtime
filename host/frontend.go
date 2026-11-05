@@ -1,13 +1,19 @@
 package host
 
 import (
+	"bytes"
 	"cmp"
 	"errors"
+	"io"
 	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
+
+	"github.com/holon-sh/protocol"
+	"github.com/holon-sh/runtime/metadata"
 )
 
 func within(root, name string) bool {
@@ -18,6 +24,16 @@ func within(root, name string) bool {
 func frontend(directory string) (http.Handler, error) {
 	if directory == "" {
 		return http.NotFoundHandler(), nil
+	}
+	var site *metadata.Runtime
+	if raw := os.Getenv(metadata.Environment); raw != "" {
+		site = new(metadata.Runtime)
+		if err := protocol.DecodeJSONNonNull([]byte(raw), site); err != nil {
+			return nil, err
+		}
+		if err := site.Validate(); err != nil {
+			return nil, err
+		}
 	}
 	application, err := os.Getwd()
 	if err != nil {
@@ -68,6 +84,16 @@ func frontend(directory string) (http.Handler, error) {
 		contentType := cmp.Or(mime.TypeByExtension(filepath.Ext(name)), "application/octet-stream")
 		w.Header().Set("Content-Type", contentType)
 		w.Header().Set("X-Content-Type-Options", "nosniff")
+		if site != nil && strings.HasPrefix(contentType, "text/html") {
+			document, err := io.ReadAll(file)
+			if err != nil {
+				http.Error(w, "Frontend unavailable", http.StatusInternalServerError)
+				return
+			}
+			document = metadata.Inherit(document, *site, r.URL.Path)
+			http.ServeContent(w, r, info.Name(), time.Time{}, bytes.NewReader(document))
+			return
+		}
 		http.ServeContent(w, r, info.Name(), info.ModTime(), file)
 	}), nil
 }
