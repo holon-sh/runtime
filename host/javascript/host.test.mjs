@@ -5,7 +5,7 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { cp, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { cp, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import {
   Client,
@@ -342,13 +342,21 @@ test(
       {
         HOLON_MCP_RUNTIME_CONFIG: undefined,
         TEST_FRONTEND: pathToFileURL(join(directory, "web/")).href,
+        HOLON_SITE_METADATA: JSON.stringify({
+          site: { name: "Shared site", image: { url: "/social.png" } },
+          origin: "https://site.example", mount: "/manuals",
+        }),
       },
     );
     const result = await call(standalone.url, "inspect", context("forged"));
     assert.equal(JSON.parse(result.content[0].text).identity, null);
     const home = new URL("/", standalone.url);
     const html = await (await fetch(home)).text();
-    assert.match(html, /Application frontend/);
+    assert.match(html, /<h1>Application frontend<\/h1>/);
+    assert.match(html, /property="og:title" content="Application frontend"/);
+    assert.match(html, /property="og:image" content="https:\/\/site.example\/social.png"/);
+    const css = await fetch(new URL("/style.css", home));
+    assert.equal(await css.text(), await readFile(join(directory, "web/style.css"), "utf8"));
     for (const path of [
       "/%2eprivate",
       "/%2findex.html",

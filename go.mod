@@ -5,6 +5,7 @@ go 1.27.0
 require (
 	github.com/holon-sh/mcp-bridge v0.0.4
 	github.com/holon-sh/protocol v0.0.1-dev.2
+	golang.org/x/net v0.53.0
 )
 
 require (
@@ -15,6 +16,6 @@ require (
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	golang.org/x/oauth2 v0.35.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
-	golang.org/x/sys v0.41.0 // indirect
+	golang.org/x/sys v0.43.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 )
