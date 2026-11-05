@@ -24,6 +24,7 @@ func TestHTMLInheritsSiteMetadataWithoutReplacingPageOverrides(t *testing.T) {
 			`property="og:image:width" content="1200"`, `rel="icon" href="https://tenant.example/favicon.svg"`,
 			`name="theme-color" content="#000000" media="(prefers-color-scheme: dark)"`,
 		}, nil},
+		{"partial theme", `<title>App</title><meta name="theme-color" content="red" media="(prefers-color-scheme:light)">`, []string{`name="theme-color" content="#000000" media="(prefers-color-scheme: dark)"`}, []string{"#ffffff"}},
 		{"overrides", `<title>Manual</title><meta property="og:title" content="Custom"><meta property="og:image" content="/own.png"><link rel="icon" href="/own.svg"><meta name="theme-color" content="red">`, []string{
 			`property="og:title" content="Custom"`, `property="og:image" content="/own.png"`, `rel="icon" href="/own.svg"`,
 			`property="og:video" content="https://cdn.example/movie.mp4"`,

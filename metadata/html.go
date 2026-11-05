@@ -48,20 +48,26 @@ func Inherit(document []byte, settings Runtime, requestPath string) []byte {
 			case "title":
 				inTitle = true
 			case "meta":
-				var property, name string
+				var property, name, media string
 				for _, attribute := range token.Attr {
 					switch attribute.Key {
 					case "property":
 						property = attribute.Val
 					case "name":
 						name = attribute.Val
+					case "media":
+						media = attribute.Val
 					}
 				}
 				if property != "" {
 					seen["property:"+strings.ToLower(property)] = true
 				}
 				if name != "" {
-					seen["name:"+strings.ToLower(name)] = true
+					key := "name:" + strings.ToLower(name)
+					if strings.EqualFold(name, "theme-color") {
+						key += ":" + strings.Join(strings.Fields(strings.ToLower(media)), "")
+					}
+					seen[key] = true
 				}
 			case "link":
 				var relations string
@@ -128,7 +134,7 @@ func missingHead(settings Runtime, requestPath, title string, seen map[string]bo
 	}
 	for _, theme := range []struct{ scheme, color string }{{"light", settings.Site.ThemeColor}, {"dark", settings.Site.DarkThemeColor}} {
 		media := "(prefers-color-scheme: " + theme.scheme + ")"
-		if theme.color != "" && !seen["name:theme-color"] {
+		if theme.color != "" && !seen["name:theme-color:"] && !seen["name:theme-color:(prefers-color-scheme:"+theme.scheme+")"] {
 			fmt.Fprintf(&head, `<meta name="theme-color" content="%s" media="%s">`, html.EscapeString(theme.color), media)
 		}
 	}
