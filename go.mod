@@ -5,6 +5,7 @@ go 1.27.0
 require (
 	github.com/holon-sh/mcp-bridge v0.0.4
 	github.com/holon-sh/protocol v0.0.1-dev.2
+	github.com/klauspost/compress v1.19.2
 )
 
 require (

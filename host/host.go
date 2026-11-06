@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/holon-sh/protocol"
 	"github.com/holon-sh/protocol/runtimecontract"
@@ -29,13 +30,18 @@ type scope struct {
 }
 
 type host struct {
-	callers     []string
-	peers       map[string]*url.URL
-	transport   *http.Transport
-	application http.Handler
-	frontend    http.Handler
-	mu          sync.Mutex
-	scopes      map[string]*scope
+	callers      []string
+	peers        map[string]*url.URL
+	transport    *http.Transport
+	image        string // the application directory, which an overlay falls back to and which is never removed
+	reloadSecret string
+	reloading    atomic.Bool
+	reloads      chan reloadJob
+	mu           sync.Mutex
+	application  http.Handler // nil from a restart's start until its child is ready
+	frontend     http.Handler
+	starting     *process
+	scopes       map[string]*scope
 }
 
 func newHost() (*host, error) {
@@ -59,11 +65,25 @@ func newHost() (*host, error) {
 	transport.Proxy = nil
 	return &host{
 		callers: settings.Callers, peers: peers, transport: transport,
+		reloadSecret: os.Getenv(reloadSecretEnv), reloads: make(chan reloadJob),
 		scopes: map[string]*scope{},
 	}, nil
 }
 
 func (h *host) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// A reload authenticates with its secret, not platform context. Without a secret the path is like any other.
+	if h.reloadSecret != "" && r.Method == http.MethodPost && r.URL.Path == reloadPath {
+		h.reload(w, r)
+		return
+	}
+	h.mu.Lock()
+	application, frontend := h.application, h.frontend
+	h.mu.Unlock()
+	if application == nil {
+		w.Header().Set("Retry-After", "1")
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "application restarting"})
+		return
+	}
 	r = r.Clone(r.Context())
 	var identity *identity
 	var token string
@@ -80,7 +100,7 @@ func (h *host) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path != "/mcp" {
 		if slices.Contains([]string{http.MethodGet, http.MethodHead}, r.Method) {
-			h.frontend.ServeHTTP(w, r)
+			frontend.ServeHTTP(w, r)
 		} else {
 			http.NotFound(w, r)
 		}
@@ -103,7 +123,7 @@ func (h *host) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.mu.Unlock()
 	}()
 	r.Header.Set(runtimecontract.ScopeHeader, id)
-	h.application.ServeHTTP(w, r)
+	application.ServeHTTP(w, r)
 }
 
 func (h *host) context(w http.ResponseWriter, r *http.Request) {
@@ -177,13 +197,24 @@ func (h *host) proxy(rewrite func(*httputil.ProxyRequest)) *httputil.ReverseProx
 	}
 }
 
-func (h *host) connect(port uint16) {
+func (h *host) connect(port uint16, frontend http.Handler) {
 	target := &url.URL{Scheme: "http", Host: "127.0.0.1:" + strconv.Itoa(int(port))}
-	h.application = h.proxy(func(p *httputil.ProxyRequest) {
+	application := h.proxy(func(p *httputil.ProxyRequest) {
 		p.SetURL(target)
 		p.Out.Host = p.In.Host
 		for _, name := range []string{"X-Forwarded-Host", "X-Forwarded-Proto"} {
 			p.Out.Header[name] = p.In.Header[name]
 		}
 	})
+	h.mu.Lock()
+	h.application, h.frontend = application, frontend
+	h.mu.Unlock()
+	// Connections to a previous child are dead, and a request that reuses one cannot always be retried.
+	h.transport.CloseIdleConnections()
+}
+
+func (h *host) disconnect() {
+	h.mu.Lock()
+	h.application, h.frontend = nil, nil
+	h.mu.Unlock()
 }
