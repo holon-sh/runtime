@@ -20,16 +20,15 @@ type identity struct {
 	Extra     map[string]any `json:"extra"`
 }
 
-func admit(r *http.Request, callers []string) (*identity, bool) {
+func admit(r *http.Request) (*identity, bool) {
 	token, caller := r.Header.Get(runtimecontract.ContextHeader), r.Header.Get(runtimecontract.CallerHeader)
-	if len(r.Header.Values(runtimecontract.CallerHeader)) != 1 {
+	if len(r.Header.Values(runtimecontract.CallerHeader)) != 1 || !strings.HasPrefix(caller, "spiffe://") {
 		return nil, false
 	}
-	discovery := runtimecontract.AppDiscoveryRequest(r.Method, r.URL.Path, r.Header.Get("Mcp-Method"))
-	if token == "" && discovery && slices.Contains(callers, caller) {
+	switch contexts := len(r.Header.Values(runtimecontract.ContextHeader)); {
+	case contexts == 0:
 		return nil, true
-	}
-	if len(r.Header.Values(runtimecontract.ContextHeader)) != 1 || len(token) > 16384 || !strings.HasPrefix(caller, "spiffe://") {
+	case contexts > 1 || len(token) > 16384:
 		return nil, false
 	}
 	var claims struct {

@@ -1,5 +1,4 @@
 import process from "node:process";
-import assert from "node:assert/strict";
 import { once } from "node:events";
 import { createInterface } from "node:readline";
 import {
@@ -119,10 +118,11 @@ export default {
       emit("stream-peer-ready");
       void (async () => {
         await peer.text().catch(() => {});
-        await assert.rejects(fetch(process.env.PEER_MCP_URL), {
-          message: "Holon peer call rejected or cancelled",
-        });
-        emit("stream-late-denied");
+        const result = await callPeer("inspect");
+        console.log(JSON.stringify({
+          event: "stream-late-forwarded",
+          identity: JSON.parse(result.content[0].text).identity,
+        }));
       })();
       return new Response(
         new ReadableStream({

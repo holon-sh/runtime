@@ -2,11 +2,13 @@ package host
 
 import (
 	"cmp"
+	"context"
 	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/holon-sh/protocol"
 	"github.com/holon-sh/protocol/runtimecontract"
@@ -14,51 +16,175 @@ import (
 
 func TestAdmission(t *testing.T) {
 	const api = "spiffe://cluster.local/ns/control/sa/api"
-	const authz = "spiffe://cluster.local/ns/control/sa/authz"
-	valid := `{"exp":4102444800,"aud":["https://holon.example"],"principal":{"iss":"issuer","sub":"user","client_id":"client"}}`
+	const reporter = "spiffe://cluster.local/ns/session/sa/reporter"
+	valid := `{"exp":4102444800,"aud":["https://holon.example"],"principal":{"iss":"issuer","sub":"user","client_id":"client","scope":"read write"}}`
+	principal := `{"token":"TOKEN","clientId":"client","scopes":["read","write"],"expiresAt":4102444800,"resource":"https://holon.example","extra":{"caller":"spiffe://edge","iss":"issuer","sub":"user"}}`
 	for _, tc := range []struct {
-		name, config, request, caller, claims string
-		admitted                              bool
+		name, config, request, caller, claims, duplicate, identity string
 	}{
-		{"valid context", "", "POST /mcp", "spiffe://edge", valid, true},
-		{"expired", "", "POST /mcp", "spiffe://edge", strings.Replace(valid, "4102444800", "1", 1), false},
-		{"missing expiry", "", "POST /mcp", "spiffe://edge", `{"aud":["https://holon.example"]}`, false},
-		{"multiple audiences", "", "POST /mcp", "spiffe://edge", `{"exp":4102444800,"aud":["https://one.example","https://two.example"]}`, false},
-		{"relative audience", "", "POST /mcp", "spiffe://edge", `{"exp":4102444800,"aud":["/relative"]}`, false},
-		{"invalid principal", "", "POST /mcp", "spiffe://edge", strings.Replace(valid, `"client_id":"client"`, `"client_id":null`, 1), false},
-		{"invalid scopes", "", "POST /mcp", "spiffe://edge", strings.Replace(valid, `"client_id":"client"`, `"client_id":"client","scope":[]`, 1), false},
-		{"control plane discovery", "", "POST /mcp server/discover", api, "", true},
-		{"control plane probe", "", "HEAD /", api, "", true},
-		{"control plane tool call", "", "POST /mcp tools/call", api, "", false},
-		{"control plane page", "", "GET /", api, "", false},
-		{"other caller", "", "POST /mcp tools/list", "spiffe://cluster.local/ns/control/sa/other-service", "", false},
-		{"second configured caller", "", "POST /mcp tools/list", authz, "", true},
-		{"no configured callers", `{"version":2,"peers":{}}`, "POST /mcp tools/list", api, "", false},
+		{"principal context", "", "POST /mcp tools/call", "spiffe://edge", valid, "", principal},
+		{"principal-less context", "", "POST /mcp tools/call", "spiffe://edge", `{"exp":4102444800,"aud":["https://holon.example"]}`, "", "null"},
+		{"expired", "", "POST /mcp tools/call", "spiffe://edge", strings.Replace(valid, "4102444800", "1", 1), "", ""},
+		{"missing expiry", "", "POST /mcp tools/call", "spiffe://edge", `{"aud":["https://holon.example"]}`, "", ""},
+		{"multiple audiences", "", "POST /mcp tools/call", "spiffe://edge", `{"exp":4102444800,"aud":["https://one.example","https://two.example"]}`, "", ""},
+		{"relative audience", "", "POST /mcp tools/call", "spiffe://edge", `{"exp":4102444800,"aud":["/relative"]}`, "", ""},
+		{"invalid principal", "", "POST /mcp tools/call", "spiffe://edge", strings.Replace(valid, `"client_id":"client"`, `"client_id":null`, 1), "", ""},
+		{"invalid scopes", "", "POST /mcp tools/call", "spiffe://edge", strings.Replace(valid, `"scope":"read write"`, `"scope":[]`, 1), "", ""},
+		{"workload call", "", "POST /mcp tools/call", reporter, "", "", "null"},
+		{"control plane discovery", "", "POST /mcp server/discover", api, "", "", "null"},
+		{"control plane probe", "", "HEAD /", api, "", "", "null"},
+		{"caller outside the mesh", "", "POST /mcp tools/call", "https://edge", "", "", ""},
+		{"two callers", "", "POST /mcp tools/call", "spiffe://edge", "", runtimecontract.CallerHeader, ""},
+		{"two contexts", "", "POST /mcp tools/call", "spiffe://edge", valid, runtimecontract.ContextHeader, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv(protocol.RuntimeConfigEnv, cmp.Or(tc.config, `{"version":2,"peers":{},"callers":["`+api+`","`+authz+`"]}`))
+			t.Setenv(protocol.RuntimeConfigEnv, cmp.Or(tc.config, `{"version":2,"peers":{},"callers":["`+api+`"]}`))
 			h, err := newHost()
 			if err != nil {
 				t.Fatal(err)
 			}
-			h.application = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
+			var identity string
+			h.application = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				context := httptest.NewRequestWithContext(r.Context(), http.MethodGet, "/context", nil)
+				context.SetPathValue("scope", r.Header.Get(runtimecontract.ScopeHeader))
+				response := httptest.NewRecorder()
+				h.context(response, context)
+				identity = strings.TrimSpace(response.Body.String())
+				w.WriteHeader(http.StatusNoContent)
+			})
 			h.frontend = h.application
 			method, target, _ := strings.Cut(tc.request, " ")
 			target, mcpMethod, _ := strings.Cut(target, " ")
 			r := httptest.NewRequestWithContext(t.Context(), method, target, nil)
 			r.Header.Set("Mcp-Method", mcpMethod)
 			r.Header.Set(runtimecontract.CallerHeader, tc.caller)
+			token := "header." + base64.RawURLEncoding.EncodeToString([]byte(tc.claims)) + ".signature"
 			if tc.claims != "" {
-				r.Header.Set(runtimecontract.ContextHeader, "header."+base64.RawURLEncoding.EncodeToString([]byte(tc.claims))+".signature")
+				r.Header.Set(runtimecontract.ContextHeader, token)
+			}
+			if tc.duplicate != "" {
+				r.Header.Add(tc.duplicate, r.Header.Get(tc.duplicate))
 			}
 			response := httptest.NewRecorder()
 			h.ServeHTTP(response, r)
 			want, cache := http.StatusNoContent, ""
-			if !tc.admitted {
+			if tc.identity == "" {
 				want, cache = http.StatusForbidden, "no-store"
 			}
 			if response.Code != want || response.Header().Get("Cache-Control") != cache {
 				t.Fatalf("admission: %d %v", response.Code, response.Header())
+			}
+			if tc.request != "HEAD /" && identity != strings.Replace(tc.identity, "TOKEN", token, 1) {
+				t.Fatalf("identity: %s", identity)
+			}
+		})
+	}
+}
+
+func TestPeerCalls(t *testing.T) {
+	const token = "header.claims.signature"
+	for _, tc := range []struct {
+		name, scope, header, context string
+		status                       int
+	}{
+		{"inside a request", "request", "", token, http.StatusOK},
+		{"inside a workload call", "workload", "", "", http.StatusOK},
+		{"outside a request", "", "", "", http.StatusOK},
+		{"after the request ended", "ended", "", "", http.StatusOK},
+		{"application credentials", "request", "Authorization", "", http.StatusForbidden},
+		{"application context", "", runtimecontract.ContextHeader, "", http.StatusForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var received http.Header
+			peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				received = r.Header.Clone()
+			}))
+			t.Cleanup(peer.Close)
+			t.Setenv(protocol.RuntimeConfigEnv, `{"version":2,"peers":{"crm":"`+peer.URL+`/mcp"}}`)
+			h, err := newHost()
+			if err != nil {
+				t.Fatal(err)
+			}
+			ended, cancel := context.WithCancel(t.Context())
+			cancel()
+			trace := http.Header{"Traceparent": {"00-trace-span-01"}}
+			h.scopes = map[string]*scope{
+				"request":  {ctx: t.Context(), token: token, trace: trace},
+				"workload": {ctx: t.Context(), trace: trace},
+				"ended":    {ctx: ended, token: token, trace: trace},
+			}
+			r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/peer/crm", nil)
+			r.SetPathValue("peer", "crm")
+			if tc.scope != "" {
+				r.Header.Set(runtimecontract.ScopeHeader, tc.scope)
+			}
+			if tc.header != "" {
+				r.Header.Set(tc.header, "Bearer app-token")
+			}
+			response := httptest.NewRecorder()
+			h.peer(response, r)
+			if response.Code != tc.status {
+				t.Fatalf("status: %d %s", response.Code, response.Body)
+			}
+			if tc.status != http.StatusOK {
+				if received != nil || response.Header().Get("X-Holon-Error") != "true" {
+					t.Fatalf("refusal: forwarded %v, headers %v", received, response.Header())
+				}
+				return
+			}
+			traced := tc.scope != "" && tc.scope != "ended"
+			if received.Get(runtimecontract.ContextHeader) != tc.context || received.Get(runtimecontract.ScopeHeader) != "" ||
+				(received.Get("Traceparent") == trace.Get("Traceparent")) != traced {
+				t.Fatalf("forwarded headers: %v", received)
+			}
+		})
+	}
+}
+
+func TestPeerCallLifetime(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		inbound bool
+	}{{"inbound request", true}, {"application request", false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			started := make(chan struct{})
+			peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				close(started)
+				<-r.Context().Done()
+			}))
+			t.Cleanup(peer.Close)
+			t.Setenv(protocol.RuntimeConfigEnv, `{"version":2,"peers":{"crm":"`+peer.URL+`/mcp"}}`)
+			h, err := newHost()
+			if err != nil {
+				t.Fatal(err)
+			}
+			inbound, endInbound := context.WithCancel(t.Context())
+			defer endInbound()
+			h.scopes["request"] = &scope{ctx: inbound, token: "header.claims.signature", trace: http.Header{}}
+			application, endApplication := context.WithCancel(t.Context())
+			defer endApplication()
+			r := httptest.NewRequestWithContext(application, http.MethodPost, "/peer/crm", nil)
+			r.SetPathValue("peer", "crm")
+			r.Header.Set(runtimecontract.ScopeHeader, "request")
+			response := httptest.NewRecorder()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				h.peer(response, r)
+			}()
+			<-started
+			if tc.inbound {
+				endInbound()
+			} else {
+				endApplication()
+			}
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("peer call outlived the request")
+			}
+			if response.Code != http.StatusBadGateway || response.Header().Get("X-Holon-Error") != "true" {
+				t.Fatalf("cancelled call: %d %v", response.Code, response.Header())
 			}
 		})
 	}

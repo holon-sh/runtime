@@ -178,13 +178,18 @@ def make_app(**options: Any) -> ASGIApp:
                     pass
                 finally:
                     await peer.aclose()
-                try:
-                    await http.get(os.environ["PEER_MCP_URL"])
-                except RuntimeError as error:
-                    assert str(error) == "Holon peer call rejected or cancelled", error
-                    emit("stream-late-denied")
-                finally:
-                    await http.aclose()
+                await http.aclose()
+                block = (await call_peer("inspect")).content[0]
+                assert isinstance(block, TextContent)
+                print(
+                    json.dumps(
+                        {
+                            "event": "stream-late-forwarded",
+                            "identity": json.loads(block.text)["identity"],
+                        }
+                    ),
+                    flush=True,
+                )
 
             asyncio.create_task(read_peer())
 

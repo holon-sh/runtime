@@ -47,11 +47,13 @@ async function app(t, peers = {}, extra = {}) {
     },
   );
   const events = [];
+  const messages = [];
   let stderr = "";
   child.stderr.on("data", (data) => (stderr += data));
   createInterface({ input: child.stdout }).on("line", (line) => {
     const message = JSON.parse(line);
     events.push(message.event);
+    messages.push(message);
     child.emit("message", message);
   });
   t.after(async () => {
@@ -74,7 +76,7 @@ async function app(t, peers = {}, extra = {}) {
       throw new Error(stderr);
     }),
   ]);
-  return { child, events, signal: t.signal, url: `http://127.0.0.1:${port}/mcp` };
+  return { child, events, messages, signal: t.signal, url: `http://127.0.0.1:${port}/mcp` };
 }
 function context(subject, principal = {}, hook) {
   const claims = {
@@ -138,7 +140,9 @@ test(
     });
     const externalPort = await listen(external);
     t.after(() => external.close());
+    const meshContexts = [];
     const mesh = createServer((req, res) => {
+      meshContexts.push("x-holon-context" in req.headers);
       if (redirect) {
         res
           .writeHead(302, { location: `http://127.0.0.1:${externalPort}` })
@@ -297,7 +301,13 @@ test(
     await event(upstream, "stream-peer-ready");
     release(upstream, "stream");
     await streaming.text();
-    await event(upstream, "stream-late-denied");
+    meshContexts.length = 0;
+    await event(upstream, "stream-late-forwarded");
+    assert.equal(
+      upstream.messages.find((m) => m.event === "stream-late-forwarded").identity,
+      null,
+    );
+    assert(meshContexts.length > 0 && meshContexts.every((present) => !present));
     await event(downstream, "peer-stream-closed");
     redirect = true;
     externalRequests.length = 0;
