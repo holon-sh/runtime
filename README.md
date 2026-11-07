@@ -14,33 +14,6 @@ there regenerates `adapter.bundle.mjs` byte for byte. `npm test` there builds th
 Node; set `HOLON_TEST_RUNTIME` to `bun`, `deno` or a Python interpreter with `host/python`'s dependencies (`uv sync --frozen`)
 to run it under another runtime.
 
-## Reloading from a source overlay
-
-With `HOLON_RELOAD_SECRET` set, `--transport=hosted-http` serves `POST /.holon/reload` on the public listener, ahead of platform
-admission, so that `holon dev` can restart the application in place. The request has `Authorization: Bearer <secret>` and the
-body `{"registry", "repository", "token", "digest", "mediaType"}`, all required: `registry` is the registry's `http` or `https`
-URL and `mediaType` is `application/vnd.holon.source-overlay.v0.tar+zstd`. The runtime fetches
-`<registry>/v2/<repository>/blobs/<digest>`, unpacks the verified zstd tar into a fresh directory under `HOLON_RELOAD_DIR`
-(default `/tmp/holon-source`), restarts the child there and answers `{"restartedAt", "readyAt", "digest"}` once it has posted
-ready. Requests meanwhile get 503. A restarted container boots from its image unless `HOLON_OVERLAY` names an overlay.
-
-| Status | Meaning |
-|---|---|
-| 400 | malformed request |
-| 401 | wrong secret |
-| 409 | a reload is in progress |
-| 500 | could not unpack, or the new child failed (`exit` holds its status) and the previous source is running again |
-| 502 | the registry refused or failed, or the blob does not match its digest |
-| 504 | the new child was not ready 45 s after the request and the previous source is running again |
-
-When the container has `HOLON_OVERLAY`, a reload request's JSON body that the platform keeps from the last successful
-reload, the runtime fetches and unpacks that overlay the same way at boot and starts the first child from it, so a new pod
-keeps the last reloaded source. If the overlay cannot be fetched or verified, or its child fails before ready, the runtime
-logs why and boots from the image. Neither `HOLON_OVERLAY` nor `HOLON_RELOAD_SECRET` reaches the child.
-
-Top-level entries of the application directory that the overlay lacks, such as `node_modules` or a built `dist`, are linked into
-the new directory. Without the secret the path behaves like any other.
-
 ## License
 
 Apache License 2.0, see `LICENSE` and `NOTICE`.
