@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"maps"
 	"net"
 	"net/http"
@@ -19,6 +20,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -42,7 +44,7 @@ class Handler(BaseHTTPRequestHandler):
             "message": "` + message + `",
             "cwd": os.getcwd(),
             "pwd": os.environ.get("PWD"),
-            "secret": os.environ.get("HOLON_RELOAD_SECRET"),
+            "secret": os.environ.get("HOLON_RELOAD_SECRET") or os.environ.get("HOLON_OVERLAY"),
             "modules": open("node_modules/marker").read() if os.path.exists("node_modules/marker") else None,
             "bytecode": os.path.exists("__pycache__"),
             "executable": os.access("tools/run", os.X_OK),
@@ -137,8 +139,9 @@ type testRuntime struct {
 	exited   chan error
 }
 
-// startRuntime runs the supervisor on a child that serves the "image" source from a fresh working directory.
-func startRuntime(t *testing.T, secret string, blobs map[string][]byte) *testRuntime {
+// startRuntime runs the supervisor on a child that serves the "image" source from a fresh working directory. A boot
+// request becomes HOLON_OVERLAY, aimed at the runtime's registry.
+func startRuntime(t *testing.T, secret string, blobs map[string][]byte, boot ...reloadRequest) *testRuntime {
 	t.Helper()
 	python, err := exec.LookPath("python3")
 	if err != nil {
@@ -169,6 +172,11 @@ func startRuntime(t *testing.T, secret string, blobs map[string][]byte) *testRun
 	rt := &testRuntime{
 		t: t, url: "http://127.0.0.1:" + strconv.Itoa(port), image: image, overlays: overlays,
 		registry: fakeRegistry(t, blobs), exited: make(chan error, 1),
+	}
+	for _, request := range boot {
+		request.Registry = rt.registry
+		value, _ := json.Marshal(request)
+		t.Setenv(overlayEnv, string(value))
 	}
 	go func() { rt.exited <- Run(ctx, []string{python, "./main.py"}) }()
 	t.Cleanup(func() {
@@ -577,5 +585,65 @@ func TestRuntimeExitsWhenReloadedChildCrashes(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("runtime outlived its application")
+	}
+}
+
+// bootLog collects the runtime's log while a test runs.
+type bootLog struct {
+	sync.Mutex
+	strings.Builder
+}
+
+func (l *bootLog) Write(p []byte) (int, error) {
+	l.Lock()
+	defer l.Unlock()
+	return l.Builder.Write(p)
+}
+
+func (l *bootLog) String() string {
+	l.Lock()
+	defer l.Unlock()
+	return l.Builder.String()
+}
+
+func TestBootAppliesOverlay(t *testing.T) {
+	good, next := overlay(t, sourceFiles("kept", "")), overlay(t, sourceFiles("next", ""))
+	crashing := overlay(t, sourceFiles("crashing", "sys.exit(3)"))
+	claimed := "sha256:" + strings.Repeat("a", 64)
+	blobs := map[string][]byte{blobDigest(good): good, blobDigest(next): next, blobDigest(crashing): crashing, claimed: good}
+	boot := func(digest, token string) reloadRequest {
+		return reloadRequest{Repository: "holon/app", Token: token, Digest: digest, MediaType: overlayMediaType}
+	}
+	for _, tc := range []struct {
+		name    string
+		boot    reloadRequest
+		child   string // the source the first request reaches
+		because string // in the log when the image boots instead
+	}{
+		{"last good overlay", boot(blobDigest(good), "pull"), "kept", ""},
+		{"token refused", boot(blobDigest(good), "other"), "image", "registry answered 401"},
+		{"digest mismatch", boot(claimed, "pull"), "image", "digest mismatch"},
+		{"malformed", reloadRequest{}, "image", "invalid HOLON_OVERLAY"},
+		{"overlay child fails", boot(blobDigest(crashing), "pull"), "image", "application exited before ready"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logged := &bootLog{}
+			log.SetOutput(logged)
+			t.Cleanup(func() { log.SetOutput(os.Stderr) })
+			rt := startRuntime(t, testSecret, blobs, tc.boot)
+			if got := rt.child(); got.Message != tc.child || got.Secret != nil {
+				t.Fatalf("first request: %+v", got)
+			}
+			if tc.because == "" && logged.String() != "" || !strings.Contains(logged.String(), tc.because) {
+				t.Fatalf("log: %q", logged.String())
+			}
+			// A later reload replaces whichever source booted, and removes a booted overlay.
+			if status, body := rt.reload(blobDigest(next)); status != http.StatusOK {
+				t.Fatalf("reload: %d %s", status, body)
+			}
+			if got, directories := rt.child(), rt.overlayDirectories(); got.Message != "next" || len(directories) != 1 {
+				t.Fatalf("after reload: %+v %v", got, directories)
+			}
+		})
 	}
 }

@@ -22,7 +22,7 @@ body `{"registry", "repository", "token", "digest", "mediaType"}`, all required:
 URL and `mediaType` is `application/vnd.holon.source-overlay.v0.tar+zstd`. The runtime fetches
 `<registry>/v2/<repository>/blobs/<digest>`, unpacks the verified zstd tar into a fresh directory under `HOLON_RELOAD_DIR`
 (default `/tmp/holon-source`), restarts the child there and answers `{"restartedAt", "readyAt", "digest"}` once it has posted
-ready. Requests meanwhile get 503. The overlay is not durable: a restarted container boots from its image.
+ready. Requests meanwhile get 503. A restarted container boots from its image unless `HOLON_OVERLAY` names an overlay.
 
 | Status | Meaning |
 |---|---|
@@ -32,6 +32,11 @@ ready. Requests meanwhile get 503. The overlay is not durable: a restarted conta
 | 500 | could not unpack, or the new child failed (`exit` holds its status) and the previous source is running again |
 | 502 | the registry refused or failed, or the blob does not match its digest |
 | 504 | the new child was not ready 45 s after the request and the previous source is running again |
+
+When the container has `HOLON_OVERLAY`, a reload request's JSON body that the platform keeps from the last successful
+reload, the runtime fetches and unpacks that overlay the same way at boot and starts the first child from it, so a new pod
+keeps the last reloaded source. If the overlay cannot be fetched or verified, or its child fails before ready, the runtime
+logs why and boots from the image. Neither `HOLON_OVERLAY` nor `HOLON_RELOAD_SECRET` reaches the child.
 
 Top-level entries of the application directory that the overlay lacks, such as `node_modules` or a built `dist`, are linked into
 the new directory. Without the secret the path behaves like any other.

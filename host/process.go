@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -57,11 +58,16 @@ func Run(ctx context.Context, command []string) error {
 	if h.image, err = os.Getwd(); err != nil {
 		return err
 	}
-	if h.reloadSecret != "" {
+	boot := os.Getenv(overlayEnv)
+	if h.reloadSecret != "" || boot != "" {
 		// A writable volume outlives the container, and overlays from before this boot are of no use.
 		if err := errors.Join(os.RemoveAll(h.overlays), os.MkdirAll(h.overlays, 0o700)); err != nil {
 			return err
 		}
+	}
+	directory := h.image
+	if boot != "" {
+		directory = h.bootOverlay(ctx, boot)
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -122,7 +128,8 @@ func Run(ctx context.Context, command []string) error {
 	go func() { servers <- broker.Serve(private) }()
 	brokerURL := "http://" + private.Addr().String() + prefix
 	environment := slices.DeleteFunc(os.Environ(), func(entry string) bool {
-		return strings.HasPrefix(entry, protocol.RuntimeConfigEnv+"=") || strings.HasPrefix(entry, reloadSecretEnv+"=")
+		return strings.HasPrefix(entry, protocol.RuntimeConfigEnv+"=") || strings.HasPrefix(entry, reloadSecretEnv+"=") ||
+			strings.HasPrefix(entry, overlayEnv+"=")
 	})
 	for name := range h.peers {
 		environment = append(environment, protocol.DependencyEnvName(name)+"="+brokerURL+"/peer/"+url.PathEscape(name))
@@ -154,7 +161,12 @@ func Run(ctx context.Context, command []string) error {
 		}()
 		return p, nil
 	}
-	current, failure := awaitReady(ctx, start, h.image, nil)
+	current, failure := awaitReady(ctx, start, directory, nil)
+	if failure != nil && directory != h.image {
+		log.Printf("boot from the image: overlay child: %v", failure)
+		_ = os.RemoveAll(directory)
+		current, failure = awaitReady(ctx, start, h.image, nil)
+	}
 	if failure != nil {
 		return errors.Join(failure, ctx.Err())
 	}

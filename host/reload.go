@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -27,6 +28,7 @@ const (
 	reloadPath        = "/.holon/reload"
 	reloadSecretEnv   = "HOLON_RELOAD_SECRET"
 	reloadDirEnv      = "HOLON_RELOAD_DIR"
+	overlayEnv        = "HOLON_OVERLAY"
 	defaultReloadDir  = "/tmp/holon-source"
 	overlayMediaType  = "application/vnd.holon.source-overlay.v0.tar+zstd"
 	maxReloadBodySize = 64 << 10
@@ -107,6 +109,22 @@ func (h *host) reload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, reloadReply{job.restartedAt.UTC(), job.readyAt.UTC(), request.Digest})
+}
+
+// bootOverlay unpacks the overlay HOLON_OVERLAY names, a reload request the platform kept from the last successful
+// reload, so that a new pod keeps the source a developer last saw running. On failure the image's directory boots.
+func (h *host) bootOverlay(ctx context.Context, value string) string {
+	var request reloadRequest
+	if protocol.DecodeJSONNonNull([]byte(value), &request) != nil || request.blob() == nil {
+		log.Print("boot from the image: invalid " + overlayEnv)
+		return h.image
+	}
+	directory, failure := h.fetchOverlay(ctx, request.blob(), request, time.Now().Add(reloadTimeout))
+	if failure != nil {
+		log.Printf("boot from the image: overlay %s: %v", request.Digest, failure)
+		return h.image
+	}
+	return directory
 }
 
 // blob is where a well-formed request's overlay is, and nil when the request is malformed.
