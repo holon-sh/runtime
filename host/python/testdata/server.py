@@ -26,8 +26,8 @@ peer_binding = resolve_default_binding("peer")
 http: httpx2.AsyncClient
 
 
-def emit(event: str) -> None:
-    print(json.dumps({"event": event}), flush=True)
+def emit(event: str, **extra: object) -> None:
+    print(json.dumps({"event": event, **extra}), flush=True)
 
 
 @asynccontextmanager
@@ -73,14 +73,6 @@ async def external() -> CallToolResult:
         },
     )
     return CallToolResult(content=[TextContent(type="text", text=response.text)])
-
-
-@server.tool()
-async def credentials() -> CallToolResult:
-    await http.get(
-        os.environ["PEER_MCP_URL"], headers={"authorization": "Bearer app-token"}
-    )
-    return CallToolResult(content=[])
 
 
 @server.tool()
@@ -178,13 +170,12 @@ def make_app(**options: Any) -> ASGIApp:
                     pass
                 finally:
                     await peer.aclose()
-                try:
-                    await http.get(os.environ["PEER_MCP_URL"])
-                except RuntimeError as error:
-                    assert str(error) == "Holon peer call rejected or cancelled", error
-                    emit("stream-late-denied")
-                finally:
-                    await http.aclose()
+                await http.aclose()
+                block = (await call_peer("inspect")).content[0]
+                assert isinstance(block, TextContent)
+                emit(
+                    "stream-late-forwarded", identity=json.loads(block.text)["identity"]
+                )
 
             asyncio.create_task(read_peer())
 

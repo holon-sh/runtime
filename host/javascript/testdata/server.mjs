@@ -1,5 +1,4 @@
 import process from "node:process";
-import assert from "node:assert/strict";
 import { once } from "node:events";
 import { createInterface } from "node:readline";
 import {
@@ -22,7 +21,7 @@ commands.on("line", (line) => {
   const { release } = JSON.parse(line);
   gates[release].resolve();
 });
-const emit = (event) => console.log(JSON.stringify({ event }));
+const emit = (event, extra = {}) => console.log(JSON.stringify({ event, ...extra }));
 const inputSchema = fromJsonSchema({ type: "object", additionalProperties: false });
 
 async function callPeer(name) {
@@ -51,13 +50,6 @@ const handler = createMcpHandler(
         },
       });
       return { content: [{ type: "text", text: await response.text() }] };
-    });
-    server.registerTool("credentials", { inputSchema }, async () => {
-      const response = await fetch(process.env.PEER_MCP_URL, {
-        headers: { authorization: "Bearer app-token" },
-      });
-      await response.body?.cancel();
-      return { content: [] };
     });
     server.registerTool("redirect", { inputSchema }, async () => {
       const response = await fetch(process.env.PEER_MCP_URL);
@@ -119,10 +111,8 @@ export default {
       emit("stream-peer-ready");
       void (async () => {
         await peer.text().catch(() => {});
-        await assert.rejects(fetch(process.env.PEER_MCP_URL), {
-          message: "Holon peer call rejected or cancelled",
-        });
-        emit("stream-late-denied");
+        const result = await callPeer("inspect");
+        emit("stream-late-forwarded", { identity: JSON.parse(result.content[0].text).identity });
       })();
       return new Response(
         new ReadableStream({
