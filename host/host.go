@@ -27,11 +27,10 @@ type scope struct {
 	ctx      context.Context
 	token    string
 	identity *identity
-	trace    http.Header
+	forward  http.Header
 }
 
 type host struct {
-	callers      []string
 	peers        map[string]*url.URL
 	transport    *http.Transport
 	image        string // the application directory, which an overlay falls back to and which is never removed
@@ -50,8 +49,7 @@ func newHost() (*host, error) {
 	var peers map[string]*url.URL
 	var settings runtimecontract.Config
 	if raw, configured := os.LookupEnv(protocol.RuntimeConfigEnv); configured {
-		if protocol.DecodeJSONNonNull([]byte(raw), &settings) != nil || settings.Version != 2 || settings.Peers == nil ||
-			slices.ContainsFunc(settings.Callers, func(caller string) bool { return !strings.HasPrefix(caller, "spiffe://") }) {
+		if protocol.DecodeJSONNonNull([]byte(raw), &settings) != nil || settings.Version != 2 || settings.Peers == nil {
 			return nil, errors.New("invalid platform identity configuration")
 		}
 		peers = make(map[string]*url.URL, len(settings.Peers))
@@ -66,10 +64,9 @@ func newHost() (*host, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
 	return &host{
-		callers: settings.Callers, peers: peers, transport: transport,
+		peers: peers, transport: transport, scopes: map[string]*scope{},
 		overlays:     cmp.Or(os.Getenv(reloadDirEnv), defaultReloadDir),
 		reloadSecret: os.Getenv(reloadSecretEnv), reloads: make(chan *reloadJob),
-		scopes: map[string]*scope{},
 	}, nil
 }
 
@@ -92,7 +89,7 @@ func (h *host) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var token string
 	if h.peers != nil {
 		var accepted bool
-		identity, accepted = admit(r, h.callers)
+		identity, accepted = admit(r)
 		if !accepted {
 			w.Header().Set("Cache-Control", "no-store")
 			http.Error(w, "Invalid platform request context", http.StatusForbidden)
@@ -109,14 +106,14 @@ func (h *host) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	stripHolon(r.Header)
-	id := rand.Text()
-	s := &scope{ctx: r.Context(), token: token, identity: identity, trace: http.Header{}}
-	for _, name := range []string{"Traceparent", "Tracestate"} {
+	s := &scope{ctx: r.Context(), token: token, identity: identity, forward: http.Header{}}
+	for _, name := range []string{"Traceparent", "Tracestate", runtimecontract.ContextHeader} {
 		if value := r.Header.Get(name); value != "" {
-			s.trace.Set(name, value)
+			s.forward.Set(name, value)
 		}
 	}
+	stripHolon(r.Header)
+	id := rand.Text()
 	h.mu.Lock()
 	h.scopes[id] = s
 	h.mu.Unlock()
@@ -129,12 +126,19 @@ func (h *host) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	application.ServeHTTP(w, r)
 }
 
+func (h *host) active(id string) *scope {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if s := h.scopes[id]; s != nil && s.ctx.Err() == nil {
+		return s
+	}
+	return nil
+}
+
 func (h *host) context(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
-	h.mu.Lock()
-	s := h.scopes[r.PathValue("scope")]
-	h.mu.Unlock()
-	if s == nil || s.ctx.Err() != nil {
+	s := h.active(r.PathValue("scope"))
+	if s == nil {
 		http.Error(w, "Request context unavailable", http.StatusForbidden)
 		return
 	}
@@ -143,9 +147,6 @@ func (h *host) context(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *host) peer(w http.ResponseWriter, r *http.Request) {
-	h.mu.Lock()
-	s := h.scopes[r.Header.Get(runtimecontract.ScopeHeader)]
-	h.mu.Unlock()
 	target, found := h.peers[r.PathValue("peer")]
 	if !found || r.URL.RawQuery != "" {
 		http.NotFound(w, r)
@@ -158,20 +159,21 @@ func (h *host) peer(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if len(r.Header.Values(runtimecontract.ScopeHeader)) != 1 || s == nil || s.token == "" || s.ctx.Err() != nil {
-		peerError(w, "Peer calls require an active incoming request", http.StatusForbidden)
-		return
+	s := h.active(r.Header.Get(runtimecontract.ScopeHeader))
+	ctx := r.Context()
+	if s != nil && s.token != "" {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(s.ctx)
+		defer cancel()
+		defer context.AfterFunc(r.Context(), cancel)()
 	}
-	ctx, cancel := context.WithCancel(s.ctx)
-	stop := context.AfterFunc(r.Context(), cancel)
-	defer stop()
-	defer cancel()
 	proxy := h.proxy(func(p *httputil.ProxyRequest) {
 		*p.Out.URL = *target
 		p.Out.Host = target.Host
 		p.Out.Header.Del(runtimecontract.ScopeHeader)
-		p.Out.Header.Set(runtimecontract.ContextHeader, s.token)
-		maps.Copy(p.Out.Header, s.trace)
+		if s != nil {
+			maps.Copy(p.Out.Header, s.forward)
+		}
 	})
 	proxy.ModifyResponse = func(response *http.Response) error {
 		if response.StatusCode >= 300 && response.StatusCode < 400 {

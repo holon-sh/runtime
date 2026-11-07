@@ -14,7 +14,6 @@ import {
 
 const runtime = process.env.HOLON_TEST_RUNTIME ?? process.execPath;
 const python = basename(runtime).startsWith("python");
-const discoveryCaller = "spiffe://cluster.local/ns/control/sa/api";
 
 async function listen(server) {
   server.listen(0, "127.0.0.1");
@@ -41,17 +40,17 @@ async function app(t, peers = {}, extra = {}) {
       env: {
         PATH: process.env.PATH,
         PORT: String(port),
-        HOLON_MCP_RUNTIME_CONFIG: JSON.stringify({ version: 2, peers, callers: [discoveryCaller] }),
+        HOLON_MCP_RUNTIME_CONFIG: JSON.stringify({ version: 2, peers }),
         ...extra,
       },
     },
   );
-  const events = [];
+  const messages = [];
   let stderr = "";
   child.stderr.on("data", (data) => (stderr += data));
   createInterface({ input: child.stdout }).on("line", (line) => {
     const message = JSON.parse(line);
-    events.push(message.event);
+    messages.push(message);
     child.emit("message", message);
   });
   t.after(async () => {
@@ -74,7 +73,7 @@ async function app(t, peers = {}, extra = {}) {
       throw new Error(stderr);
     }),
   ]);
-  return { child, events, signal: t.signal, url: `http://127.0.0.1:${port}/mcp` };
+  return { child, messages, signal: t.signal, url: `http://127.0.0.1:${port}/mcp` };
 }
 function context(subject, principal = {}, hook) {
   const claims = {
@@ -116,9 +115,10 @@ async function call(url, name, headers, signal) {
   }
 }
 async function event(app, name, count = 1) {
-  while (app.events.filter((value) => value === name).length < count) {
+  while (app.messages.filter((message) => message.event === name).length < count) {
     await once(app.child, "message", { signal: app.signal });
   }
+  return app.messages.findLast((message) => message.event === name);
 }
 function release(app, name) {
   app.child.stdin.write(`${JSON.stringify({ release: name })}\n`);
@@ -167,34 +167,6 @@ test(
       { peer },
       { PEER_MCP_URL: "http://stale.invalid/mcp", EXTERNAL_URL: `http://127.0.0.1:${externalPort}` },
     );
-    for (const [method, status] of [["server/discover", 200], ["tools/call", 400]]) {
-      const response = await fetch(upstream.url, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          accept: "application/json, text/event-stream",
-          "mcp-protocol-version": "2026-07-28",
-          "mcp-method": "server/discover",
-          ...(method === "tools/call" && { "mcp-name": "inspect" }),
-          "x-holon-caller": discoveryCaller,
-        },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: "discovery",
-          method,
-          params: {
-            ...(method === "tools/call" && { name: "inspect", arguments: {} }),
-            _meta: {
-              "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-              "io.modelcontextprotocol/clientInfo": { name: "holon", version: "1" },
-              "io.modelcontextprotocol/clientCapabilities": {},
-            },
-          },
-        }),
-      });
-      assert.equal(response.status, status, method);
-      await response.text();
-    }
     const identities = [
       {
         subject: "alice",
@@ -264,24 +236,16 @@ test(
       app: "accounts", job: "hook-job", jobUID: "job-uid",
       operation: "install", step: 1, attempt: 1, deadline: "2030-03-17T17:47:40Z",
     };
-    for (const [invocation, expected] of [
-      [undefined, null],
-      [hook, { caller: "spiffe://app-a", hook }],
-    ]) {
-      const headers = context(undefined, {}, invocation);
-      const result = await call(upstream.url, "inspect", headers);
-      const { identity } = JSON.parse(result.content[0].text);
-      assert.deepEqual(identity && identity.extra, expected);
-    }
+    const invoked = await call(upstream.url, "inspect", context(undefined, {}, hook));
+    assert.deepEqual(JSON.parse(invoked.content[0].text).identity.extra, {
+      caller: "spiffe://app-a",
+      hook,
+    });
     const response = await call(upstream.url, "external", context("user"));
     assert(
       !Object.keys(JSON.parse(response.content[0].text)).some((name) =>
         name.startsWith("x-holon-"),
       ),
-    );
-    assert.equal(
-      (await call(upstream.url, "credentials", context("user"))).isError,
-      true,
     );
     const abort = new AbortController();
     const pending = call(upstream.url, "wait", context("user"), abort.signal);
@@ -297,7 +261,7 @@ test(
     await event(upstream, "stream-peer-ready");
     release(upstream, "stream");
     await streaming.text();
-    await event(upstream, "stream-late-denied");
+    assert.equal((await event(upstream, "stream-late-forwarded")).identity, null);
     await event(downstream, "peer-stream-closed");
     redirect = true;
     externalRequests.length = 0;
