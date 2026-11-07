@@ -20,9 +20,18 @@ type identity struct {
 	Extra     map[string]any `json:"extra"`
 }
 
-func admit(r *http.Request) (*identity, bool) {
+// meshCaller is the single spiffe identity the waypoint asserts for a request, or "" without one.
+func meshCaller(r *http.Request) string {
 	caller := r.Header.Get(runtimecontract.CallerHeader)
 	if len(r.Header.Values(runtimecontract.CallerHeader)) != 1 || !strings.HasPrefix(caller, "spiffe://") {
+		return ""
+	}
+	return caller
+}
+
+func admit(r *http.Request) (*identity, bool) {
+	caller := meshCaller(r)
+	if caller == "" {
 		return nil, false
 	}
 	contexts := r.Header.Values(runtimecontract.ContextHeader)

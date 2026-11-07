@@ -15,24 +15,29 @@ func within(root, name string) bool {
 	return filepath.IsLocal(relative)
 }
 
-func frontend(directory string) (http.Handler, error) {
+// frontend serves a directory the child named, relative to the child's source. That can be an overlay, and the
+// directory can then resolve into the image's application through a link, so image is allowed too.
+func frontend(directory, source, image string) (http.Handler, error) {
 	if directory == "" {
 		return http.NotFoundHandler(), nil
 	}
-	application, err := os.Getwd()
+	source, err := filepath.EvalSymlinks(source)
 	if err != nil {
 		return nil, err
 	}
-	application, err = filepath.EvalSymlinks(application)
+	image, err = filepath.EvalSymlinks(image)
 	if err != nil {
 		return nil, err
+	}
+	if !filepath.IsAbs(directory) {
+		directory = filepath.Join(source, directory)
 	}
 	root, err := filepath.EvalSymlinks(directory)
 	if err != nil {
 		return nil, err
 	}
 	info, err := os.Stat(root)
-	if err != nil || !info.IsDir() || !within(application, root) {
+	if err != nil || !info.IsDir() || !within(source, root) && !within(image, root) {
 		return nil, errors.New("frontend must be a directory inside the application")
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
