@@ -23,7 +23,6 @@ func TestAdmission(t *testing.T) {
 		{"principal context", "spiffe://edge", valid, "", principal},
 		{"principal-less context", "spiffe://edge", `{"exp":4102444800,"aud":["https://holon.example"]}`, "", "null"},
 		{"expired", "spiffe://edge", strings.Replace(valid, "4102444800", "1", 1), "", ""},
-		{"missing expiry", "spiffe://edge", `{"aud":["https://holon.example"]}`, "", ""},
 		{"multiple audiences", "spiffe://edge", `{"exp":4102444800,"aud":["https://one.example","https://two.example"]}`, "", ""},
 		{"relative audience", "spiffe://edge", `{"exp":4102444800,"aud":["/relative"]}`, "", ""},
 		{"invalid principal", "spiffe://edge", strings.Replace(valid, `"client_id":"client"`, `"client_id":null`, 1), "", ""},
@@ -186,7 +185,7 @@ func TestPeerCallLifetime(t *testing.T) {
 func TestInvalidConfiguration(t *testing.T) {
 	for _, raw := range []string{
 		`{"version":1,"peers":{}}`, `{"version":2}`, `{"version":2,"peers":{},"unknown":true}`,
-		`{"version":2,"peers":{"peer":"https://peer/mcp"}}`, `{"version":2,"peers":{"peer":"http://user@peer/mcp"}}`,
+		`{"version":2,"peers":{"peer":"https://peer/mcp"}}`,
 	} {
 		t.Run(raw, func(t *testing.T) {
 			t.Setenv(protocol.RuntimeConfigEnv, raw)

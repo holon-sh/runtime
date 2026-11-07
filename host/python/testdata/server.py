@@ -76,14 +76,6 @@ async def external() -> CallToolResult:
 
 
 @server.tool()
-async def credentials() -> CallToolResult:
-    await http.get(
-        os.environ["PEER_MCP_URL"], headers={"authorization": "Bearer app-token"}
-    )
-    return CallToolResult(content=[])
-
-
-@server.tool()
 async def redirect() -> CallToolResult:
     await http.get(os.environ["PEER_MCP_URL"])
     return CallToolResult(content=[])

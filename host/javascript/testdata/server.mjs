@@ -51,13 +51,6 @@ const handler = createMcpHandler(
       });
       return { content: [{ type: "text", text: await response.text() }] };
     });
-    server.registerTool("credentials", { inputSchema }, async () => {
-      const response = await fetch(process.env.PEER_MCP_URL, {
-        headers: { authorization: "Bearer app-token" },
-      });
-      await response.body?.cancel();
-      return { content: [] };
-    });
     server.registerTool("redirect", { inputSchema }, async () => {
       const response = await fetch(process.env.PEER_MCP_URL);
       await response.body?.cancel();

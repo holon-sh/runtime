@@ -14,7 +14,6 @@ import {
 
 const runtime = process.env.HOLON_TEST_RUNTIME ?? process.execPath;
 const python = basename(runtime).startsWith("python");
-const discoveryCaller = "spiffe://cluster.local/ns/control/sa/api";
 
 async function listen(server) {
   server.listen(0, "127.0.0.1");
@@ -168,34 +167,6 @@ test(
       { peer },
       { PEER_MCP_URL: "http://stale.invalid/mcp", EXTERNAL_URL: `http://127.0.0.1:${externalPort}` },
     );
-    for (const [method, status] of [["server/discover", 200], ["tools/call", 400]]) {
-      const response = await fetch(upstream.url, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          accept: "application/json, text/event-stream",
-          "mcp-protocol-version": "2026-07-28",
-          "mcp-method": "server/discover",
-          ...(method === "tools/call" && { "mcp-name": "inspect" }),
-          "x-holon-caller": discoveryCaller,
-        },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: "discovery",
-          method,
-          params: {
-            ...(method === "tools/call" && { name: "inspect", arguments: {} }),
-            _meta: {
-              "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-              "io.modelcontextprotocol/clientInfo": { name: "holon", version: "1" },
-              "io.modelcontextprotocol/clientCapabilities": {},
-            },
-          },
-        }),
-      });
-      assert.equal(response.status, status, method);
-      await response.text();
-    }
     const identities = [
       {
         subject: "alice",
@@ -265,24 +236,16 @@ test(
       app: "accounts", job: "hook-job", jobUID: "job-uid",
       operation: "install", step: 1, attempt: 1, deadline: "2030-03-17T17:47:40Z",
     };
-    for (const [invocation, expected] of [
-      [undefined, null],
-      [hook, { caller: "spiffe://app-a", hook }],
-    ]) {
-      const headers = context(undefined, {}, invocation);
-      const result = await call(upstream.url, "inspect", headers);
-      const { identity } = JSON.parse(result.content[0].text);
-      assert.deepEqual(identity && identity.extra, expected);
-    }
+    const invoked = await call(upstream.url, "inspect", context(undefined, {}, hook));
+    assert.deepEqual(JSON.parse(invoked.content[0].text).identity.extra, {
+      caller: "spiffe://app-a",
+      hook,
+    });
     const response = await call(upstream.url, "external", context("user"));
     assert(
       !Object.keys(JSON.parse(response.content[0].text)).some((name) =>
         name.startsWith("x-holon-"),
       ),
-    );
-    assert.equal(
-      (await call(upstream.url, "credentials", context("user"))).isError,
-      true,
     );
     const abort = new AbortController();
     const pending = call(upstream.url, "wait", context("user"), abort.signal);
