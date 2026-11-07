@@ -24,10 +24,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/holon-sh/protocol"
+	"github.com/holon-sh/protocol/runtimecontract"
 	"github.com/klauspost/compress/zstd"
 )
 
-const testSecret = "reload-secret"
+// apiCaller is the mesh identity the runtime's configuration lets reload; edgeCaller is any other admitted caller.
+const apiCaller, edgeCaller = "spiffe://cluster.local/ns/holon-system/sa/holon-api", "spiffe://edge"
 
 // childSource is a fake application. Its message is part of its source, so a reply shows which source is running.
 func childSource(message, beforeReady string) string {
@@ -41,7 +44,7 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps({
             "message": "` + message + `",
             "cwd": os.getcwd(),
-            "secret": os.environ.get("HOLON_RELOAD_SECRET") or os.environ.get("HOLON_OVERLAY"),
+            "leaked": os.environ.get("HOLON_MCP_RUNTIME_CONFIG") or os.environ.get("HOLON_OVERLAY"),
             "modules": open("node_modules/marker").read() if os.path.exists("node_modules/marker") else None,
         }).encode()
         self.send_response(200)
@@ -136,7 +139,7 @@ type testRuntime struct {
 
 // startRuntime runs the supervisor on a child that serves the "image" source from a fresh working directory. A boot
 // request becomes HOLON_OVERLAY, aimed at the runtime's registry.
-func startRuntime(t *testing.T, secret string, blobs map[string][]byte, boot ...reloadRequest) *testRuntime {
+func startRuntime(t *testing.T, blobs map[string][]byte, boot ...reloadRequest) *testRuntime {
 	t.Helper()
 	python, err := exec.LookPath("python3")
 	if err != nil {
@@ -161,7 +164,7 @@ func startRuntime(t *testing.T, secret string, blobs map[string][]byte, boot ...
 	}
 	overlays := filepath.Join(base, "overlays")
 	t.Setenv("PORT", strconv.Itoa(port))
-	t.Setenv(reloadSecretEnv, secret)
+	t.Setenv(protocol.RuntimeConfigEnv, `{"version":2,"peers":{},"callers":["`+apiCaller+`"]}`)
 	t.Setenv(reloadDirEnv, overlays)
 	ctx, cancel := context.WithCancel(context.Background())
 	rt := &testRuntime{
@@ -212,7 +215,7 @@ func writeTree(t *testing.T, root string, files map[string]string) {
 	}
 }
 
-func (rt *testRuntime) reload(digest string) (int, []byte) {
+func (rt *testRuntime) reload(caller, digest string) (int, []byte) {
 	rt.t.Helper()
 	body, _ := json.Marshal(reloadRequest{
 		Registry: rt.registry, Repository: "holon/app", Token: "pull", Digest: digest, MediaType: overlayMediaType,
@@ -221,7 +224,7 @@ func (rt *testRuntime) reload(digest string) (int, []byte) {
 	if err != nil {
 		rt.t.Fatal(err)
 	}
-	request.Header.Set("Authorization", "Bearer "+testSecret)
+	request.Header.Set(runtimecontract.CallerHeader, caller)
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		rt.t.Fatal(err)
@@ -237,13 +240,18 @@ func (rt *testRuntime) reload(digest string) (int, []byte) {
 type childReply struct {
 	Message string  `json:"message"`
 	Cwd     string  `json:"cwd"`
-	Secret  *string `json:"secret"`
+	Leaked  *string `json:"leaked"`
 	Modules *string `json:"modules"`
 }
 
 func (rt *testRuntime) get(path string) *http.Response {
 	rt.t.Helper()
-	response, err := http.Get(rt.url + path)
+	request, err := http.NewRequest(http.MethodGet, rt.url+path, nil)
+	if err != nil {
+		rt.t.Fatal(err)
+	}
+	request.Header.Set(runtimecontract.CallerHeader, edgeCaller)
+	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		rt.t.Fatal(err)
 	}
@@ -285,7 +293,7 @@ func TestReload(t *testing.T) {
 	}
 	for _, tc := range []struct {
 		name    string
-		secret  string // the runtime's; the request presents testSecret
+		caller  string // the request's mesh identity
 		digest  string
 		image   map[string]string // written over the image after boot
 		timeout time.Duration
@@ -293,22 +301,22 @@ func TestReload(t *testing.T) {
 		exit    string // the failed child's status in the reply
 		child   string // the source serving afterwards, or "" when the runtime has exited
 	}{
-		{name: "new source", secret: testSecret, digest: blobDigest(source), status: http.StatusOK, child: "new"},
-		{name: "wrong secret", secret: "other", digest: blobDigest(source), status: http.StatusUnauthorized, child: "image"},
-		{name: "no secret", digest: blobDigest(source), status: http.StatusNotFound, child: "image"},
-		{name: "malformed request", secret: testSecret, digest: "sha256:abc", status: http.StatusBadRequest, child: "image"},
-		{name: "digest mismatch", secret: testSecret, digest: tampered, status: http.StatusBadGateway, child: "image"},
-		{name: "archive escapes", secret: testSecret, digest: blobDigest(escapes), status: http.StatusInternalServerError, child: "image"},
+		{name: "new source", caller: apiCaller, digest: blobDigest(source), status: http.StatusOK, child: "new"},
+		{name: "caller not allowed to reload", caller: edgeCaller, digest: blobDigest(source), status: http.StatusNotFound, child: "image"},
+		{name: "no mesh caller", digest: blobDigest(source), status: http.StatusForbidden, child: "image"},
+		{name: "malformed request", caller: apiCaller, digest: "sha256:abc", status: http.StatusBadRequest, child: "image"},
+		{name: "digest mismatch", caller: apiCaller, digest: tampered, status: http.StatusBadGateway, child: "image"},
+		{name: "archive escapes", caller: apiCaller, digest: blobDigest(escapes), status: http.StatusInternalServerError, child: "image"},
 		{
-			name: "new child exits", secret: testSecret, digest: blobDigest(exits),
+			name: "new child exits", caller: apiCaller, digest: blobDigest(exits),
 			status: http.StatusInternalServerError, exit: "exit status 3", child: "image",
 		},
 		{
-			name: "new child never ready", secret: testSecret, digest: blobDigest(silent), timeout: 500 * time.Millisecond,
+			name: "new child never ready", caller: apiCaller, digest: blobDigest(silent), timeout: 500 * time.Millisecond,
 			status: http.StatusGatewayTimeout, child: "image",
 		},
 		{
-			name: "rollback fails", secret: testSecret, digest: blobDigest(exits), image: map[string]string{"main.py": "raise SystemExit(4)"},
+			name: "rollback fails", caller: apiCaller, digest: blobDigest(exits), image: map[string]string{"main.py": "raise SystemExit(4)"},
 			status: http.StatusInternalServerError, exit: "exit status 3",
 		},
 	} {
@@ -318,9 +326,9 @@ func TestReload(t *testing.T) {
 				reloadTimeout = tc.timeout
 				t.Cleanup(func() { reloadTimeout = previous })
 			}
-			rt := startRuntime(t, tc.secret, blobs)
+			rt := startRuntime(t, blobs)
 			writeTree(t, rt.image, tc.image)
-			status, body := rt.reload(tc.digest)
+			status, body := rt.reload(tc.caller, tc.digest)
 			var failure reloadFailure
 			_ = json.Unmarshal(body, &failure)
 			if status != tc.status || failure.Exit != tc.exit {
@@ -340,7 +348,7 @@ func TestReload(t *testing.T) {
 			}
 			got := rt.child()
 			page, _ := io.ReadAll(rt.get("/").Body)
-			if got.Message != tc.child || got.Secret != nil || got.Modules == nil || *got.Modules != "from image" || string(page) != "image" {
+			if got.Message != tc.child || got.Leaked != nil || got.Modules == nil || *got.Modules != "from image" || string(page) != "image" {
 				t.Fatalf("serving %+v %q", got, page)
 			}
 			running := 0
@@ -368,20 +376,20 @@ func TestReloadAnswers503DuringRestart(t *testing.T) {
 	t.Cleanup(open)
 	first := overlay(t, sourceFiles("first", ""))
 	gated := overlay(t, sourceFiles("gated", "urllib.request.urlopen("+strconv.Quote(gate.URL)+").close()"))
-	rt := startRuntime(t, testSecret, map[string][]byte{blobDigest(first): first, blobDigest(gated): gated})
-	if status, body := rt.reload(blobDigest(first)); status != http.StatusOK {
+	rt := startRuntime(t, map[string][]byte{blobDigest(first): first, blobDigest(gated): gated})
+	if status, body := rt.reload(apiCaller, blobDigest(first)); status != http.StatusOK {
 		t.Fatalf("first reload: %d %s", status, body)
 	}
 	finished := make(chan int)
 	go func() {
-		status, _ := rt.reload(blobDigest(gated))
+		status, _ := rt.reload(apiCaller, blobDigest(gated))
 		finished <- status
 	}()
 	<-started
 	if response := rt.get("/mcp"); response.StatusCode != http.StatusServiceUnavailable || response.Header.Get("Retry-After") != "1" {
 		t.Fatalf("during restart: %d %v", response.StatusCode, response.Header)
 	}
-	if status, body := rt.reload(blobDigest(gated)); status != http.StatusConflict {
+	if status, body := rt.reload(apiCaller, blobDigest(gated)); status != http.StatusConflict {
 		t.Fatalf("concurrent reload: %d %s", status, body)
 	}
 	open()
@@ -429,10 +437,10 @@ func TestBootAppliesOverlay(t *testing.T) {
 			logged := &bootLog{}
 			log.SetOutput(logged)
 			t.Cleanup(func() { log.SetOutput(os.Stderr) })
-			rt := startRuntime(t, testSecret, blobs, reloadRequest{
+			rt := startRuntime(t, blobs, reloadRequest{
 				Repository: "holon/app", Token: tc.token, Digest: tc.digest, MediaType: overlayMediaType,
 			})
-			if got := rt.child(); got.Message != tc.child || got.Secret != nil {
+			if got := rt.child(); got.Message != tc.child || got.Leaked != nil {
 				t.Fatalf("first request: %+v", got)
 			}
 			if tc.because == "" && logged.String() != "" || !strings.Contains(logged.String(), tc.because) {

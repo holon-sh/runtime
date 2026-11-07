@@ -4,7 +4,6 @@ import (
 	"archive/tar"
 	"context"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -26,7 +25,6 @@ import (
 // pod or its container restarts, the application boots from its image again and the CLI re-sends on its next save.
 const (
 	reloadPath        = "/.holon/reload"
-	reloadSecretEnv   = "HOLON_RELOAD_SECRET"
 	reloadDirEnv      = "HOLON_RELOAD_DIR"
 	overlayEnv        = "HOLON_OVERLAY"
 	defaultReloadDir  = "/tmp/holon-source"
@@ -76,13 +74,6 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 
 func (h *host) reload(w http.ResponseWriter, r *http.Request) {
 	deadline := time.Now().Add(reloadTimeout)
-	presented, _ := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-	got, want := sha256.Sum256([]byte(presented)), sha256.Sum256([]byte(h.reloadSecret))
-	if subtle.ConstantTimeCompare(got[:], want[:]) != 1 {
-		w.Header().Set("WWW-Authenticate", "Bearer")
-		writeJSON(w, http.StatusUnauthorized, reloadFailure{Message: "invalid reload secret"})
-		return
-	}
 	var request reloadRequest
 	var blob *url.URL
 	if data, err := io.ReadAll(io.LimitReader(r.Body, maxReloadBodySize)); err == nil && protocol.DecodeJSONNonNull(data, &request) == nil {

@@ -59,7 +59,7 @@ func Run(ctx context.Context, command []string) error {
 		return err
 	}
 	boot := os.Getenv(overlayEnv)
-	if h.reloadSecret != "" || boot != "" {
+	if h.callers != nil || boot != "" {
 		// A writable volume outlives the container, and overlays from before this boot are of no use.
 		if err := errors.Join(os.RemoveAll(h.overlays), os.MkdirAll(h.overlays, 0o700)); err != nil {
 			return err
@@ -128,8 +128,7 @@ func Run(ctx context.Context, command []string) error {
 	go func() { servers <- broker.Serve(private) }()
 	brokerURL := "http://" + private.Addr().String() + prefix
 	environment := slices.DeleteFunc(os.Environ(), func(entry string) bool {
-		return strings.HasPrefix(entry, protocol.RuntimeConfigEnv+"=") || strings.HasPrefix(entry, reloadSecretEnv+"=") ||
-			strings.HasPrefix(entry, overlayEnv+"=")
+		return strings.HasPrefix(entry, protocol.RuntimeConfigEnv+"=") || strings.HasPrefix(entry, overlayEnv+"=")
 	})
 	for name := range h.peers {
 		environment = append(environment, protocol.DependencyEnvName(name)+"="+brokerURL+"/peer/"+url.PathEscape(name))

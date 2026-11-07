@@ -31,18 +31,18 @@ type scope struct {
 }
 
 type host struct {
-	peers        map[string]*url.URL
-	transport    *http.Transport
-	image        string // the application directory, which an overlay falls back to and which is never removed
-	overlays     string // the directory that holds each overlay's directory
-	reloadSecret string
-	reloading    atomic.Bool
-	reloads      chan *reloadJob
-	mu           sync.Mutex
-	application  http.Handler // nil from a restart's start until its child is ready
-	frontend     http.Handler
-	starting     *process
-	scopes       map[string]*scope
+	peers       map[string]*url.URL
+	transport   *http.Transport
+	image       string   // the application directory, which an overlay falls back to and which is never removed
+	overlays    string   // the directory that holds each overlay's directory
+	callers     []string // the mesh identities that may reload the application
+	reloading   atomic.Bool
+	reloads     chan *reloadJob
+	mu          sync.Mutex
+	application http.Handler // nil from a restart's start until its child is ready
+	frontend    http.Handler
+	starting    *process
+	scopes      map[string]*scope
 }
 
 func newHost() (*host, error) {
@@ -65,14 +65,14 @@ func newHost() (*host, error) {
 	transport.Proxy = nil
 	return &host{
 		peers: peers, transport: transport, scopes: map[string]*scope{},
-		overlays:     cmp.Or(os.Getenv(reloadDirEnv), defaultReloadDir),
-		reloadSecret: os.Getenv(reloadSecretEnv), reloads: make(chan *reloadJob),
+		overlays: cmp.Or(os.Getenv(reloadDirEnv), defaultReloadDir),
+		callers:  settings.Callers, reloads: make(chan *reloadJob),
 	}, nil
 }
 
 func (h *host) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// A reload authenticates with its secret, not platform context. Without a secret the path is like any other.
-	if h.reloadSecret != "" && r.Method == http.MethodPost && r.URL.Path == reloadPath {
+	// A reload is admitted by its mesh caller, without platform context; any other caller is answered like any request.
+	if caller := meshCaller(r); caller != "" && slices.Contains(h.callers, caller) && r.Method == http.MethodPost && r.URL.Path == reloadPath {
 		h.reload(w, r)
 		return
 	}
