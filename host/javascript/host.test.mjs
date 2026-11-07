@@ -41,18 +41,16 @@ async function app(t, peers = {}, extra = {}) {
       env: {
         PATH: process.env.PATH,
         PORT: String(port),
-        HOLON_MCP_RUNTIME_CONFIG: JSON.stringify({ version: 2, peers, callers: [discoveryCaller] }),
+        HOLON_MCP_RUNTIME_CONFIG: JSON.stringify({ version: 2, peers }),
         ...extra,
       },
     },
   );
-  const events = [];
   const messages = [];
   let stderr = "";
   child.stderr.on("data", (data) => (stderr += data));
   createInterface({ input: child.stdout }).on("line", (line) => {
     const message = JSON.parse(line);
-    events.push(message.event);
     messages.push(message);
     child.emit("message", message);
   });
@@ -76,7 +74,7 @@ async function app(t, peers = {}, extra = {}) {
       throw new Error(stderr);
     }),
   ]);
-  return { child, events, messages, signal: t.signal, url: `http://127.0.0.1:${port}/mcp` };
+  return { child, messages, signal: t.signal, url: `http://127.0.0.1:${port}/mcp` };
 }
 function context(subject, principal = {}, hook) {
   const claims = {
@@ -118,9 +116,10 @@ async function call(url, name, headers, signal) {
   }
 }
 async function event(app, name, count = 1) {
-  while (app.events.filter((value) => value === name).length < count) {
+  while (app.messages.filter((message) => message.event === name).length < count) {
     await once(app.child, "message", { signal: app.signal });
   }
+  return app.messages.findLast((message) => message.event === name);
 }
 function release(app, name) {
   app.child.stdin.write(`${JSON.stringify({ release: name })}\n`);
@@ -140,9 +139,7 @@ test(
     });
     const externalPort = await listen(external);
     t.after(() => external.close());
-    const meshContexts = [];
     const mesh = createServer((req, res) => {
-      meshContexts.push("x-holon-context" in req.headers);
       if (redirect) {
         res
           .writeHead(302, { location: `http://127.0.0.1:${externalPort}` })
@@ -301,13 +298,7 @@ test(
     await event(upstream, "stream-peer-ready");
     release(upstream, "stream");
     await streaming.text();
-    meshContexts.length = 0;
-    await event(upstream, "stream-late-forwarded");
-    assert.equal(
-      upstream.messages.find((m) => m.event === "stream-late-forwarded").identity,
-      null,
-    );
-    assert(meshContexts.length > 0 && meshContexts.every((present) => !present));
+    assert.equal((await event(upstream, "stream-late-forwarded")).identity, null);
     await event(downstream, "peer-stream-closed");
     redirect = true;
     externalRequests.length = 0;

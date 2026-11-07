@@ -25,7 +25,7 @@ type scope struct {
 	ctx      context.Context
 	token    string
 	identity *identity
-	trace    http.Header
+	forward  http.Header
 }
 
 type host struct {
@@ -41,8 +41,7 @@ func newHost() (*host, error) {
 	var peers map[string]*url.URL
 	var settings runtimecontract.Config
 	if raw, configured := os.LookupEnv(protocol.RuntimeConfigEnv); configured {
-		if protocol.DecodeJSONNonNull([]byte(raw), &settings) != nil || settings.Version != 2 || settings.Peers == nil ||
-			slices.ContainsFunc(settings.Callers, func(caller string) bool { return !strings.HasPrefix(caller, "spiffe://") }) {
+		if protocol.DecodeJSONNonNull([]byte(raw), &settings) != nil || settings.Version != 2 || settings.Peers == nil {
 			return nil, errors.New("invalid platform identity configuration")
 		}
 		peers = make(map[string]*url.URL, len(settings.Peers))
@@ -82,14 +81,14 @@ func (h *host) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	stripHolon(r.Header)
-	id := rand.Text()
-	s := &scope{ctx: r.Context(), token: token, identity: identity, trace: http.Header{}}
-	for _, name := range []string{"Traceparent", "Tracestate"} {
+	s := &scope{ctx: r.Context(), token: token, identity: identity, forward: http.Header{}}
+	for _, name := range []string{"Traceparent", "Tracestate", runtimecontract.ContextHeader} {
 		if value := r.Header.Get(name); value != "" {
-			s.trace.Set(name, value)
+			s.forward.Set(name, value)
 		}
 	}
+	stripHolon(r.Header)
+	id := rand.Text()
 	h.mu.Lock()
 	h.scopes[id] = s
 	h.mu.Unlock()
@@ -136,21 +135,19 @@ func (h *host) peer(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s := h.active(r.Header.Get(runtimecontract.ScopeHeader))
-	ctx, cancel := context.WithCancel(r.Context())
+	ctx := r.Context()
 	if s != nil && s.token != "" {
+		var cancel context.CancelFunc
 		ctx, cancel = context.WithCancel(s.ctx)
+		defer cancel()
 		defer context.AfterFunc(r.Context(), cancel)()
 	}
-	defer cancel()
 	proxy := h.proxy(func(p *httputil.ProxyRequest) {
 		*p.Out.URL = *target
 		p.Out.Host = target.Host
 		p.Out.Header.Del(runtimecontract.ScopeHeader)
 		if s != nil {
-			maps.Copy(p.Out.Header, s.trace)
-		}
-		if s != nil && s.token != "" {
-			p.Out.Header.Set(runtimecontract.ContextHeader, s.token)
+			maps.Copy(p.Out.Header, s.forward)
 		}
 	})
 	proxy.ModifyResponse = func(response *http.Response) error {

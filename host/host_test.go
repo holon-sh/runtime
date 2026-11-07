@@ -1,7 +1,6 @@
 package host
 
 import (
-	"cmp"
 	"context"
 	"encoding/base64"
 	"net/http"
@@ -15,30 +14,27 @@ import (
 )
 
 func TestAdmission(t *testing.T) {
-	const api = "spiffe://cluster.local/ns/control/sa/api"
 	const reporter = "spiffe://cluster.local/ns/session/sa/reporter"
 	valid := `{"exp":4102444800,"aud":["https://holon.example"],"principal":{"iss":"issuer","sub":"user","client_id":"client","scope":"read write"}}`
 	principal := `{"token":"TOKEN","clientId":"client","scopes":["read","write"],"expiresAt":4102444800,"resource":"https://holon.example","extra":{"caller":"spiffe://edge","iss":"issuer","sub":"user"}}`
 	for _, tc := range []struct {
-		name, config, request, caller, claims, duplicate, identity string
+		name, caller, claims, duplicate, identity string
 	}{
-		{"principal context", "", "POST /mcp tools/call", "spiffe://edge", valid, "", principal},
-		{"principal-less context", "", "POST /mcp tools/call", "spiffe://edge", `{"exp":4102444800,"aud":["https://holon.example"]}`, "", "null"},
-		{"expired", "", "POST /mcp tools/call", "spiffe://edge", strings.Replace(valid, "4102444800", "1", 1), "", ""},
-		{"missing expiry", "", "POST /mcp tools/call", "spiffe://edge", `{"aud":["https://holon.example"]}`, "", ""},
-		{"multiple audiences", "", "POST /mcp tools/call", "spiffe://edge", `{"exp":4102444800,"aud":["https://one.example","https://two.example"]}`, "", ""},
-		{"relative audience", "", "POST /mcp tools/call", "spiffe://edge", `{"exp":4102444800,"aud":["/relative"]}`, "", ""},
-		{"invalid principal", "", "POST /mcp tools/call", "spiffe://edge", strings.Replace(valid, `"client_id":"client"`, `"client_id":null`, 1), "", ""},
-		{"invalid scopes", "", "POST /mcp tools/call", "spiffe://edge", strings.Replace(valid, `"scope":"read write"`, `"scope":[]`, 1), "", ""},
-		{"workload call", "", "POST /mcp tools/call", reporter, "", "", "null"},
-		{"control plane discovery", "", "POST /mcp server/discover", api, "", "", "null"},
-		{"control plane probe", "", "HEAD /", api, "", "", "null"},
-		{"caller outside the mesh", "", "POST /mcp tools/call", "https://edge", "", "", ""},
-		{"two callers", "", "POST /mcp tools/call", "spiffe://edge", "", runtimecontract.CallerHeader, ""},
-		{"two contexts", "", "POST /mcp tools/call", "spiffe://edge", valid, runtimecontract.ContextHeader, ""},
+		{"principal context", "spiffe://edge", valid, "", principal},
+		{"principal-less context", "spiffe://edge", `{"exp":4102444800,"aud":["https://holon.example"]}`, "", "null"},
+		{"expired", "spiffe://edge", strings.Replace(valid, "4102444800", "1", 1), "", ""},
+		{"missing expiry", "spiffe://edge", `{"aud":["https://holon.example"]}`, "", ""},
+		{"multiple audiences", "spiffe://edge", `{"exp":4102444800,"aud":["https://one.example","https://two.example"]}`, "", ""},
+		{"relative audience", "spiffe://edge", `{"exp":4102444800,"aud":["/relative"]}`, "", ""},
+		{"invalid principal", "spiffe://edge", strings.Replace(valid, `"client_id":"client"`, `"client_id":null`, 1), "", ""},
+		{"invalid scopes", "spiffe://edge", strings.Replace(valid, `"scope":"read write"`, `"scope":[]`, 1), "", ""},
+		{"workload call", reporter, "", "", "null"},
+		{"caller outside the mesh", "https://edge", "", "", ""},
+		{"two callers", "spiffe://edge", "", runtimecontract.CallerHeader, ""},
+		{"two contexts", "spiffe://edge", valid, runtimecontract.ContextHeader, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv(protocol.RuntimeConfigEnv, cmp.Or(tc.config, `{"version":2,"peers":{},"callers":["`+api+`"]}`))
+			t.Setenv(protocol.RuntimeConfigEnv, `{"version":2,"peers":{}}`)
 			h, err := newHost()
 			if err != nil {
 				t.Fatal(err)
@@ -53,10 +49,7 @@ func TestAdmission(t *testing.T) {
 				w.WriteHeader(http.StatusNoContent)
 			})
 			h.frontend = h.application
-			method, target, _ := strings.Cut(tc.request, " ")
-			target, mcpMethod, _ := strings.Cut(target, " ")
-			r := httptest.NewRequestWithContext(t.Context(), method, target, nil)
-			r.Header.Set("Mcp-Method", mcpMethod)
+			r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/mcp", nil)
 			r.Header.Set(runtimecontract.CallerHeader, tc.caller)
 			token := "header." + base64.RawURLEncoding.EncodeToString([]byte(tc.claims)) + ".signature"
 			if tc.claims != "" {
@@ -74,7 +67,7 @@ func TestAdmission(t *testing.T) {
 			if response.Code != want || response.Header().Get("Cache-Control") != cache {
 				t.Fatalf("admission: %d %v", response.Code, response.Header())
 			}
-			if tc.request != "HEAD /" && identity != strings.Replace(tc.identity, "TOKEN", token, 1) {
+			if identity != strings.Replace(tc.identity, "TOKEN", token, 1) {
 				t.Fatalf("identity: %s", identity)
 			}
 		})
@@ -109,9 +102,9 @@ func TestPeerCalls(t *testing.T) {
 			cancel()
 			trace := http.Header{"Traceparent": {"00-trace-span-01"}}
 			h.scopes = map[string]*scope{
-				"request":  {ctx: t.Context(), token: token, trace: trace},
-				"workload": {ctx: t.Context(), trace: trace},
-				"ended":    {ctx: ended, token: token, trace: trace},
+				"request":  {ctx: t.Context(), token: token, forward: http.Header{"Traceparent": trace["Traceparent"], runtimecontract.ContextHeader: {token}}},
+				"workload": {ctx: t.Context(), forward: trace},
+				"ended":    {ctx: ended, token: token, forward: trace},
 			}
 			r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/peer/crm", nil)
 			r.SetPathValue("peer", "crm")
@@ -160,7 +153,7 @@ func TestPeerCallLifetime(t *testing.T) {
 			}
 			inbound, endInbound := context.WithCancel(t.Context())
 			defer endInbound()
-			h.scopes["request"] = &scope{ctx: inbound, token: "header.claims.signature", trace: http.Header{}}
+			h.scopes["request"] = &scope{ctx: inbound, token: "header.claims.signature"}
 			application, endApplication := context.WithCancel(t.Context())
 			defer endApplication()
 			r := httptest.NewRequestWithContext(application, http.MethodPost, "/peer/crm", nil)
@@ -193,7 +186,6 @@ func TestPeerCallLifetime(t *testing.T) {
 func TestInvalidConfiguration(t *testing.T) {
 	for _, raw := range []string{
 		`{"version":1,"peers":{}}`, `{"version":2}`, `{"version":2,"peers":{},"unknown":true}`,
-		`{"version":2,"peers":{},"callers":["spiffe://edge","https://edge"]}`,
 		`{"version":2,"peers":{"peer":"https://peer/mcp"}}`, `{"version":2,"peers":{"peer":"http://user@peer/mcp"}}`,
 	} {
 		t.Run(raw, func(t *testing.T) {

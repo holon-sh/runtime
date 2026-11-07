@@ -21,16 +21,18 @@ type identity struct {
 }
 
 func admit(r *http.Request) (*identity, bool) {
-	token, caller := r.Header.Get(runtimecontract.ContextHeader), r.Header.Get(runtimecontract.CallerHeader)
+	caller := r.Header.Get(runtimecontract.CallerHeader)
 	if len(r.Header.Values(runtimecontract.CallerHeader)) != 1 || !strings.HasPrefix(caller, "spiffe://") {
 		return nil, false
 	}
-	switch contexts := len(r.Header.Values(runtimecontract.ContextHeader)); {
-	case contexts == 0:
+	contexts := r.Header.Values(runtimecontract.ContextHeader)
+	if len(contexts) == 0 {
 		return nil, true
-	case contexts > 1 || len(token) > 16384:
+	}
+	if len(contexts) > 1 || len(contexts[0]) > 16384 {
 		return nil, false
 	}
+	token := contexts[0]
 	var claims struct {
 		Expires   float64        `json:"exp"`
 		Audience  []string       `json:"aud"`

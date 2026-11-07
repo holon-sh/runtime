@@ -26,8 +26,8 @@ peer_binding = resolve_default_binding("peer")
 http: httpx2.AsyncClient
 
 
-def emit(event: str) -> None:
-    print(json.dumps({"event": event}), flush=True)
+def emit(event: str, **extra: object) -> None:
+    print(json.dumps({"event": event, **extra}), flush=True)
 
 
 @asynccontextmanager
@@ -181,14 +181,8 @@ def make_app(**options: Any) -> ASGIApp:
                 await http.aclose()
                 block = (await call_peer("inspect")).content[0]
                 assert isinstance(block, TextContent)
-                print(
-                    json.dumps(
-                        {
-                            "event": "stream-late-forwarded",
-                            "identity": json.loads(block.text)["identity"],
-                        }
-                    ),
-                    flush=True,
+                emit(
+                    "stream-late-forwarded", identity=json.loads(block.text)["identity"]
                 )
 
             asyncio.create_task(read_peer())

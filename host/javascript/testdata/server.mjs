@@ -21,7 +21,7 @@ commands.on("line", (line) => {
   const { release } = JSON.parse(line);
   gates[release].resolve();
 });
-const emit = (event) => console.log(JSON.stringify({ event }));
+const emit = (event, extra = {}) => console.log(JSON.stringify({ event, ...extra }));
 const inputSchema = fromJsonSchema({ type: "object", additionalProperties: false });
 
 async function callPeer(name) {
@@ -119,10 +119,7 @@ export default {
       void (async () => {
         await peer.text().catch(() => {});
         const result = await callPeer("inspect");
-        console.log(JSON.stringify({
-          event: "stream-late-forwarded",
-          identity: JSON.parse(result.content[0].text).identity,
-        }));
+        emit("stream-late-forwarded", { identity: JSON.parse(result.content[0].text).identity });
       })();
       return new Response(
         new ReadableStream({
