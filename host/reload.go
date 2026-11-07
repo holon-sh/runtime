@@ -2,7 +2,6 @@ package host
 
 import (
 	"archive/tar"
-	"cmp"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -30,19 +29,18 @@ const (
 	reloadDirEnv      = "HOLON_RELOAD_DIR"
 	defaultReloadDir  = "/tmp/holon-source"
 	overlayMediaType  = "application/vnd.holon.source-overlay.v0.tar+zstd"
-	fetchTimeout      = 45 * time.Second
 	maxReloadBodySize = 64 << 10
 )
 
-// readyTimeout bounds a restarted child's startup, inside the minute the caller waits for the reply.
-var readyTimeout = 45 * time.Second
+// reloadTimeout bounds a reload from its request to the new child's ready, inside the minute the caller waits.
+var reloadTimeout = 45 * time.Second
 
 type reloadRequest struct {
-	Registry   string `json:"registry,omitempty"`
+	Registry   string `json:"registry"`
 	Repository string `json:"repository"`
 	Token      string `json:"token"`
 	Digest     string `json:"digest"`
-	MediaType  string `json:"mediaType,omitempty"`
+	MediaType  string `json:"mediaType"`
 }
 
 type reloadReply struct {
@@ -54,23 +52,17 @@ type reloadReply struct {
 type reloadFailure struct {
 	status  int
 	Message string `json:"error"`
-	Digest  string `json:"digest,omitempty"`
 	Exit    string `json:"exit,omitempty"`
 }
 
 func (f *reloadFailure) Error() string { return f.Message }
 
-func (f *reloadFailure) outcome() reloadOutcome { return reloadOutcome{f.status, f} }
-
-type reloadOutcome struct {
-	status int
-	body   any
-}
-
-// reloadJob hands an unpacked overlay to Run, which owns the child.
+// reloadJob hands an unpacked overlay to Run, which owns the child. Run fills in the times before a nil reply.
 type reloadJob struct {
-	directory, digest string
-	reply             chan reloadOutcome
+	directory            string
+	deadline             time.Time
+	restartedAt, readyAt time.Time
+	reply                chan *reloadFailure
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
@@ -81,6 +73,7 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 }
 
 func (h *host) reload(w http.ResponseWriter, r *http.Request) {
+	deadline := time.Now().Add(reloadTimeout)
 	presented, _ := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 	got, want := sha256.Sum256([]byte(presented)), sha256.Sum256([]byte(h.reloadSecret))
 	if subtle.ConstantTimeCompare(got[:], want[:]) != 1 {
@@ -89,14 +82,11 @@ func (h *host) reload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var request reloadRequest
-	data, err := io.ReadAll(io.LimitReader(r.Body, maxReloadBodySize))
-	if err != nil || protocol.DecodeJSONNonNull(data, &request) != nil || !protocol.ValidDigest(request.Digest) || request.Token == "" ||
-		request.MediaType != "" && request.MediaType != overlayMediaType {
-		writeJSON(w, http.StatusBadRequest, reloadFailure{Message: "invalid reload request"})
-		return
+	var blob *url.URL
+	if data, err := io.ReadAll(io.LimitReader(r.Body, maxReloadBodySize)); err == nil && protocol.DecodeJSONNonNull(data, &request) == nil {
+		blob = request.blob()
 	}
-	blob, err := blobURL(request)
-	if err != nil {
+	if blob == nil {
 		writeJSON(w, http.StatusBadRequest, reloadFailure{Message: "invalid reload request"})
 		return
 	}
@@ -105,43 +95,34 @@ func (h *host) reload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer h.reloading.Store(false)
-	directory, failure := h.fetchOverlay(r.Context(), blob, request)
+	job := &reloadJob{deadline: deadline, reply: make(chan *reloadFailure, 1)}
+	var failure *reloadFailure
+	if job.directory, failure = h.fetchOverlay(r.Context(), blob, request, deadline); failure == nil {
+		// Run receives unless it is returning, and the restart then waits for it even if the caller has gone.
+		h.reloads <- job
+		failure = <-job.reply
+	}
 	if failure != nil {
 		writeJSON(w, failure.status, failure)
 		return
 	}
-	job := reloadJob{directory: directory, digest: request.Digest, reply: make(chan reloadOutcome, 1)}
-	select {
-	case h.reloads <- job:
-	case <-r.Context().Done():
-		_ = os.RemoveAll(directory)
-		writeJSON(w, http.StatusServiceUnavailable, reloadFailure{Message: "reload cancelled"})
-		return
-	}
-	// The restart is past the point of return, so this waits for it even if the caller has gone.
-	outcome := <-job.reply
-	writeJSON(w, outcome.status, outcome.body)
+	writeJSON(w, http.StatusOK, reloadReply{job.restartedAt.UTC(), job.readyAt.UTC(), request.Digest})
 }
 
-// blobURL accepts the registry's URL beside a repository name, or a repository that starts with its registry's host.
-func blobURL(request reloadRequest) (*url.URL, error) {
-	registry, name := request.Registry, request.Repository
-	if registry == "" {
-		var host string
-		host, name, _ = strings.Cut(request.Repository, "/")
-		registry = "https://" + host
+// blob is where a well-formed request's overlay is, and nil when the request is malformed.
+func (request reloadRequest) blob() *url.URL {
+	base, err := url.Parse(request.Registry)
+	if err != nil || base.Host == "" || base.Scheme != "http" && base.Scheme != "https" || request.Repository == "" ||
+		request.Token == "" || !protocol.ValidDigest(request.Digest) || request.MediaType != overlayMediaType {
+		return nil
 	}
-	base, err := url.Parse(registry)
-	if err != nil || base.Host == "" || base.Scheme != "http" && base.Scheme != "https" || name == "" {
-		return nil, errors.New("invalid registry")
-	}
-	return base.JoinPath("v2", name, "blobs", request.Digest), nil
+	return base.JoinPath("v2", request.Repository, "blobs", request.Digest)
 }
 
 // fetchOverlay streams the blob into a fresh directory while hashing it. Nothing runs from the directory until the
 // digest has matched, and it is removed if it does not.
-func (h *host) fetchOverlay(ctx context.Context, blob *url.URL, request reloadRequest) (string, *reloadFailure) {
-	ctx, cancel := context.WithTimeout(ctx, fetchTimeout)
+func (h *host) fetchOverlay(ctx context.Context, blob *url.URL, request reloadRequest, deadline time.Time) (string, *reloadFailure) {
+	ctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 	get, err := http.NewRequestWithContext(ctx, http.MethodGet, blob.String(), nil)
 	if err != nil {
@@ -156,13 +137,9 @@ func (h *host) fetchOverlay(ctx context.Context, blob *url.URL, request reloadRe
 	if response.StatusCode != http.StatusOK {
 		return "", &reloadFailure{status: http.StatusBadGateway, Message: fmt.Sprintf("registry answered %d", response.StatusCode)}
 	}
-	root := cmp.Or(os.Getenv(reloadDirEnv), defaultReloadDir)
-	if err := os.MkdirAll(root, 0o700); err != nil {
-		return "", &reloadFailure{status: http.StatusInternalServerError, Message: "prepare source directory: " + err.Error()}
-	}
 	// The suffix keeps the directory fresh when a digest returns while its earlier directory is in use.
 	short := strings.TrimPrefix(request.Digest, "sha256:")[:12]
-	directory, err := os.MkdirTemp(root, short+"-")
+	directory, err := os.MkdirTemp(h.overlays, short+"-")
 	if err != nil {
 		return "", &reloadFailure{status: http.StatusInternalServerError, Message: "prepare source directory: " + err.Error()}
 	}
@@ -181,8 +158,8 @@ func unpackVerified(blob io.Reader, directory, digest, image string) *reloadFail
 	if _, err := io.Copy(io.Discard, stream); err != nil {
 		return &reloadFailure{status: http.StatusBadGateway, Message: "registry read failed"}
 	}
-	if actual := "sha256:" + hex.EncodeToString(hash.Sum(nil)); actual != digest {
-		return &reloadFailure{status: http.StatusConflict, Message: "digest mismatch", Digest: actual}
+	if "sha256:"+hex.EncodeToString(hash.Sum(nil)) != digest {
+		return &reloadFailure{status: http.StatusBadGateway, Message: "digest mismatch"}
 	}
 	if err := errors.Join(unpacked, linkImageEntries(image, directory)); err != nil {
 		return &reloadFailure{status: http.StatusInternalServerError, Message: "unpack source: " + err.Error()}

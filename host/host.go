@@ -1,6 +1,7 @@
 package host
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -34,9 +35,10 @@ type host struct {
 	peers        map[string]*url.URL
 	transport    *http.Transport
 	image        string // the application directory, which an overlay falls back to and which is never removed
+	overlays     string // the directory that holds each overlay's directory
 	reloadSecret string
 	reloading    atomic.Bool
-	reloads      chan reloadJob
+	reloads      chan *reloadJob
 	mu           sync.Mutex
 	application  http.Handler // nil from a restart's start until its child is ready
 	frontend     http.Handler
@@ -65,7 +67,8 @@ func newHost() (*host, error) {
 	transport.Proxy = nil
 	return &host{
 		callers: settings.Callers, peers: peers, transport: transport,
-		reloadSecret: os.Getenv(reloadSecretEnv), reloads: make(chan reloadJob),
+		overlays:     cmp.Or(os.Getenv(reloadDirEnv), defaultReloadDir),
+		reloadSecret: os.Getenv(reloadSecretEnv), reloads: make(chan *reloadJob),
 		scopes: map[string]*scope{},
 	}, nil
 }
@@ -81,7 +84,7 @@ func (h *host) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mu.Unlock()
 	if application == nil {
 		w.Header().Set("Retry-After", "1")
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "application restarting"})
+		http.Error(w, "Application restarting", http.StatusServiceUnavailable)
 		return
 	}
 	r = r.Clone(r.Context())

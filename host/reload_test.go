@@ -44,6 +44,8 @@ class Handler(BaseHTTPRequestHandler):
             "pwd": os.environ.get("PWD"),
             "secret": os.environ.get("HOLON_RELOAD_SECRET"),
             "modules": open("node_modules/marker").read() if os.path.exists("node_modules/marker") else None,
+            "bytecode": os.path.exists("__pycache__"),
+            "executable": os.access("tools/run", os.X_OK),
         }).encode()
         self.send_response(200)
         self.send_header("Content-Length", str(len(body)))
@@ -69,7 +71,8 @@ func sourceFiles(message, beforeReady string) map[string]string {
 	return map[string]string{"main.py": childSource(message, beforeReady), "web/index.html": message}
 }
 
-func overlay(t *testing.T, files map[string]string) []byte {
+// overlay packs files, then entries without contents, into a zstd tar.
+func overlay(t *testing.T, files map[string]string, entries ...*tar.Header) []byte {
 	t.Helper()
 	var compressed bytes.Buffer
 	encoder, err := zstd.NewWriter(&compressed)
@@ -82,6 +85,11 @@ func overlay(t *testing.T, files map[string]string) []byte {
 			t.Fatal(err)
 		}
 		if _, err := archive.Write([]byte(files[name])); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, entry := range entries {
+		if err := archive.WriteHeader(entry); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -141,7 +149,7 @@ func startRuntime(t *testing.T, secret string, blobs map[string][]byte) *testRun
 		t.Fatal(err)
 	}
 	writeTree(t, image, sourceFiles("image", ""))
-	writeTree(t, image, map[string]string{"node_modules/marker": "from image"})
+	writeTree(t, image, map[string]string{"node_modules/marker": "from image", "__pycache__/main.pyc": ""})
 	t.Chdir(image)
 	reserved, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -229,11 +237,13 @@ func (rt *testRuntime) reload(digest string) (int, []byte) {
 }
 
 type childReply struct {
-	Message string  `json:"message"`
-	Cwd     string  `json:"cwd"`
-	Pwd     string  `json:"pwd"`
-	Secret  *string `json:"secret"`
-	Modules *string `json:"modules"`
+	Message    string  `json:"message"`
+	Cwd        string  `json:"cwd"`
+	Pwd        string  `json:"pwd"`
+	Secret     *string `json:"secret"`
+	Modules    *string `json:"modules"`
+	Bytecode   bool    `json:"bytecode"`
+	Executable bool    `json:"executable"`
 }
 
 func (rt *testRuntime) child() childReply {
@@ -275,7 +285,13 @@ func (rt *testRuntime) overlayDirectories() []string {
 }
 
 func TestReloadRestartsFromNewSource(t *testing.T) {
-	first, second := overlay(t, sourceFiles("first", "")), overlay(t, sourceFiles("second", ""))
+	// A read-only directory must still be removable once a later overlay replaces this one.
+	first := overlay(t, sourceFiles("first", ""),
+		&tar.Header{Name: "readonly/", Typeflag: tar.TypeDir, Mode: 0o500},
+		&tar.Header{Name: "readonly/run.sh", Typeflag: tar.TypeReg, Mode: 0o755},
+		&tar.Header{Name: "tools/run", Typeflag: tar.TypeSymlink, Linkname: "../readonly/run.sh", Mode: 0o777},
+	)
+	second := overlay(t, sourceFiles("second", ""))
 	rt := startRuntime(t, testSecret, map[string][]byte{blobDigest(first): first, blobDigest(second): second})
 	if got := rt.child(); got.Message != "image" || got.Cwd != rt.image || got.Secret != nil {
 		t.Fatalf("boot: %+v", got)
@@ -299,8 +315,8 @@ func TestReloadRestartsFromNewSource(t *testing.T) {
 		got.Pwd != got.Cwd || got.Secret != nil {
 		t.Fatalf("overlay: %+v", got)
 	}
-	if got.Modules == nil || *got.Modules != "from image" {
-		t.Fatalf("image entries are not visible from the overlay: %+v", got)
+	if !got.Executable {
+		t.Fatalf("overlay lost its modes: %+v", got)
 	}
 	if page := rt.page(); page != "first" {
 		t.Fatalf("frontend: %q", page)
@@ -330,40 +346,38 @@ func TestReloadKeepsWhatTheImageBuilt(t *testing.T) {
 	if status, body := rt.reload(blobDigest(blob)); status != http.StatusOK {
 		t.Fatalf("%d %s", status, body)
 	}
-	if got, page := rt.child(), rt.page(); got.Message != "new" || page != "image" {
+	got, page := rt.child(), rt.page()
+	if got.Message != "new" || page != "image" || got.Modules == nil || *got.Modules != "from image" || got.Bytecode {
 		t.Fatalf("%+v %q", got, page)
-	}
-}
-
-func TestLinkImageEntries(t *testing.T) {
-	image, directory := t.TempDir(), t.TempDir()
-	writeTree(t, image, map[string]string{"node_modules/a": "", "dist/b": "", "__pycache__/c": "", "source.py": "image"})
-	writeTree(t, directory, map[string]string{"source.py": "overlay"})
-	if err := linkImageEntries(image, directory); err != nil {
-		t.Fatal(err)
-	}
-	entries, err := os.ReadDir(directory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	names := []string{}
-	for _, entry := range entries {
-		names = append(names, entry.Name())
-	}
-	if !slices.Equal(names, []string{"dist", "node_modules", "source.py"}) {
-		t.Fatalf("entries: %v", names)
-	}
-	if data, err := os.ReadFile(filepath.Join(directory, "source.py")); err != nil || string(data) != "overlay" {
-		t.Fatalf("overlay file: %q %v", data, err)
 	}
 }
 
 func TestReloadRejectsBeforeRestart(t *testing.T) {
 	blob := overlay(t, sourceFiles("new", ""))
 	digest := blobDigest(blob)
-	rt := startRuntime(t, testSecret, map[string][]byte{digest: blob})
+	blobs := map[string][]byte{digest: blob}
+	// served adds a blob under its own digest, or under claimed when that is given.
+	served := func(blob []byte, claimed ...string) string {
+		digest := append(claimed, blobDigest(blob))[0]
+		blobs[digest] = blob
+		return digest
+	}
+	file := func(name string) *tar.Header { return &tar.Header{Name: name, Typeflag: tar.TypeReg, Mode: 0o644} }
+	link := func(name, target string) *tar.Header {
+		return &tar.Header{Name: name, Typeflag: tar.TypeSymlink, Linkname: target, Mode: 0o777}
+	}
+	unpackable := func(entries ...*tar.Header) string { return served(overlay(t, nil, entries...)) }
+	tampered := served(overlay(t, sourceFiles("tampered", "")), "sha256:"+strings.Repeat("a", 64))
+	notArchive := served([]byte("not zstd"))
+	parent, nestedParent, grandparent := unpackable(file("../outside")), unpackable(file("a/../../outside")), unpackable(file("../../outside"))
+	absolute, absoluteLink, parentLink := unpackable(file("/outside")), unpackable(link("link", "/etc")), unpackable(link("a/link", "../../../outside"))
+	throughLink := unpackable(link("link", "a"), link("a", ".."), file("link/outside"))
+	device := unpackable(&tar.Header{Name: "device", Typeflag: tar.TypeChar, Mode: 0o644})
+	rt := startRuntime(t, testSecret, blobs)
 	request := func(fields map[string]string) string {
-		merged := map[string]string{"registry": rt.registry, "repository": "holon/app", "token": "pull", "digest": digest}
+		merged := map[string]string{
+			"registry": rt.registry, "repository": "holon/app", "token": "pull", "digest": digest, "mediaType": overlayMediaType,
+		}
 		maps.Copy(merged, fields)
 		body, _ := json.Marshal(merged)
 		return string(body)
@@ -380,9 +394,23 @@ func TestReloadRejectsBeforeRestart(t *testing.T) {
 		{"bad digest", testSecret, request(map[string]string{"digest": "sha256:abc"}), http.StatusBadRequest},
 		{"no token", testSecret, request(map[string]string{"token": ""}), http.StatusBadRequest},
 		{"no repository", testSecret, request(map[string]string{"repository": ""}), http.StatusBadRequest},
+		{"no media type", testSecret, request(map[string]string{"mediaType": ""}), http.StatusBadRequest},
 		{"other media type", testSecret, request(map[string]string{"mediaType": "application/x-tar"}), http.StatusBadRequest},
+		{"no registry", testSecret, request(map[string]string{"registry": "", "repository": "127.0.0.1/holon/app"}), http.StatusBadRequest},
+		{"registry without scheme", testSecret, request(map[string]string{"registry": "registry"}), http.StatusBadRequest},
+		{"registry of another scheme", testSecret, request(map[string]string{"registry": "ftp://registry"}), http.StatusBadRequest},
 		{"registry refuses token", testSecret, request(map[string]string{"token": "other"}), http.StatusBadGateway},
 		{"registry has no blob", testSecret, request(map[string]string{"digest": "sha256:" + strings.Repeat("0", 64)}), http.StatusBadGateway},
+		{"blob does not match its digest", testSecret, request(map[string]string{"digest": tampered}), http.StatusBadGateway},
+		{"not an archive", testSecret, request(map[string]string{"digest": notArchive}), http.StatusInternalServerError},
+		{"parent path", testSecret, request(map[string]string{"digest": parent}), http.StatusInternalServerError},
+		{"nested parent path", testSecret, request(map[string]string{"digest": nestedParent}), http.StatusInternalServerError},
+		{"path above the overlay root", testSecret, request(map[string]string{"digest": grandparent}), http.StatusInternalServerError},
+		{"absolute path", testSecret, request(map[string]string{"digest": absolute}), http.StatusInternalServerError},
+		{"absolute link", testSecret, request(map[string]string{"digest": absoluteLink}), http.StatusInternalServerError},
+		{"parent link", testSecret, request(map[string]string{"digest": parentLink}), http.StatusInternalServerError},
+		{"write through links", testSecret, request(map[string]string{"digest": throughLink}), http.StatusInternalServerError},
+		{"device", testSecret, request(map[string]string{"digest": device}), http.StatusInternalServerError},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if status, body := rt.post(tc.secret, tc.body); status != tc.status {
@@ -394,6 +422,9 @@ func TestReloadRejectsBeforeRestart(t *testing.T) {
 			if directories := rt.overlayDirectories(); len(directories) != 0 {
 				t.Fatalf("overlay left behind: %v", directories)
 			}
+			if entries, _ := os.ReadDir(filepath.Dir(rt.overlays)); len(entries) != 1 {
+				t.Fatalf("wrote outside the overlay root: %v", entries)
+			}
 		})
 	}
 }
@@ -402,31 +433,6 @@ func TestReloadPathWithoutSecretIsLikeAnyOther(t *testing.T) {
 	rt := startRuntime(t, "", nil)
 	if status, _ := rt.post("anything", `{}`); status != http.StatusNotFound {
 		t.Fatalf("reload path: %d", status)
-	}
-}
-
-func TestReloadDigestMismatch(t *testing.T) {
-	for name, served := range map[string][]byte{
-		"valid archive under another digest": overlay(t, sourceFiles("tampered", "")),
-		"not an archive":                     []byte("not zstd"),
-	} {
-		t.Run(name, func(t *testing.T) {
-			claimed := "sha256:" + strings.Repeat("a", 64)
-			rt := startRuntime(t, testSecret, map[string][]byte{claimed: served})
-			status, body := rt.reload(claimed)
-			var failure struct {
-				Digest string `json:"digest"`
-			}
-			if status != http.StatusConflict || json.Unmarshal(body, &failure) != nil || failure.Digest != blobDigest(served) {
-				t.Fatalf("%d %s", status, body)
-			}
-			if got := rt.child(); got.Message != "image" {
-				t.Fatalf("application changed: %+v", got)
-			}
-			if directories := rt.overlayDirectories(); len(directories) != 0 {
-				t.Fatalf("overlay left behind: %v", directories)
-			}
-		})
 	}
 }
 
@@ -452,8 +458,8 @@ func TestReloadAnswers503AndSerialisesUntilReady(t *testing.T) {
 		data, _ := io.ReadAll(response.Body)
 		_ = response.Body.Close()
 		if code == http.StatusServiceUnavailable {
-			if response.Header.Get("Content-Type") != "application/json" || !json.Valid(data) {
-				t.Fatalf("503 body: %v %s", response.Header, data)
+			if response.Header.Get("Retry-After") != "1" {
+				t.Fatalf("503: %v %s", response.Header, data)
 			}
 			break
 		}
@@ -465,7 +471,7 @@ func TestReloadAnswers503AndSerialisesUntilReady(t *testing.T) {
 	if page := rt.page(); !strings.Contains(page, "restarting") {
 		t.Fatalf("static route during restart: %q", page)
 	}
-	if status, body := rt.reload(digest); status != http.StatusConflict || strings.Contains(string(body), `"digest"`) {
+	if status, body := rt.reload(digest); status != http.StatusConflict {
 		t.Fatalf("concurrent reload: %d %s", status, body)
 	}
 	if status, _ := rt.post("wrong", `{}`); status != http.StatusUnauthorized {
@@ -481,77 +487,76 @@ func TestReloadAnswers503AndSerialisesUntilReady(t *testing.T) {
 	}
 }
 
-func TestReloadRollsBackFailedChild(t *testing.T) {
+func TestReloadRollsBack(t *testing.T) {
+	previous := reloadTimeout
+	reloadTimeout = 3 * time.Second
+	t.Cleanup(func() { reloadTimeout = previous })
 	good := overlay(t, sourceFiles("good", ""))
 	bad := overlay(t, sourceFiles("bad", "sys.exit(3)"))
-	badFrontend := overlay(t, sourceFiles("outside frontend", `FRONTEND = "/"`))
-	rt := startRuntime(t, testSecret, map[string][]byte{
-		blobDigest(good): good, blobDigest(bad): bad, blobDigest(badFrontend): badFrontend,
-	})
-	// Rolling back from the image's own directory.
-	status, body := rt.reload(blobDigest(bad))
-	var failure reloadFailure
-	if status != http.StatusInternalServerError || json.Unmarshal(body, &failure) != nil || failure.Exit != "exit status 3" {
-		t.Fatalf("failed child: %d %s", status, body)
-	}
-	if got := rt.child(); got.Message != "image" || got.Cwd != rt.image {
-		t.Fatalf("after rollback: %+v", got)
-	}
-	if directories := rt.overlayDirectories(); len(directories) != 0 {
-		t.Fatalf("failed overlay kept: %v", directories)
-	}
-	// Rolling back from an overlay, whose directory must survive.
-	if status, body := rt.reload(blobDigest(good)); status != http.StatusOK {
-		t.Fatalf("good reload: %d %s", status, body)
-	}
-	running := rt.child().Cwd
-	if status, body := rt.reload(blobDigest(bad)); status != http.StatusInternalServerError {
-		t.Fatalf("failed child: %d %s", status, body)
-	}
-	if got := rt.child(); got.Message != "good" || got.Cwd != running {
-		t.Fatalf("after rollback: %+v", got)
-	}
-	if rt.page() != "good" {
-		t.Fatal("frontend did not roll back")
-	}
-	// A child that posts ready but names a frontend outside the application also rolls back.
-	if status, body := rt.reload(blobDigest(badFrontend)); status != http.StatusInternalServerError {
-		t.Fatalf("invalid frontend: %d %s", status, body)
-	}
-	if got := rt.child(); got.Message != "good" {
-		t.Fatalf("after rollback: %+v", got)
-	}
-}
-
-func TestReloadRollsBackChildThatNeverReadies(t *testing.T) {
-	previous := readyTimeout
-	readyTimeout = 500 * time.Millisecond
-	t.Cleanup(func() { readyTimeout = previous })
-	blob := overlay(t, sourceFiles("slow", "time.sleep(60)"))
-	rt := startRuntime(t, testSecret, map[string][]byte{blobDigest(blob): blob})
-	if status, body := rt.reload(blobDigest(blob)); status != http.StatusGatewayTimeout {
-		t.Fatalf("%d %s", status, body)
-	}
-	if got := rt.child(); got.Message != "image" {
-		t.Fatalf("after rollback: %+v", got)
-	}
-}
-
-func TestReloadExitsWhenRollbackFails(t *testing.T) {
-	bad := overlay(t, sourceFiles("bad", "sys.exit(3)"))
-	rt := startRuntime(t, testSecret, map[string][]byte{blobDigest(bad): bad})
-	writeTree(t, rt.image, map[string]string{"main.py": "import sys\nsys.exit(4)\n"})
-	if status, body := rt.reload(blobDigest(bad)); status != http.StatusInternalServerError {
-		t.Fatalf("%d %s", status, body)
-	}
-	select {
-	case err := <-rt.exited:
-		rt.exited <- err
-		if err == nil || !strings.Contains(err.Error(), "restore application") {
-			t.Fatalf("exit: %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("runtime kept running with no application")
+	for _, tc := range []struct {
+		name          string
+		from, overlay []byte            // from is reloaded first, and nil leaves the image running
+		image         map[string]string // written over the image after boot
+		status        int
+		exit          string // the failed child's status in the reply
+		child         string // the source running afterwards, or "" when the runtime exits
+	}{
+		{name: "child exits", overlay: bad, status: http.StatusInternalServerError, exit: "exit status 3", child: "image"},
+		{name: "child exits on an overlay", from: good, overlay: bad, status: http.StatusInternalServerError, exit: "exit status 3", child: "good"},
+		{
+			name: "frontend outside the application", overlay: overlay(t, sourceFiles("outside", `FRONTEND = "/"`)),
+			status: http.StatusInternalServerError, child: "image",
+		},
+		{name: "child never readies", overlay: overlay(t, sourceFiles("slow", "time.sleep(60)")), status: http.StatusGatewayTimeout, child: "image"},
+		{
+			name: "previous source fails too", overlay: bad, image: map[string]string{"main.py": "import sys\nsys.exit(4)\n"},
+			status: http.StatusInternalServerError, exit: "exit status 3",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			blobs := map[string][]byte{blobDigest(tc.overlay): tc.overlay}
+			if tc.from != nil {
+				blobs[blobDigest(tc.from)] = tc.from
+			}
+			rt := startRuntime(t, testSecret, blobs)
+			if tc.from != nil {
+				if status, body := rt.reload(blobDigest(tc.from)); status != http.StatusOK {
+					t.Fatalf("first reload: %d %s", status, body)
+				}
+			}
+			before := rt.child()
+			writeTree(t, rt.image, tc.image)
+			status, body := rt.reload(blobDigest(tc.overlay))
+			var failure reloadFailure
+			if status != tc.status || json.Unmarshal(body, &failure) != nil || failure.Exit != tc.exit {
+				t.Fatalf("%d %s", status, body)
+			}
+			if tc.child == "" {
+				select {
+				case err := <-rt.exited:
+					rt.exited <- err
+					if err == nil || !strings.Contains(err.Error(), "restore application") {
+						t.Fatalf("exit: %v", err)
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("runtime kept running with no application")
+				}
+				return
+			}
+			if got := rt.child(); got.Message != tc.child || got.Cwd != before.Cwd {
+				t.Fatalf("after rollback: %+v", got)
+			}
+			if page := rt.page(); page != tc.child {
+				t.Fatalf("frontend after rollback: %q", page)
+			}
+			kept := []string{}
+			if tc.from != nil {
+				kept = append(kept, filepath.Base(before.Cwd))
+			}
+			if directories := rt.overlayDirectories(); !slices.Equal(directories, kept) {
+				t.Fatalf("overlays after rollback: %v", directories)
+			}
+		})
 	}
 }
 
@@ -572,93 +577,5 @@ func TestRuntimeExitsWhenReloadedChildCrashes(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("runtime outlived its application")
-	}
-}
-
-func TestBlobURL(t *testing.T) {
-	digest := "sha256:" + strings.Repeat("a", 64)
-	for _, tc := range []struct{ registry, repository, want string }{
-		{"http://registry.holon-system.svc.cluster.local:5000", "holon/upload/app", "http://registry.holon-system.svc.cluster.local:5000/v2/holon/upload/app/blobs/" + digest},
-		{"", "registry.example:5000/holon/app", "https://registry.example:5000/v2/holon/app/blobs/" + digest},
-		{"ftp://registry", "holon/app", ""},
-		{"registry", "holon/app", ""},
-		{"", "registry-only", ""},
-		{"http://registry", "", ""},
-	} {
-		got, err := blobURL(reloadRequest{Registry: tc.registry, Repository: tc.repository, Digest: digest})
-		if tc.want == "" && err == nil || tc.want != "" && (err != nil || got.String() != tc.want) {
-			t.Errorf("%q %q: %v %v", tc.registry, tc.repository, got, err)
-		}
-	}
-}
-
-func TestExtractOverlayStaysInside(t *testing.T) {
-	type entry struct {
-		name, link string
-		kind       byte
-	}
-	for name, entries := range map[string][]entry{
-		"parent path":        {{name: "../outside", kind: tar.TypeReg}},
-		"nested parent path": {{name: "a/../../outside", kind: tar.TypeReg}},
-		"absolute path":      {{name: "/outside", kind: tar.TypeReg}},
-		"absolute link":      {{name: "link", link: "/etc", kind: tar.TypeSymlink}},
-		"parent link":        {{name: "a/link", link: "../../outside", kind: tar.TypeSymlink}},
-		"write through link": {{name: "link", link: "a", kind: tar.TypeSymlink}, {name: "a", link: "..", kind: tar.TypeSymlink}, {name: "link/outside", kind: tar.TypeReg}},
-		"device":             {{name: "device", kind: tar.TypeChar}},
-	} {
-		t.Run(name, func(t *testing.T) {
-			parent := t.TempDir()
-			directory := filepath.Join(parent, "source")
-			if err := os.Mkdir(directory, 0o700); err != nil {
-				t.Fatal(err)
-			}
-			var compressed bytes.Buffer
-			encoder, _ := zstd.NewWriter(&compressed)
-			archive := tar.NewWriter(encoder)
-			for _, item := range entries {
-				if err := archive.WriteHeader(&tar.Header{Name: item.name, Linkname: item.link, Typeflag: item.kind, Mode: 0o644}); err != nil {
-					t.Fatal(err)
-				}
-			}
-			_ = archive.Close()
-			_ = encoder.Close()
-			if extractOverlay(&compressed, directory) == nil {
-				t.Fatal("archive accepted")
-			}
-			if entries, _ := os.ReadDir(parent); len(entries) != 1 {
-				t.Fatalf("wrote outside the directory: %v", entries)
-			}
-		})
-	}
-}
-
-func TestExtractOverlayKeepsTree(t *testing.T) {
-	var compressed bytes.Buffer
-	encoder, _ := zstd.NewWriter(&compressed)
-	archive := tar.NewWriter(encoder)
-	for _, header := range []*tar.Header{
-		{Name: "readonly/", Typeflag: tar.TypeDir, Mode: 0o500},
-		{Name: "readonly/run.sh", Typeflag: tar.TypeReg, Mode: 0o755, Size: 2},
-		{Name: "readonly/link", Typeflag: tar.TypeSymlink, Linkname: "run.sh", Mode: 0o777},
-	} {
-		if err := archive.WriteHeader(header); err != nil {
-			t.Fatal(err)
-		}
-		if header.Size != 0 {
-			_, _ = archive.Write([]byte("ok"))
-		}
-	}
-	_ = archive.Close()
-	_ = encoder.Close()
-	directory := t.TempDir()
-	if err := extractOverlay(&compressed, directory); err != nil {
-		t.Fatal(err)
-	}
-	info, err := os.Stat(filepath.Join(directory, "readonly/link"))
-	if err != nil || info.Mode().Perm()&0o100 == 0 {
-		t.Fatalf("file through link: %v %v", info, err)
-	}
-	if err := os.RemoveAll(directory); err != nil {
-		t.Fatalf("overlay cannot be removed: %v", err)
 	}
 }

@@ -1,7 +1,6 @@
 package host
 
 import (
-	"cmp"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -60,7 +59,7 @@ func Run(ctx context.Context, command []string) error {
 	}
 	if h.reloadSecret != "" {
 		// A writable volume outlives the container, and overlays from before this boot are of no use.
-		if err := os.RemoveAll(cmp.Or(os.Getenv(reloadDirEnv), defaultReloadDir)); err != nil {
+		if err := errors.Join(os.RemoveAll(h.overlays), os.MkdirAll(h.overlays, 0o700)); err != nil {
 			return err
 		}
 	}
@@ -155,9 +154,9 @@ func Run(ctx context.Context, command []string) error {
 		}()
 		return p, nil
 	}
-	current, err := start(h.image)
-	if err != nil {
-		return err
+	current, failure := awaitReady(ctx, start, h.image, nil)
+	if failure != nil {
+		return errors.Join(failure, ctx.Err())
 	}
 	defer func() {
 		_ = public.Close()
@@ -168,20 +167,13 @@ func Run(ctx context.Context, command []string) error {
 		select {
 		case <-current.done:
 			return errors.Join(errors.New("application exited"), current.err, ctx.Err())
-		case err := <-current.ready:
-			if err != nil {
-				return err
-			}
 		case err := <-servers:
 			return err
 		case <-ctx.Done():
 			return ctx.Err()
 		case job := <-h.reloads:
-			next, outcome, err := h.restart(ctx, start, current, job)
-			if next != nil {
-				current = next
-			}
-			job.reply <- outcome
+			next, failure, err := h.restart(ctx, start, current, job)
+			job.reply <- failure
 			if err != nil {
 				// Let the reply reach the caller before the pod restarts.
 				shutdown, stop := context.WithTimeout(context.Background(), time.Second)
@@ -189,6 +181,7 @@ func Run(ctx context.Context, command []string) error {
 				_ = public.Shutdown(shutdown)
 				return err
 			}
+			current = next
 		}
 	}
 }
@@ -196,35 +189,37 @@ func Run(ctx context.Context, command []string) error {
 // restart replaces the child with one running from job's directory, or restores the previous directory's child if
 // the new one does not become ready. An error means neither is running.
 func (h *host) restart(
-	ctx context.Context, start func(string) (*process, error), current *process, job reloadJob,
-) (*process, reloadOutcome, error) {
-	restartedAt := time.Now()
+	ctx context.Context, start func(string) (*process, error), current *process, job *reloadJob,
+) (*process, *reloadFailure, error) {
+	job.restartedAt = time.Now()
 	h.disconnect()
 	current.stop()
-	next, failure := awaitReady(ctx, start, job.directory)
+	next, failure := awaitReady(ctx, start, job.directory, time.After(time.Until(job.deadline)))
 	if failure == nil {
-		readyAt := time.Now()
+		job.readyAt = time.Now()
 		if current.directory != h.image {
 			_ = os.RemoveAll(current.directory)
 		}
-		return next, reloadOutcome{http.StatusOK, reloadReply{restartedAt.UTC(), readyAt.UTC(), job.digest}}, nil
+		return next, nil, nil
 	}
 	_ = os.RemoveAll(job.directory)
-	previous, restored := awaitReady(ctx, start, current.directory)
+	// The previous source started before, so it gets as long as a first boot.
+	previous, restored := awaitReady(ctx, start, current.directory, nil)
 	if restored != nil {
-		return nil, failure.outcome(), fmt.Errorf("restore application after failed reload: %w", restored)
+		return nil, failure, fmt.Errorf("restore application after failed reload: %w", restored)
 	}
-	return previous, failure.outcome(), nil
+	return previous, failure, nil
 }
 
-// awaitReady starts a child and returns it once it has posted ready; if it will not, it is not left running.
-func awaitReady(ctx context.Context, start func(string) (*process, error), directory string) (*process, *reloadFailure) {
+// awaitReady starts a child and returns it once it has posted ready; if it will not, it is not left running. A nil
+// timeout waits as long as the child runs.
+func awaitReady(
+	ctx context.Context, start func(string) (*process, error), directory string, timeout <-chan time.Time,
+) (*process, *reloadFailure) {
 	p, err := start(directory)
 	if err != nil {
 		return nil, &reloadFailure{status: http.StatusInternalServerError, Message: err.Error()}
 	}
-	timeout := time.NewTimer(readyTimeout)
-	defer timeout.Stop()
 	select {
 	case err := <-p.ready:
 		if err == nil {
@@ -236,7 +231,7 @@ func awaitReady(ctx context.Context, start func(string) (*process, error), direc
 		return nil, &reloadFailure{
 			status: http.StatusInternalServerError, Message: "application exited before ready", Exit: p.command.ProcessState.String(),
 		}
-	case <-timeout.C:
+	case <-timeout:
 		p.stop()
 		return nil, &reloadFailure{status: http.StatusGatewayTimeout, Message: "application did not become ready"}
 	case <-ctx.Done():
