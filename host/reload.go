@@ -9,7 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
@@ -21,12 +21,12 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
-// A source overlay lets `holon dev` restart the application in place from new source. It is not durable: when the
-// pod or its container restarts, the application boots from its image again and the CLI re-sends on its next save.
+// A source overlay lets `holon dev` restart the application in place from new source. The platform records the latest
+// one in the file HOLON_OVERLAY_FILE names, which a new container starts from.
 const (
 	reloadPath        = "/.holon/reload"
 	reloadDirEnv      = "HOLON_RELOAD_DIR"
-	overlayEnv        = "HOLON_OVERLAY"
+	overlayFileEnv    = "HOLON_OVERLAY_FILE"
 	defaultReloadDir  = "/tmp/holon-source"
 	overlayMediaType  = "application/vnd.holon.source-overlay.v0.tar+zstd"
 	maxReloadBodySize = 64 << 10
@@ -38,7 +38,6 @@ var reloadTimeout = 45 * time.Second
 type reloadRequest struct {
 	Registry   string `json:"registry"`
 	Repository string `json:"repository"`
-	Token      string `json:"token"`
 	Digest     string `json:"digest"`
 	MediaType  string `json:"mediaType"`
 }
@@ -102,27 +101,25 @@ func (h *host) reload(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, reloadReply{job.restartedAt.UTC(), job.readyAt.UTC(), request.Digest})
 }
 
-// bootOverlay unpacks the overlay HOLON_OVERLAY names, a reload request the platform kept from the last successful
-// reload, so that a new pod keeps the source a developer last saw running. On failure the image's directory boots.
-func (h *host) bootOverlay(ctx context.Context, value string) string {
+// bootOverlay unpacks the overlay the platform recorded. A development image holds no source of its own, so a failure
+// here fails the boot.
+func (h *host) bootOverlay(ctx context.Context, recorded []byte) (string, error) {
 	var request reloadRequest
-	if protocol.DecodeJSONNonNull([]byte(value), &request) != nil || request.blob() == nil {
-		log.Print("boot from the image: invalid " + overlayEnv)
-		return h.image
+	if protocol.DecodeJSONNonNull(recorded, &request) != nil || request.blob() == nil {
+		return "", errors.New("invalid " + overlayFileEnv)
 	}
 	directory, failure := h.fetchOverlay(ctx, request.blob(), request, time.Now().Add(reloadTimeout))
 	if failure != nil {
-		log.Printf("boot from the image: overlay %s: %v", request.Digest, failure)
-		return h.image
+		return "", fmt.Errorf("boot overlay %s: %w", request.Digest, failure)
 	}
-	return directory
+	return directory, nil
 }
 
 // blob is where a well-formed request's overlay is, and nil when the request is malformed.
 func (request reloadRequest) blob() *url.URL {
 	base, err := url.Parse(request.Registry)
 	if err != nil || base.Host == "" || base.Scheme != "http" && base.Scheme != "https" || request.Repository == "" ||
-		request.Token == "" || !protocol.ValidDigest(request.Digest) || request.MediaType != overlayMediaType {
+		!protocol.ValidDigest(request.Digest) || request.MediaType != overlayMediaType {
 		return nil
 	}
 	return base.JoinPath("v2", request.Repository, "blobs", request.Digest)
@@ -133,14 +130,9 @@ func (request reloadRequest) blob() *url.URL {
 func (h *host) fetchOverlay(ctx context.Context, blob *url.URL, request reloadRequest, deadline time.Time) (string, *reloadFailure) {
 	ctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
-	get, err := http.NewRequestWithContext(ctx, http.MethodGet, blob.String(), nil)
+	response, err := h.getBlob(ctx, blob)
 	if err != nil {
-		return "", &reloadFailure{status: http.StatusBadRequest, Message: "invalid reload request"}
-	}
-	get.Header.Set("Authorization", "Bearer "+request.Token)
-	response, err := (&http.Client{Transport: h.transport}).Do(get)
-	if err != nil {
-		return "", &reloadFailure{status: http.StatusBadGateway, Message: "registry unavailable"}
+		return "", &reloadFailure{status: http.StatusBadGateway, Message: "registry: " + err.Error()}
 	}
 	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusOK {
@@ -253,4 +245,12 @@ func linkImageEntries(image, directory string) error {
 		}
 	}
 	return nil
+}
+
+// srcLayout reports an overlay whose packages live under its own src/. A project packaged that way is also installed
+// in the image's environment, which would otherwise win the import.
+func srcLayout(directory string) bool {
+	src, err := os.Lstat(filepath.Join(directory, "src"))
+	packages, _ := fs.Glob(os.DirFS(directory), "*/__init__.py")
+	return err == nil && src.IsDir() && len(packages) == 0
 }

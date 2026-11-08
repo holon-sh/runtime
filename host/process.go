@@ -6,12 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -58,16 +58,19 @@ func Run(ctx context.Context, command []string) error {
 	if h.image, err = os.Getwd(); err != nil {
 		return err
 	}
-	boot := os.Getenv(overlayEnv)
-	if h.callers != nil || boot != "" {
+	// An unset variable reads as an absent file, and either boots the image.
+	boot, _ := os.ReadFile(os.Getenv(overlayFileEnv))
+	if h.callers != nil || len(boot) != 0 {
 		// A writable volume outlives the container, and overlays from before this boot are of no use.
 		if err := errors.Join(os.RemoveAll(h.overlays), os.MkdirAll(h.overlays, 0o700)); err != nil {
 			return err
 		}
 	}
 	directory := h.image
-	if boot != "" {
-		directory = h.bootOverlay(ctx, boot)
+	if len(boot) != 0 {
+		if directory, err = h.bootOverlay(ctx, boot); err != nil {
+			return err
+		}
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -128,7 +131,7 @@ func Run(ctx context.Context, command []string) error {
 	go func() { servers <- broker.Serve(private) }()
 	brokerURL := "http://" + private.Addr().String() + prefix
 	environment := slices.DeleteFunc(os.Environ(), func(entry string) bool {
-		return strings.HasPrefix(entry, protocol.RuntimeConfigEnv+"=") || strings.HasPrefix(entry, overlayEnv+"=")
+		return strings.HasPrefix(entry, protocol.RuntimeConfigEnv+"=")
 	})
 	for name := range h.peers {
 		environment = append(environment, protocol.DependencyEnvName(name)+"="+brokerURL+"/peer/"+url.PathEscape(name))
@@ -139,6 +142,9 @@ func Run(ctx context.Context, command []string) error {
 		child := exec.CommandContext(childCtx, command[0], command[1:]...)
 		child.Dir = directory
 		child.Env = append(slices.Clone(environment), "PWD="+directory)
+		if directory != h.image && srcLayout(directory) {
+			child.Env = append(child.Env, "PYTHONPATH="+filepath.Join(directory, "src")+string(os.PathListSeparator)+os.Getenv("PYTHONPATH"))
+		}
 		child.Stdin, child.Stdout, child.Stderr = os.Stdin, os.Stdout, os.Stderr
 		child.Cancel = func() error { return child.Process.Signal(syscall.SIGTERM) }
 		child.WaitDelay = 5 * time.Second
@@ -161,11 +167,6 @@ func Run(ctx context.Context, command []string) error {
 		return p, nil
 	}
 	current, failure := awaitReady(ctx, start, directory, nil)
-	if failure != nil && directory != h.image {
-		log.Printf("boot from the image: overlay child: %v", failure)
-		_ = os.RemoveAll(directory)
-		current, failure = awaitReady(ctx, start, h.image, nil)
-	}
 	if failure != nil {
 		return errors.Join(failure, ctx.Err())
 	}

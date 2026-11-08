@@ -5,11 +5,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
-	"log"
 	"maps"
 	"net"
 	"net/http"
@@ -44,7 +44,7 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps({
             "message": "` + message + `",
             "cwd": os.getcwd(),
-            "leaked": os.environ.get("HOLON_MCP_RUNTIME_CONFIG") or os.environ.get("HOLON_OVERLAY"),
+            "leaked": os.environ.get("HOLON_MCP_RUNTIME_CONFIG"),
             "modules": open("node_modules/marker").read() if os.path.exists("node_modules/marker") else None,
         }).encode()
         self.send_response(200)
@@ -104,16 +104,32 @@ func blobDigest(blob []byte) string {
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
-// fakeRegistry serves blobs by digest to the bearer token "pull".
+// basicLogin is the Docker config entry for the login fakeRegistry's token endpoint accepts.
+var basicLogin = `{"auth":"` + base64.StdEncoding.EncodeToString([]byte("puller:secret")) + `"}`
+
+// fakeRegistry serves blobs by digest to the bearer token its token endpoint grants for the login puller:secret or
+// the identity token "identity".
 func fakeRegistry(t *testing.T, blobs map[string][]byte) string {
 	t.Helper()
+	const scope = "repository:holon/app:pull"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/token" {
+			username, password, _ := r.BasicAuth()
+			if username+":"+password != "puller:secret" && r.PostFormValue("refresh_token") != "identity" ||
+				r.FormValue("service") != "registry" || r.FormValue("scope") != scope {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]string{"token": "pull"})
+			return
+		}
 		digest, found := strings.CutPrefix(r.URL.Path, "/v2/holon/app/blobs/")
 		if !found || r.Method != http.MethodGet {
 			http.NotFound(w, r)
 			return
 		}
 		if r.Header.Get("Authorization") != "Bearer pull" {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="http://`+r.Host+`/token",service="registry",scope="`+scope+`"`)
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
@@ -137,9 +153,15 @@ type testRuntime struct {
 	exited   chan error
 }
 
+// bootFile is what the platform records for a new container: the overlay, and the registry login beside it.
+type bootFile struct {
+	reloadRequest
+	login string
+}
+
 // startRuntime runs the supervisor on a child that serves the "image" source from a fresh working directory. A boot
-// request becomes HOLON_OVERLAY, aimed at the runtime's registry.
-func startRuntime(t *testing.T, blobs map[string][]byte, boot ...reloadRequest) *testRuntime {
+// file is aimed at the runtime's registry; without one the file HOLON_OVERLAY_FILE names is absent.
+func startRuntime(t *testing.T, blobs map[string][]byte, boot ...bootFile) *testRuntime {
 	t.Helper()
 	python, err := exec.LookPath("python3")
 	if err != nil {
@@ -171,11 +193,18 @@ func startRuntime(t *testing.T, blobs map[string][]byte, boot ...reloadRequest) 
 		t: t, url: "http://127.0.0.1:" + strconv.Itoa(port), image: image, overlays: overlays,
 		registry: fakeRegistry(t, blobs), exited: make(chan error, 1),
 	}
-	for _, request := range boot {
-		request.Registry = rt.registry
-		value, _ := json.Marshal(request)
-		t.Setenv(overlayEnv, string(value))
+	login := basicLogin
+	t.Setenv(overlayFileEnv, filepath.Join(base, "overlay"))
+	for _, file := range boot {
+		file.Registry = rt.registry
+		value, _ := json.Marshal(file.reloadRequest)
+		writeTree(t, base, map[string]string{"overlay": string(value)})
+		login = file.login
 	}
+	t.Setenv("DOCKER_CONFIG", filepath.Join(base, "registry"))
+	writeTree(t, base, map[string]string{
+		"registry/config.json": `{"auths":{"` + strings.TrimPrefix(rt.registry, "http://") + `":` + login + `}}`,
+	})
 	go func() { rt.exited <- Run(ctx, []string{python, "./main.py"}) }()
 	t.Cleanup(func() {
 		cancel()
@@ -218,7 +247,7 @@ func writeTree(t *testing.T, root string, files map[string]string) {
 func (rt *testRuntime) reload(caller, digest string) (int, []byte) {
 	rt.t.Helper()
 	body, _ := json.Marshal(reloadRequest{
-		Registry: rt.registry, Repository: "holon/app", Token: "pull", Digest: digest, MediaType: overlayMediaType,
+		Registry: rt.registry, Repository: "holon/app", Digest: digest, MediaType: overlayMediaType,
 	})
 	request, err := http.NewRequest(http.MethodPost, rt.url+reloadPath, bytes.NewReader(body))
 	if err != nil {
@@ -288,8 +317,13 @@ func TestReload(t *testing.T) {
 	silent := overlay(t, sourceFiles("silent", "time.sleep(60)"))
 	escapes := overlay(t, nil, &tar.Header{Name: "../../outside", Typeflag: tar.TypeReg, Mode: 0o644})
 	tampered := "sha256:" + strings.Repeat("a", 64)
+	packaged := overlay(t, map[string]string{"main.py": childSource("src layout", "import overlaid"), "src/overlaid/__init__.py": ""})
+	rootPackage := overlay(t, map[string]string{
+		"main.py": childSource("root package", `assert "PYTHONPATH" not in os.environ`), "flat/__init__.py": "", "src/index.ts": "",
+	})
 	blobs := map[string][]byte{
 		blobDigest(source): source, blobDigest(exits): exits, blobDigest(silent): silent, blobDigest(escapes): escapes, tampered: source,
+		blobDigest(packaged): packaged, blobDigest(rootPackage): rootPackage,
 	}
 	for _, tc := range []struct {
 		name    string
@@ -302,6 +336,8 @@ func TestReload(t *testing.T) {
 		child   string // the source serving afterwards, or "" when the runtime has exited
 	}{
 		{name: "new source", caller: apiCaller, digest: blobDigest(source), status: http.StatusOK, child: "new"},
+		{name: "src layout", caller: apiCaller, digest: blobDigest(packaged), status: http.StatusOK, child: "src layout"},
+		{name: "package at the root", caller: apiCaller, digest: blobDigest(rootPackage), status: http.StatusOK, child: "root package"},
 		{name: "caller not allowed to reload", caller: edgeCaller, digest: blobDigest(source), status: http.StatusNotFound, child: "image"},
 		{name: "no mesh caller", digest: blobDigest(source), status: http.StatusForbidden, child: "image"},
 		{name: "malformed request", caller: apiCaller, digest: "sha256:abc", status: http.StatusBadRequest, child: "image"},
@@ -401,50 +437,22 @@ func TestReloadAnswers503DuringRestart(t *testing.T) {
 	}
 }
 
-// bootLog collects the runtime's log while a test runs.
-type bootLog struct {
-	sync.Mutex
-	strings.Builder
-}
-
-func (l *bootLog) Write(p []byte) (int, error) {
-	l.Lock()
-	defer l.Unlock()
-	return l.Builder.Write(p)
-}
-
-func (l *bootLog) String() string {
-	l.Lock()
-	defer l.Unlock()
-	return l.Builder.String()
-}
-
-func TestBootAppliesOverlay(t *testing.T) {
-	kept, crashing := overlay(t, sourceFiles("kept", "")), overlay(t, sourceFiles("crashing", "sys.exit(3)"))
-	tampered := "sha256:" + strings.Repeat("a", 64)
-	blobs := map[string][]byte{blobDigest(kept): kept, blobDigest(crashing): crashing, tampered: kept}
+func TestBootOverlayFile(t *testing.T) {
+	kept := overlay(t, sourceFiles("kept", ""))
+	recorded := reloadRequest{Repository: "holon/app", Digest: blobDigest(kept), MediaType: overlayMediaType}
 	for _, tc := range []struct {
-		name, digest, token string
-		child               string // the source the first request reaches
-		because             string // in the log when the image boots instead
+		name  string
+		boot  []bootFile
+		child string
 	}{
-		{"last good overlay", blobDigest(kept), "pull", "kept", ""},
-		{"token refused", blobDigest(kept), "other", "image", "registry answered 401"},
-		{"digest mismatch", tampered, "pull", "image", "digest mismatch"},
-		{"overlay child fails", blobDigest(crashing), "pull", "image", "application exited before ready"},
+		{"absent file", nil, "image"},
+		{"basic credentials", []bootFile{{recorded, basicLogin}}, "kept"},
+		{"identity token", []bootFile{{recorded, `{"identitytoken":"identity"}`}}, "kept"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			logged := &bootLog{}
-			log.SetOutput(logged)
-			t.Cleanup(func() { log.SetOutput(os.Stderr) })
-			rt := startRuntime(t, blobs, reloadRequest{
-				Repository: "holon/app", Token: tc.token, Digest: tc.digest, MediaType: overlayMediaType,
-			})
-			if got := rt.child(); got.Message != tc.child || got.Leaked != nil {
+			rt := startRuntime(t, map[string][]byte{blobDigest(kept): kept}, tc.boot...)
+			if got := rt.child(); got.Message != tc.child {
 				t.Fatalf("first request: %+v", got)
-			}
-			if tc.because == "" && logged.String() != "" || !strings.Contains(logged.String(), tc.because) {
-				t.Fatalf("log: %q", logged.String())
 			}
 		})
 	}
