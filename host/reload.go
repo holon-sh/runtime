@@ -38,6 +38,7 @@ var reloadTimeout = 45 * time.Second
 type reloadRequest struct {
 	Registry   string `json:"registry"`
 	Repository string `json:"repository"`
+	Token      string `json:"token"`
 	Digest     string `json:"digest"`
 	MediaType  string `json:"mediaType"`
 }
@@ -119,7 +120,7 @@ func (h *host) bootOverlay(ctx context.Context, recorded []byte) (string, error)
 func (request reloadRequest) blob() *url.URL {
 	base, err := url.Parse(request.Registry)
 	if err != nil || base.Host == "" || base.Scheme != "http" && base.Scheme != "https" || request.Repository == "" ||
-		!protocol.ValidDigest(request.Digest) || request.MediaType != overlayMediaType {
+		request.Token == "" || !protocol.ValidDigest(request.Digest) || request.MediaType != overlayMediaType {
 		return nil
 	}
 	return base.JoinPath("v2", request.Repository, "blobs", request.Digest)
@@ -130,9 +131,14 @@ func (request reloadRequest) blob() *url.URL {
 func (h *host) fetchOverlay(ctx context.Context, blob *url.URL, request reloadRequest, deadline time.Time) (string, *reloadFailure) {
 	ctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
-	response, err := h.getBlob(ctx, blob)
+	get, err := http.NewRequestWithContext(ctx, http.MethodGet, blob.String(), nil)
 	if err != nil {
-		return "", &reloadFailure{status: http.StatusBadGateway, Message: "registry: " + err.Error()}
+		return "", &reloadFailure{status: http.StatusBadRequest, Message: "invalid reload request"}
+	}
+	get.Header.Set("Authorization", "Bearer "+request.Token)
+	response, err := (&http.Client{Transport: h.transport}).Do(get)
+	if err != nil {
+		return "", &reloadFailure{status: http.StatusBadGateway, Message: "registry unavailable"}
 	}
 	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusOK {

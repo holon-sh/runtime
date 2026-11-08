@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -104,32 +103,16 @@ func blobDigest(blob []byte) string {
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
-// basicLogin is the Docker config entry for the login fakeRegistry's token endpoint accepts.
-var basicLogin = `{"auth":"` + base64.StdEncoding.EncodeToString([]byte("puller:secret")) + `"}`
-
-// fakeRegistry serves blobs by digest to the bearer token its token endpoint grants for the login puller:secret or
-// the identity token "identity".
+// fakeRegistry serves blobs by digest to the bearer token "pull".
 func fakeRegistry(t *testing.T, blobs map[string][]byte) string {
 	t.Helper()
-	const scope = "repository:holon/app:pull"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/token" {
-			username, password, _ := r.BasicAuth()
-			if username+":"+password != "puller:secret" && r.PostFormValue("refresh_token") != "identity" ||
-				r.FormValue("service") != "registry" || r.FormValue("scope") != scope {
-				w.WriteHeader(http.StatusUnauthorized)
-				return
-			}
-			writeJSON(w, http.StatusOK, map[string]string{"token": "pull"})
-			return
-		}
 		digest, found := strings.CutPrefix(r.URL.Path, "/v2/holon/app/blobs/")
 		if !found || r.Method != http.MethodGet {
 			http.NotFound(w, r)
 			return
 		}
 		if r.Header.Get("Authorization") != "Bearer pull" {
-			w.Header().Set("WWW-Authenticate", `Bearer realm="http://`+r.Host+`/token",service="registry",scope="`+scope+`"`)
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
@@ -153,15 +136,9 @@ type testRuntime struct {
 	exited   chan error
 }
 
-// bootFile is what the platform records for a new container: the overlay, and the registry login beside it.
-type bootFile struct {
-	reloadRequest
-	login string
-}
-
 // startRuntime runs the supervisor on a child that serves the "image" source from a fresh working directory. A boot
-// file is aimed at the runtime's registry; without one the file HOLON_OVERLAY_FILE names is absent.
-func startRuntime(t *testing.T, blobs map[string][]byte, boot ...bootFile) *testRuntime {
+// request becomes the file HOLON_OVERLAY_FILE names, aimed at the runtime's registry; without one the file is absent.
+func startRuntime(t *testing.T, blobs map[string][]byte, boot ...reloadRequest) *testRuntime {
 	t.Helper()
 	python, err := exec.LookPath("python3")
 	if err != nil {
@@ -193,18 +170,12 @@ func startRuntime(t *testing.T, blobs map[string][]byte, boot ...bootFile) *test
 		t: t, url: "http://127.0.0.1:" + strconv.Itoa(port), image: image, overlays: overlays,
 		registry: fakeRegistry(t, blobs), exited: make(chan error, 1),
 	}
-	login := basicLogin
 	t.Setenv(overlayFileEnv, filepath.Join(base, "overlay"))
-	for _, file := range boot {
-		file.Registry = rt.registry
-		value, _ := json.Marshal(file.reloadRequest)
+	for _, request := range boot {
+		request.Registry = rt.registry
+		value, _ := json.Marshal(request)
 		writeTree(t, base, map[string]string{"overlay": string(value)})
-		login = file.login
 	}
-	t.Setenv("DOCKER_CONFIG", filepath.Join(base, "registry"))
-	writeTree(t, base, map[string]string{
-		"registry/config.json": `{"auths":{"` + strings.TrimPrefix(rt.registry, "http://") + `":` + login + `}}`,
-	})
 	go func() { rt.exited <- Run(ctx, []string{python, "./main.py"}) }()
 	t.Cleanup(func() {
 		cancel()
@@ -247,7 +218,7 @@ func writeTree(t *testing.T, root string, files map[string]string) {
 func (rt *testRuntime) reload(caller, digest string) (int, []byte) {
 	rt.t.Helper()
 	body, _ := json.Marshal(reloadRequest{
-		Registry: rt.registry, Repository: "holon/app", Digest: digest, MediaType: overlayMediaType,
+		Registry: rt.registry, Repository: "holon/app", Token: "pull", Digest: digest, MediaType: overlayMediaType,
 	})
 	request, err := http.NewRequest(http.MethodPost, rt.url+reloadPath, bytes.NewReader(body))
 	if err != nil {
@@ -439,15 +410,14 @@ func TestReloadAnswers503DuringRestart(t *testing.T) {
 
 func TestBootOverlayFile(t *testing.T) {
 	kept := overlay(t, sourceFiles("kept", ""))
-	recorded := reloadRequest{Repository: "holon/app", Digest: blobDigest(kept), MediaType: overlayMediaType}
+	recorded := reloadRequest{Repository: "holon/app", Token: "pull", Digest: blobDigest(kept), MediaType: overlayMediaType}
 	for _, tc := range []struct {
 		name  string
-		boot  []bootFile
+		boot  []reloadRequest
 		child string
 	}{
 		{"absent file", nil, "image"},
-		{"basic credentials", []bootFile{{recorded, basicLogin}}, "kept"},
-		{"identity token", []bootFile{{recorded, `{"identitytoken":"identity"}`}}, "kept"},
+		{"recorded overlay", []reloadRequest{recorded}, "kept"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rt := startRuntime(t, map[string][]byte{blobDigest(kept): kept}, tc.boot...)
