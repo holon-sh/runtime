@@ -87,7 +87,7 @@ function context(subject, principal = {}, hook) {
             sub: subject,
             client_id: "client",
             scope: " read  write\tcombined ",
-            act: [{ iss: "https://issuer.example", sub: "actor" }],
+            act: { iss: "https://issuer.example", sub: "actor" },
             ...principal,
           },
         }
@@ -171,13 +171,13 @@ test(
       {
         subject: "alice",
         principal: {},
-        actor: { act: [{ iss: "https://issuer.example", sub: "actor" }] },
+        actor: { act: { iss: "https://issuer.example", sub: "actor" } },
         scopes: ["read", "write\tcombined"],
       },
       {
         subject: "large-subject-" + "<".repeat(9000),
         principal: { act: null, scope: "" },
-        actor: { act: null },
+        actor: {},
         scopes: [],
       },
       {
@@ -227,7 +227,7 @@ test(
         const { identity } = JSON.parse(result.content[0].text);
         assert.equal(identity.token, headers["x-holon-context"]);
         assert.deepEqual(identity.scopes, ["fresh"]);
-        assert.equal(identity.extra.act, null);
+        assert.equal(identity.extra.act, undefined);
       } finally {
         await client.close();
       }

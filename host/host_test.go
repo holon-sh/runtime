@@ -16,6 +16,8 @@ import (
 func TestAdmission(t *testing.T) {
 	const reporter = "spiffe://cluster.local/ns/session/sa/reporter"
 	valid := `{"exp":4102444800,"aud":["https://holon.example"],"principal":{"iss":"issuer","sub":"user","client_id":"client","scope":"read write"}}`
+	// A mistyped standard claim reads as absent; other claims pass through.
+	profile := `{"address":{"country":1,"locality":"Tokyo"},"custom":{"values":[1,null]},"email_verified":"true","name":"Ada","updated_at":1}`
 	principal := `{"token":"TOKEN","clientId":"client","scopes":["read","write"],"expiresAt":4102444800,"resource":"https://holon.example","extra":{"caller":"spiffe://edge","iss":"issuer","sub":"user"}}`
 	for _, tc := range []struct {
 		name, caller, claims, duplicate, identity string
@@ -27,6 +29,9 @@ func TestAdmission(t *testing.T) {
 		{"relative audience", "spiffe://edge", `{"exp":4102444800,"aud":["/relative"]}`, "", ""},
 		{"invalid principal", "spiffe://edge", strings.Replace(valid, `"client_id":"client"`, `"client_id":null`, 1), "", ""},
 		{"invalid scopes", "spiffe://edge", strings.Replace(valid, `"scope":"read write"`, `"scope":[]`, 1), "", ""},
+		{"identity claims", "spiffe://edge", strings.Replace(valid, `}}`, `,"claims":`+profile+`}}`, 1), "",
+			strings.Replace(principal, `"iss"`, `"claims":`+strings.NewReplacer(`"country":1,`, "", `"email_verified":"true",`, "").Replace(profile)+`,"iss"`, 1)},
+		{"non-object actor", "spiffe://edge", strings.Replace(valid, `}}`, `,"act":[{"sub":"agent"}]}}`, 1), "", ""},
 		{"workload call", reporter, "", "", "null"},
 		{"caller outside the mesh", "https://edge", "", "", ""},
 		{"two callers", "spiffe://edge", "", runtimecontract.CallerHeader, ""},
