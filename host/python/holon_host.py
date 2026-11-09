@@ -5,6 +5,7 @@ import re
 import socket
 import sys
 from contextvars import ContextVar
+from typing import Any
 from urllib.parse import quote
 
 import httpx2
@@ -21,49 +22,32 @@ from starlette.types import Message, Receive, Scope, Send
 _scope: ContextVar[str] = ContextVar("holon_scope", default="")
 
 
-def http_client() -> httpx2.AsyncClient:
-    peer = re.compile(re.escape(os.environ["HOLON_HOST_URL"]) + r"/peer/[^/?#]+")
+def contain_http(host: str) -> None:
+    broker = re.compile(re.escape(host) + r"/peer/[^/?#]+")
+    send = httpx2.AsyncClient.send
 
-    async def prepare(request: httpx2.Request) -> None:
-        if not peer.fullmatch(str(request.url)):
+    async def send_in_scope(
+        client: httpx2.AsyncClient, request: httpx2.Request, **options: Any
+    ) -> httpx2.Response:
+        if not broker.fullmatch(str(request.url)):
             for name in list(request.headers):
                 if name.startswith("x-holon-"):
                     del request.headers[name]
-            return
-        request.headers = httpx2.Headers(
-            [*request.headers.raw, (b"x-holon-scope", _scope.get().encode())]
-        )
-
-    async def check(response: httpx2.Response) -> None:
-        if (
-            peer.fullmatch(str(response.request.url))
-            and "x-holon-error" in response.headers
-        ):
+            return await send(client, request, **options)
+        request.headers["x-holon-scope"] = _scope.get()
+        response = await send(client, request, **options)
+        if "x-holon-error" in response.headers:
             await response.aclose()
             raise RuntimeError("Holon peer call rejected or cancelled")
+        return response
 
-    return httpx2.AsyncClient(
-        timeout=httpx2.Timeout(30.0, read=300.0),
-        trust_env=False,
-        event_hooks={"request": [prepare], "response": [check]},
-    )
-
-
-def binding(app: str) -> dict[str, object] | None:
-    endpoint = os.environ.get(app.upper().replace("-", "_") + "_MCP_URL")
-    return {"endpoint": endpoint, "http_client": http_client} if endpoint else None
+    httpx2.AsyncClient.send = send_in_scope  # type: ignore[method-assign, assignment]
 
 
 async def start(entry: str) -> None:
     host = os.environ["HOLON_HOST_URL"]
     sys.path.insert(0, os.getcwd())
-    try:
-        from holon.binding import set_default_binding
-    except ModuleNotFoundError as error:
-        if error.name not in {"holon", "holon.binding"}:
-            raise
-    else:
-        set_default_binding(binding)
+    contain_http(host)
     application = importlib.import_module(entry)
     app = AuthContextMiddleware(
         application.server.streamable_http_app(

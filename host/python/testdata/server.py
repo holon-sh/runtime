@@ -9,7 +9,6 @@ from typing import Any
 from urllib.parse import unquote, urlsplit
 
 import httpx2
-from holon.binding import resolve_default_binding
 from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server.auth.middleware.auth_context import get_access_token
@@ -19,10 +18,7 @@ from starlette.datastructures import Headers
 from starlette.responses import StreamingResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from holon_host import http_client
-
 gates = {name: asyncio.Event() for name in ("inspect", "stream")}
-peer_binding = resolve_default_binding("peer")
 http: httpx2.AsyncClient
 
 
@@ -44,8 +40,7 @@ async def lifespan(server: MCPServer[Any]) -> AsyncIterator[None]:
 
     task = asyncio.create_task(commands())
     try:
-        factory = peer_binding["http_client"] if peer_binding else http_client
-        async with factory() as http:
+        async with httpx2.AsyncClient(trust_env=False) as http:
             yield
     finally:
         task.cancel()
@@ -58,7 +53,7 @@ server = MCPServer("ordinary-app", lifespan=lifespan)
 
 
 async def call_peer(name: str) -> CallToolResult:
-    transport = streamable_http_client(peer_binding["endpoint"], http_client=http)
+    transport = streamable_http_client(os.environ["PEER_MCP_URL"], http_client=http)
     async with Client(transport, mode="2026-07-28") as client:
         return await client.call_tool(name, {})
 
@@ -152,7 +147,7 @@ def make_app(**options: Any) -> ASGIApp:
             await StreamingResponse(peer_body())(scope, receive, send)
             return
         if stream == "source":
-            http = http_client()
+            http = httpx2.AsyncClient(trust_env=False)
             peer = await http.send(
                 http.build_request(
                     "POST",

@@ -16,7 +16,6 @@ strict = true
 warn_unreachable = true
 local_partial_types = true
 files = ["."]
-mypy_path = ["testdata"]
 explicit_package_bases = true
 
 [tool.ruff]
