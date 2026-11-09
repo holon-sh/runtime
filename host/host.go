@@ -25,6 +25,7 @@ import (
 
 type scope struct {
 	ctx      context.Context
+	cancel   context.CancelFunc
 	token    string
 	identity *identity
 	forward  http.Header
@@ -106,7 +107,9 @@ func (h *host) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	s := &scope{ctx: r.Context(), token: token, identity: identity, forward: http.Header{}}
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	s := &scope{ctx: ctx, cancel: cancel, token: token, identity: identity, forward: http.Header{}}
 	for _, name := range []string{"Traceparent", "Tracestate", runtimecontract.ContextHeader} {
 		if value := r.Header.Get(name); value != "" {
 			s.forward.Set(name, value)
@@ -123,7 +126,7 @@ func (h *host) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.mu.Unlock()
 	}()
 	r.Header.Set(runtimecontract.ScopeHeader, id)
-	application.ServeHTTP(w, r)
+	application.ServeHTTP(w, r.WithContext(ctx))
 }
 
 func (h *host) active(id string) *scope {
@@ -221,5 +224,8 @@ func (h *host) connect(port uint16, frontend http.Handler) {
 func (h *host) disconnect() {
 	h.mu.Lock()
 	h.application, h.frontend = nil, nil
+	for _, s := range h.scopes {
+		s.cancel()
+	}
 	h.mu.Unlock()
 }
