@@ -80,16 +80,46 @@ func admit(r *http.Request) (*identity, bool) {
 	}
 	admitted.Extra["iss"], admitted.Extra["sub"] = claims.Principal["iss"], claims.Principal["sub"]
 	if profile, present := claims.Principal["claims"]; present {
-		if _, ok := profile.(map[string]any); !ok {
+		if !standardTypes(profile, openIDClaims) {
 			return nil, false
 		}
 		admitted.Extra["claims"] = profile
 	}
-	if actor, present := claims.Principal["act"]; present {
+	if actor := claims.Principal["act"]; actor != nil {
+		if !typed[map[string]any](actor) {
+			return nil, false
+		}
 		admitted.Extra["act"] = actor
 	}
 	admitted.ClientID = claims.Principal["client_id"].(string)
 	return admitted, true
+}
+
+func typed[T any](value any) bool { _, ok := value.(T); return ok }
+
+var isString = typed[string]
+
+// The standard claims application SDKs type (OpenID Connect Core 1.0 §5.1); other claims pass through as JSON.
+var openIDClaims = map[string]func(any) bool{
+	"name": isString, "given_name": isString, "family_name": isString, "middle_name": isString,
+	"nickname": isString, "preferred_username": isString, "profile": isString, "picture": isString,
+	"website": isString, "email": isString, "email_verified": typed[bool], "gender": isString,
+	"birthdate": isString, "zoneinfo": isString, "locale": isString, "phone_number": isString,
+	"phone_number_verified": typed[bool], "updated_at": typed[float64],
+	"address": func(value any) bool { return standardTypes(value, addressClaims) },
+}
+
+var addressClaims = map[string]func(any) bool{
+	"formatted": isString, "street_address": isString, "locality": isString,
+	"region": isString, "postal_code": isString, "country": isString,
+}
+
+// standardTypes reports whether value is a JSON object, after dropping its standard claims whose values lack the
+// standard type: a provider's quirk then reads as an absent claim, as it does on the platform, not a refused request.
+func standardTypes(value any, standard map[string]func(any) bool) bool {
+	object, ok := value.(map[string]any)
+	maps.DeleteFunc(object, func(name string, claim any) bool { valid, known := standard[name]; return known && !valid(claim) })
+	return ok
 }
 
 func stripHolon(headers http.Header) {
