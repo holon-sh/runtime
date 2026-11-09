@@ -16,7 +16,7 @@ to run it under another runtime.
 
 ## Community
 
-Ask questions and share what you're building on the [Holon Discord](https://holon-labs.dev/discord/).
+Ask questions and share what you're building on the [Holon Discord](https://discord.gg/jXExyBdy).
 
 ## License
 
