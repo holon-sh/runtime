@@ -332,20 +332,27 @@ test(
 );
 
 test(
-  "a Python application that fails to import shows only its own frames",
+  "a Python application that fails to start shows only its own frames",
   { skip: !python, timeout: 10000 },
   async (t) => {
-    const directory = await mkdtemp(join(process.cwd(), ".import-test-"));
-    t.after(() => rm(directory, { recursive: true, force: true }));
-    await writeFile(join(directory, "server.py"), "import helper\n");
-    await writeFile(join(directory, "helper.py"), "def broken(:\n    pass\n");
-    const child = host({}, { cwd: directory });
-    let stderr = "";
-    child.stderr.on("data", (data) => (stderr += data));
-    const [code] = await once(child, "exit");
-    assert.notEqual(code, 0);
-    const frames = [...stderr.matchAll(/File "([^"]+)"/g)].map(([, file]) => basename(file));
-    assert.deepEqual(frames, ["server.py", "helper.py"]);
-    assert.match(stderr, /SyntaxError/);
+    for (const { files, frames, error } of [
+      {
+        files: { "server.py": "import helper\n", "helper.py": "def broken(:\n" },
+        frames: ["server.py", "helper.py"],
+        error: /SyntaxError/,
+      },
+      { files: { "server.py": "frontend = None\n" }, frames: [], error: /has no attribute 'server'/ },
+    ]) {
+      const directory = await mkdtemp(join(process.cwd(), ".start-test-"));
+      t.after(() => rm(directory, { recursive: true, force: true }));
+      for (const [name, source] of Object.entries(files)) await writeFile(join(directory, name), source);
+      const child = host({}, { cwd: directory });
+      let stderr = "";
+      child.stderr.on("data", (data) => (stderr += data));
+      const [code] = await once(child, "exit");
+      assert.notEqual(code, 0);
+      assert.deepEqual([...stderr.matchAll(/File "([^"]+)"/g)].map(([, file]) => basename(file)), frames);
+      assert.match(stderr, error);
+    }
   },
 );
