@@ -59,8 +59,7 @@ async def start(entry: str) -> None:
     try:
         __import__(entry)
     except Exception as error:
-        # Unlike importlib.import_module, the import statement drops importlib's frames, so skipping this one
-        # leaves only the application's.
+        # __import__ omits importlib's frames; skipping this one leaves only the application's.
         assert error.__traceback__ is not None
         traceback.print_exception(error.with_traceback(error.__traceback__.tb_next))
         raise SystemExit(1) from error
@@ -77,7 +76,7 @@ async def start(entry: str) -> None:
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         listener.listen()
-        async with httpcore2.AsyncConnectionPool() as control:
+        async with httpcore2.AsyncConnectionPool(max_connections=None) as control:
 
             async def dispatch(scope: Scope, receive: Receive, send: Send) -> None:
                 if scope["type"] == "lifespan":

@@ -241,7 +241,7 @@ func awaitReady(
 		return nil, &reloadFailure{status: http.StatusInternalServerError, Message: "application rejected: " + err.Error()}
 	case <-p.done:
 		return nil, &reloadFailure{
-			status: http.StatusInternalServerError, Message: "application exited before ready", Exit: p.command.ProcessState.String(),
+			status: http.StatusInternalServerError, Message: "application exited before ready: " + p.command.ProcessState.String(),
 		}
 	case <-timeout:
 		p.stop()

@@ -303,7 +303,7 @@ func TestReload(t *testing.T) {
 		image   map[string]string // written over the image after boot
 		timeout time.Duration
 		status  int
-		exit    string // the failed child's status in the reply
+		exit    string // the failed child's status, which ends the reply's error
 		child   string // the source serving afterwards, or "" when the runtime has exited
 	}{
 		{name: "new source", caller: apiCaller, digest: blobDigest(source), status: http.StatusOK, child: "new"},
@@ -338,7 +338,7 @@ func TestReload(t *testing.T) {
 			status, body := rt.reload(tc.caller, tc.digest)
 			var failure reloadFailure
 			_ = json.Unmarshal(body, &failure)
-			if status != tc.status || failure.Exit != tc.exit {
+			if status != tc.status || !strings.HasSuffix(failure.Message, tc.exit) {
 				t.Fatalf("%d %s", status, body)
 			}
 			if tc.child == "" {

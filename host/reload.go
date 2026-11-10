@@ -52,7 +52,6 @@ type reloadReply struct {
 type reloadFailure struct {
 	status  int
 	Message string `json:"error"`
-	Exit    string `json:"exit,omitempty"`
 }
 
 func (f *reloadFailure) Error() string { return f.Message }
