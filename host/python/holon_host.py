@@ -57,12 +57,18 @@ async def start(entry: str) -> None:
     sys.path.insert(0, os.getcwd())
     contain_http(host)
     try:
-        __import__(entry)
+        await serve(host, entry)
     except Exception as error:
-        # __import__ omits importlib's frames; skipping this one leaves only the application's.
-        assert error.__traceback__ is not None
-        traceback.print_exception(error.with_traceback(error.__traceback__.tb_next))
+        # The host's own frames lead the traceback; __import__ already leaves out importlib's.
+        frames = error.__traceback__
+        while frames and frames.tb_frame.f_code.co_filename == __file__:
+            frames = frames.tb_next
+        traceback.print_exception(error.with_traceback(frames))
         raise SystemExit(1) from error
+
+
+async def serve(host: str, entry: str) -> None:
+    __import__(entry)
     application = sys.modules[entry]
     app = AuthContextMiddleware(
         application.server.streamable_http_app(
