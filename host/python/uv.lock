@@ -295,6 +295,7 @@ source = { virtual = "." }
 
 [package.dev-dependencies]
 dev = [
+    { name = "holon-sh" },
     { name = "mcp" },
     { name = "mypy" },
     { name = "ruff" },
@@ -304,9 +305,24 @@ dev = [
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "holon-sh", specifier = "==0.0.1.dev9" },
     { name = "mcp", specifier = "==2.3.0" },
     { name = "mypy", specifier = "==2.4.0" },
     { name = "ruff", specifier = "==0.16.8" },
+]
+
+[[package]]
+name = "holon-sh"
+version = "0.0.1.dev9"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx2" },
+    { name = "jsonschema" },
+    { name = "mcp" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/52/3c/1ac1f6b3b24c19b1b287fff2955ab372992f6e6d08d49d068e89fec2feb2/holon_sh-0.0.1.dev9.tar.gz", hash = "sha256:443dbd737cf41fac2b51530814f347af5c282d94ddc2dd7c34e76c20c4ae5c3a", size = 60042, upload-time = "2026-11-10T19:48:53.951Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c8/3d/64636e649f76f0f26deb3730a974b8a412c0f212cb41a95bf954fabcf2a8/holon_sh-0.0.1.dev9-py3-none-any.whl", hash = "sha256:774e22874c02514f4632b27c68848bca03ff3c4c69d313708a5aba74e1db7185", size = 50218, upload-time = "2026-11-10T19:48:52.897Z" },
 ]
 
 [[package]]

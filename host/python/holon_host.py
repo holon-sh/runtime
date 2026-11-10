@@ -10,6 +10,7 @@ from urllib.parse import quote
 
 import httpx2
 import uvicorn
+from holon.ext.events import Events
 from mcp.server.auth.middleware.auth_context import AuthContextMiddleware
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.auth.provider import AccessToken
@@ -55,13 +56,18 @@ async def start(entry: str) -> None:
     sys.path.insert(0, os.getcwd())
     contain_http(host)
     application = importlib.import_module(entry)
+    server = application.server
+    served = server.streamable_http_app(
+        stateless_http=True,
+        transport_security=TransportSecuritySettings(
+            enable_dns_rebinding_protection=False
+        ),
+    )
+    events = next(
+        (each for each in server.middleware if isinstance(each, Events)), None
+    )
     app = AuthContextMiddleware(
-        application.server.streamable_http_app(
-            stateless_http=True,
-            transport_security=TransportSecuritySettings(
-                enable_dns_rebinding_protection=False
-            ),
-        )
+        served if events is None else events.asgi(server.session_manager)
     )
     frontend = os.fspath(getattr(application, "frontend", ""))
     with socket.socket() as listener:
@@ -84,7 +90,7 @@ async def start(entry: str) -> None:
                             response.raise_for_status()
                         await send(message)
 
-                    await app(scope, receive, startup)
+                    await served(scope, receive, startup)
                     return
                 identifier = Headers(scope=scope).get("x-holon-scope", "")
                 response = await control.get(
