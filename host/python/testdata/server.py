@@ -14,6 +14,7 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.types import CallToolResult, TextContent
+from opentelemetry import propagate
 from starlette.datastructures import Headers
 from starlette.responses import StreamingResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -106,12 +107,18 @@ async def inspect(ctx: Context[Any, Any]) -> CallToolResult:
             "expiresAt": token.expires_at,
             "resource": token.resource,
         }
+    trace: dict[str, str] = {}
+    propagate.inject(trace)
     return CallToolResult(
         content=[
             TextContent(
                 type="text",
                 text=json.dumps(
-                    {"identity": identity, "headers": list(ctx.headers or {})}
+                    {
+                        "identity": identity,
+                        "headers": list(ctx.headers or {}),
+                        "traceparent": trace.get("traceparent"),
+                    }
                 ),
             )
         ]

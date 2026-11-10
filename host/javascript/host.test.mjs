@@ -231,6 +231,10 @@ test(
       } finally {
         await client.close();
       }
+      // The Python SDK's server span parents on the caller's trace header.
+      const traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+      const traced = await call(downstream.url, "inspect", { ...context("alice"), traceparent });
+      assert.equal(JSON.parse(traced.content[0].text).traceparent, traceparent);
     }
     const hook = {
       app: "accounts", job: "hook-job", jobUID: "job-uid",
