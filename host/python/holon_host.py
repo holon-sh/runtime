@@ -19,6 +19,12 @@ from starlette.datastructures import Headers
 from starlette.responses import Response
 from starlette.types import Message, Receive, Scope, Send
 
+try:
+    from opentelemetry import context as tracing
+    from opentelemetry import propagate
+except ImportError:  # without OpenTelemetry the MCP SDK has no span to parent
+    tracing = None  # type: ignore[assignment]
+
 _scope: ContextVar[str] = ContextVar("holon_scope", default="")
 
 
@@ -110,9 +116,17 @@ async def start(entry: str) -> None:
                     scope["user"] = AuthenticatedUser(token)
                     scope["auth"] = AuthCredentials(token.scopes)
                 current = _scope.set(identifier)
+                # The SDK's server span parents on params._meta, else on this context: the caller's trace headers.
+                trace = (
+                    tracing.attach(propagate.extract(Headers(scope=scope)))
+                    if tracing
+                    else None
+                )
                 try:
                     await app(scope, receive, send)
                 finally:
+                    if trace is not None:
+                        tracing.detach(trace)
                     _scope.reset(current)
 
             await uvicorn.Server(
