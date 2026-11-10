@@ -10,6 +10,7 @@ from urllib.parse import quote
 
 import httpx2
 import uvicorn
+from holon.ext.events import Events
 from mcp.server.auth.middleware.auth_context import AuthContextMiddleware
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.auth.provider import AccessToken
@@ -62,14 +63,8 @@ async def start(entry: str) -> None:
             enable_dns_rebinding_protection=False
         ),
     )
-    module = sys.modules.get("holon.ext.events")
     events = next(
-        (
-            each
-            for each in server.middleware
-            if module and isinstance(each, module.Events)
-        ),
-        None,
+        (each for each in server.middleware if isinstance(each, Events)), None
     )
     app = AuthContextMiddleware(
         served if events is None else events.asgi(server.session_manager)
