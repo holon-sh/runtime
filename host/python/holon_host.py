@@ -25,11 +25,6 @@ try:
 except ImportError:  # without OpenTelemetry the MCP SDK has no span to parent
     tracing = None  # type: ignore[assignment]
 
-try:
-    from holon.ext.events import Events
-except ImportError:
-    Events = None  # type: ignore[assignment, misc]
-
 _scope: ContextVar[str] = ContextVar("holon_scope", default="")
 
 
@@ -67,11 +62,12 @@ async def start(entry: str) -> None:
             enable_dns_rebinding_protection=False
         ),
     )
+    module = sys.modules.get("holon.ext.events")
     events = next(
         (
             each
             for each in server.middleware
-            if Events is not None and isinstance(each, Events)
+            if module and isinstance(each, module.Events)
         ),
         None,
     )

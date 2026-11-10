@@ -8,7 +8,7 @@ dependencies = []
 package = false
 
 [dependency-groups]
-dev = ["holon-sh==0.0.1.dev9", "mcp==2.3.0", "mypy==2.4.0", "ruff==0.16.8"]
+dev = ["mcp==2.3.0", "mypy==2.4.0", "ruff==0.16.8"]
 
 [tool.mypy]
 python_version = "3.11"
