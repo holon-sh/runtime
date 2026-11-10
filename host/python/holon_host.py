@@ -76,7 +76,7 @@ async def start(entry: str) -> None:
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         listener.listen()
-        async with httpcore2.AsyncConnectionPool(max_connections=None) as control:
+        async with httpcore2.AsyncConnectionPool() as control:
 
             async def dispatch(scope: Scope, receive: Receive, send: Send) -> None:
                 if scope["type"] == "lifespan":
@@ -86,7 +86,6 @@ async def start(entry: str) -> None:
                             response = await control.request(
                                 "POST",
                                 f"{host}/ready",
-                                headers={"content-type": "application/json"},
                                 content=json.dumps(
                                     {
                                         "port": listener.getsockname()[1],
