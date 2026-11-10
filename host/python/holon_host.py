@@ -1,13 +1,15 @@
-import importlib
+import json
 import math
 import os
 import re
 import socket
 import sys
+import traceback
 from contextvars import ContextVar
 from typing import Any
 from urllib.parse import quote
 
+import httpcore2
 import httpx2
 import uvicorn
 from mcp.server.auth.middleware.auth_context import AuthContextMiddleware
@@ -54,7 +56,15 @@ async def start(entry: str) -> None:
     host = os.environ["HOLON_HOST_URL"]
     sys.path.insert(0, os.getcwd())
     contain_http(host)
-    application = importlib.import_module(entry)
+    try:
+        __import__(entry)
+    except Exception as error:
+        # Unlike importlib.import_module, the import statement drops importlib's frames, so skipping this one
+        # leaves only the application's.
+        assert error.__traceback__ is not None
+        traceback.print_exception(error.with_traceback(error.__traceback__.tb_next))
+        raise SystemExit(1) from error
+    application = sys.modules[entry]
     app = AuthContextMiddleware(
         application.server.streamable_http_app(
             stateless_http=True,
@@ -67,35 +77,42 @@ async def start(entry: str) -> None:
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         listener.listen()
-        async with httpx2.AsyncClient(trust_env=False) as control:
+        async with httpcore2.AsyncConnectionPool() as control:
 
             async def dispatch(scope: Scope, receive: Receive, send: Send) -> None:
                 if scope["type"] == "lifespan":
 
                     async def startup(message: Message) -> None:
                         if message["type"] == "lifespan.startup.complete":
-                            response = await control.post(
+                            response = await control.request(
+                                "POST",
                                 f"{host}/ready",
-                                json={
-                                    "port": listener.getsockname()[1],
-                                    "frontend": frontend,
-                                },
+                                headers={"content-type": "application/json"},
+                                content=json.dumps(
+                                    {
+                                        "port": listener.getsockname()[1],
+                                        "frontend": frontend,
+                                    }
+                                ).encode(),
                             )
-                            response.raise_for_status()
+                            if response.status != 204:
+                                raise RuntimeError(
+                                    "Holon host rejected application startup"
+                                )
                         await send(message)
 
                     await app(scope, receive, startup)
                     return
                 identifier = Headers(scope=scope).get("x-holon-scope", "")
-                response = await control.get(
-                    f"{host}/context/{quote(identifier, safe='')}"
+                response = await control.request(
+                    "GET", f"{host}/context/{quote(identifier, safe='')}"
                 )
-                if not response.is_success:
+                if response.status != 200:
                     await Response("Request context unavailable", status_code=403)(
                         scope, receive, send
                     )
                     return
-                identity = response.json()
+                identity = json.loads(response.content)
                 scope["headers"] = [
                     (name, value)
                     for name, value in scope["headers"]

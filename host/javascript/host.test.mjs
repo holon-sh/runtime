@@ -20,11 +20,8 @@ async function listen(server) {
   await once(server, "listening");
   return server.address().port;
 }
-async function app(t, peers = {}, extra = {}) {
-  const reserve = createServer();
-  const port = await listen(reserve);
-  await new Promise((resolve) => reserve.close(resolve));
-  const child = spawn(
+function host(port, peers, extra, options = {}) {
+  return spawn(
     fileURLToPath(new URL("./.host-test", import.meta.url)),
     [
       "--transport=hosted-http",
@@ -43,8 +40,15 @@ async function app(t, peers = {}, extra = {}) {
         HOLON_MCP_RUNTIME_CONFIG: JSON.stringify({ version: 2, peers }),
         ...extra,
       },
+      ...options,
     },
   );
+}
+async function app(t, peers = {}, extra = {}) {
+  const reserve = createServer();
+  const port = await listen(reserve);
+  await new Promise((resolve) => reserve.close(resolve));
+  const child = host(port, peers, extra);
   const messages = [];
   let stderr = "";
   child.stderr.on("data", (data) => (stderr += data));
@@ -73,7 +77,12 @@ async function app(t, peers = {}, extra = {}) {
       throw new Error(stderr);
     }),
   ]);
-  return { child, messages, signal: t.signal, url: `http://127.0.0.1:${port}/mcp` };
+  return {
+    child, messages, signal: t.signal, url: `http://127.0.0.1:${port}/mcp`,
+    get stderr() {
+      return stderr;
+    },
+  };
 }
 function context(subject, principal = {}, hook) {
   const claims = {
@@ -290,6 +299,8 @@ test(
     await stopped;
     await abandoned;
     await event(downstream, "cancelled", 2);
+    for (const { stderr } of [upstream, downstream])
+      assert.doesNotMatch(stderr, /\/ready|\/context\//, "the adapter logged its own host requests");
   },
 );
 
@@ -325,5 +336,25 @@ test(
     ]) {
       assert.equal((await fetch(new URL(path, home))).status, 404);
     }
+  },
+);
+
+test(
+  "a Python application that fails to import shows only its own frames",
+  { skip: !python, timeout: 10000 },
+  async (t) => {
+    const directory = await mkdtemp(join(process.cwd(), ".import-test-"));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    await writeFile(join(directory, "server.py"), "import helper\n");
+    await writeFile(join(directory, "helper.py"), "def broken(:\n    pass\n");
+    // The application never becomes ready, so the runtime never binds this port.
+    const child = host(1, {}, {}, { cwd: directory });
+    let stderr = "";
+    child.stderr.on("data", (data) => (stderr += data));
+    const [code] = await once(child, "exit");
+    assert.notEqual(code, 0);
+    const frames = [...stderr.matchAll(/File "([^"]+)"/g)].map(([, file]) => file);
+    assert.deepEqual(frames, [join(directory, "server.py"), join(directory, "helper.py")]);
+    assert.match(stderr, /\n    def broken\(:\n.*\nSyntaxError: /);
   },
 );
