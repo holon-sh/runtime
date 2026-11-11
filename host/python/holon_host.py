@@ -11,7 +11,6 @@ from urllib.parse import quote
 import httpx2
 import uvicorn
 from holon.ext.events import Events
-from holon.ext.files import FileServer, LocalStorage
 from mcp.server.auth.middleware.auth_context import AuthContextMiddleware
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.auth.provider import AccessToken
@@ -19,7 +18,6 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.authentication import AuthCredentials, UnauthenticatedUser
 from starlette.datastructures import Headers
 from starlette.responses import Response
-from starlette.routing import Mount, Router
 from starlette.types import Message, Receive, Scope, Send
 
 try:
@@ -70,14 +68,6 @@ async def start(entry: str) -> None:
     )
     app = AuthContextMiddleware(
         served if events is None else events.asgi(server.session_manager)
-    )
-    # Where each FileServer's LocalStorage points its targets; sdk-py keeps both attributes private for now.
-    beneath = Router(
-        [
-            Mount("/mcp" + each._storage._path, app=each._storage.app)
-            for each in server.middleware
-            if isinstance(each, FileServer) and isinstance(each._storage, LocalStorage)
-        ]
     )
     frontend = os.fspath(getattr(application, "frontend", ""))
     with socket.socket() as listener:
@@ -139,7 +129,8 @@ async def start(entry: str) -> None:
                     else None
                 )
                 try:
-                    await (app if scope["path"] == "/mcp" else beneath)(
+                    # Beneath the endpoint, the SDK's app serves the routes the application registered.
+                    await (app if scope["path"] == "/mcp" else served)(
                         scope, receive, send
                     )
                 finally:

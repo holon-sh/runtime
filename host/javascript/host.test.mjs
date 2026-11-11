@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createServer, request } from "node:http";
 import { spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
 import { once } from "node:events";
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -295,20 +294,16 @@ test(
 );
 
 test(
-  "Python applications serve file transfers beneath the MCP endpoint",
+  "Python applications serve the routes they register beneath the MCP endpoint",
   { timeout: 10000, skip: !python },
   async (t) => {
     const { url } = await app(t);
-    const result = await call(url, "transfer", context("alice"));
-    const [upload, download] = JSON.parse(result.content[0].text);
-    // The platform forwards a transfer without credentials, under a context that names no one.
-    const transfer = (path, init) => fetch(url + path, { ...init, headers: context() });
-    const body = randomBytes(5 << 20);
-    assert.equal((await transfer(upload, { method: "PUT", body })).status, 201);
-    const published = await transfer(download);
-    assert.equal(published.headers.get("content-security-policy"), "sandbox");
-    assert.equal(published.headers.get("x-content-type-options"), "nosniff");
-    assert.equal(await published.text(), "<p>Published</p>");
+    // The platform forwards a file transfer without credentials, under a context that names no one.
+    const body = new Uint8Array(5 << 20);
+    const response = await fetch(`${url}/upload`, { method: "PUT", body, headers: context() });
+    assert.equal(response.headers.get("content-security-policy"), "sandbox");
+    assert.equal(response.headers.get("x-content-type-options"), "nosniff");
+    assert.equal(await response.text(), `<p>${body.length} bytes</p>`);
   },
 );
 
@@ -341,7 +336,7 @@ test(
       "/%2findex.html",
       "/missing",
       "/escape",
-      "/mcp/files/d/token",
+      "/mcp/missing",
     ]) {
       assert.equal((await fetch(new URL(path, home))).status, 404);
     }

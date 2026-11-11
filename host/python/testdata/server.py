@@ -2,7 +2,6 @@ import asyncio
 import json
 import os
 import sys
-import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -10,7 +9,6 @@ from typing import Any
 from urllib.parse import unquote, urlsplit
 
 import httpx2
-from holon.ext.files import FileServer, LocalStorage
 from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server.auth.middleware.auth_context import get_access_token
@@ -18,7 +16,8 @@ from mcp.server.mcpserver import Context, MCPServer
 from mcp.types import CallToolResult, TextContent
 from opentelemetry import propagate
 from starlette.datastructures import Headers
-from starlette.responses import StreamingResponse
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, StreamingResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 gates = {name: asyncio.Event() for name in ("inspect", "stream")}
@@ -53,17 +52,13 @@ async def lifespan(server: MCPServer[Any]) -> AsyncIterator[None]:
 
 
 server = MCPServer("ordinary-app", lifespan=lifespan)
-storage = LocalStorage()
-server.middleware.insert(0, FileServer(storage, tools=lambda name: None))
 
 
-@server.tool()
-async def transfer() -> CallToolResult:
-    expires = time.time() + 60
-    upload = await storage.issue("upload", 5 << 20, "image/png", expires)
-    download = await storage.publish(b"<p>Published</p>", None, "text/html", expires)
-    paths = [upload["path"], download["path"]]
-    return CallToolResult(content=[TextContent(type="text", text=json.dumps(paths))])
+async def upload(request: Request) -> HTMLResponse:
+    return HTMLResponse(f"<p>{len(await request.body())} bytes</p>")
+
+
+server.custom_route("/mcp/upload", methods=["PUT"])(upload)
 
 
 async def call_peer(name: str) -> CallToolResult:

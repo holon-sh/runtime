@@ -99,8 +99,7 @@ func (h *host) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		token = r.Header.Get(runtimecontract.ContextHeader)
 		r.Header.Del("Authorization")
 	}
-	beneath := strings.HasPrefix(r.URL.Path, "/mcp/")
-	if r.URL.Path != "/mcp" && !beneath {
+	if r.URL.Path != "/mcp" && !strings.HasPrefix(r.URL.Path, "/mcp/") {
 		if slices.Contains([]string{http.MethodGet, http.MethodHead}, r.Method) {
 			frontend.ServeHTTP(w, r)
 		} else {
@@ -108,11 +107,9 @@ func (h *host) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if beneath {
-		// Extension targets, such as MCP file downloads, share the frontend's origin, so what they serve never runs.
-		w.Header().Set("Content-Security-Policy", "sandbox")
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-	}
+	// The application's answers, such as files beneath its endpoint, share the frontend's origin but never run there.
+	w.Header().Set("Content-Security-Policy", "sandbox")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	s := &scope{ctx: ctx, cancel: cancel, token: token, identity: identity, forward: http.Header{}}
