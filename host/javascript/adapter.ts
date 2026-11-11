@@ -47,6 +47,8 @@ export async function start(loadApplication: () => Promise<Application>) {
   }
 
   const fetch = async (request: Request) => {
+    // The host forwards paths beneath the MCP endpoint too, and this adapter serves none of them.
+    if (new URL(request.url).pathname !== "/mcp") return new Response("Not Found", { status: 404 });
     const scope = request.headers.get("x-holon-scope");
     if (!scope) return new Response("Missing host context", { status: 403 });
     const context = await nativeFetch(`${host}/context/${encodeURIComponent(scope)}`, {

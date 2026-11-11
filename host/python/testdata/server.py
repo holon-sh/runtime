@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import Any
 from urllib.parse import unquote, urlsplit
 
 import httpx2
+from holon.ext.files import FileServer, LocalStorage
 from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server.auth.middleware.auth_context import get_access_token
@@ -51,6 +53,22 @@ async def lifespan(server: MCPServer[Any]) -> AsyncIterator[None]:
 
 
 server = MCPServer("ordinary-app", lifespan=lifespan)
+storage = LocalStorage()
+server.middleware.insert(0, FileServer(storage, tools=lambda name: None))
+
+
+@server.tool()
+async def stage(size: int) -> CallToolResult:
+    target = await storage.issue("staged", size, "text/html", time.time() + 60)
+    return CallToolResult(content=[TextContent(type="text", text=target["path"])])
+
+
+@server.tool()
+async def publish(size: int) -> CallToolResult:
+    staged = await storage.confirm("staged", size, None)
+    assert staged is not None
+    target = await storage.publish(staged, None, "text/html", time.time() + 60)
+    return CallToolResult(content=[TextContent(type="text", text=target["path"])])
 
 
 async def call_peer(name: str) -> CallToolResult:

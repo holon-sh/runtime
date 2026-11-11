@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createServer, request } from "node:http";
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { once } from "node:events";
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -98,7 +99,7 @@ function context(subject, principal = {}, hook) {
     "x-holon-caller": "spiffe://edge",
   };
 }
-async function call(url, name, headers, signal) {
+async function call(url, name, headers, signal, args = {}) {
   const client = new Client(
     { name: "test", version: "1" },
     { versionNegotiation: { mode: { pin: "2026-07-28" } } },
@@ -109,7 +110,7 @@ async function call(url, name, headers, signal) {
         requestInit: { headers },
       }),
     );
-    return await client.callTool({ name, arguments: {} }, { signal });
+    return await client.callTool({ name, arguments: args }, { signal });
   } finally {
     await client.close();
   }
@@ -294,6 +295,27 @@ test(
 );
 
 test(
+  "Python applications serve file transfers beneath the MCP endpoint",
+  { timeout: 10000, skip: !python },
+  async (t) => {
+    const { url } = await app(t);
+    const target = async (name, size) =>
+      (await call(url, name, context("alice"), undefined, { size })).content[0].text;
+    // The platform forwards a transfer without credentials, under a context that names no one.
+    const transfer = (path, init = {}) => fetch(url + path, { ...init, headers: context() });
+    const bytes = randomBytes(5 << 20);
+    const upload = await transfer(await target("stage", bytes.length), { method: "PUT", body: bytes });
+    assert.equal(upload.status, 201);
+    const download = await transfer(await target("publish", bytes.length));
+    assert.equal(download.status, 200);
+    assert.equal(download.headers.get("content-security-policy"), "sandbox");
+    assert.equal(download.headers.get("x-content-type-options"), "nosniff");
+    assert.deepEqual(Buffer.from(await download.arrayBuffer()), bytes);
+    assert.equal((await transfer("/elsewhere")).status, 404);
+  },
+);
+
+test(
   "standalone SDK applications ignore untrusted identity and serve static files",
   { timeout: 10000 },
   async (t) => {
@@ -322,6 +344,7 @@ test(
       "/%2findex.html",
       "/missing",
       "/escape",
+      "/mcp/files/d/token",
     ]) {
       assert.equal((await fetch(new URL(path, home))).status, 404);
     }
