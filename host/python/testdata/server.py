@@ -58,17 +58,12 @@ server.middleware.insert(0, FileServer(storage, tools=lambda name: None))
 
 
 @server.tool()
-async def stage(size: int) -> CallToolResult:
-    target = await storage.issue("staged", size, "text/html", time.time() + 60)
-    return CallToolResult(content=[TextContent(type="text", text=target["path"])])
-
-
-@server.tool()
-async def publish(size: int) -> CallToolResult:
-    staged = await storage.confirm("staged", size, None)
-    assert staged is not None
-    target = await storage.publish(staged, None, "text/html", time.time() + 60)
-    return CallToolResult(content=[TextContent(type="text", text=target["path"])])
+async def transfer() -> CallToolResult:
+    expires = time.time() + 60
+    upload = await storage.issue("upload", 5 << 20, "image/png", expires)
+    download = await storage.publish(b"<p>Published</p>", None, "text/html", expires)
+    paths = [upload["path"], download["path"]]
+    return CallToolResult(content=[TextContent(type="text", text=json.dumps(paths))])
 
 
 async def call_peer(name: str) -> CallToolResult:

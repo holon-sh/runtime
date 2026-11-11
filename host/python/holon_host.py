@@ -71,8 +71,7 @@ async def start(entry: str) -> None:
     app = AuthContextMiddleware(
         served if events is None else events.asgi(server.session_manager)
     )
-    # Each FileServer's LocalStorage issues targets at its path beneath the MCP endpoint, authorized by their tokens.
-    # sdk-py keeps the storage and its path private for now.
+    # Where each FileServer's LocalStorage points its targets; sdk-py keeps both attributes private for now.
     beneath = Router(
         [
             Mount("/mcp" + each._storage._path, app=each._storage.app)

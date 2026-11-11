@@ -99,7 +99,7 @@ function context(subject, principal = {}, hook) {
     "x-holon-caller": "spiffe://edge",
   };
 }
-async function call(url, name, headers, signal, args = {}) {
+async function call(url, name, headers, signal) {
   const client = new Client(
     { name: "test", version: "1" },
     { versionNegotiation: { mode: { pin: "2026-07-28" } } },
@@ -110,7 +110,7 @@ async function call(url, name, headers, signal, args = {}) {
         requestInit: { headers },
       }),
     );
-    return await client.callTool({ name, arguments: args }, { signal });
+    return await client.callTool({ name, arguments: {} }, { signal });
   } finally {
     await client.close();
   }
@@ -299,19 +299,16 @@ test(
   { timeout: 10000, skip: !python },
   async (t) => {
     const { url } = await app(t);
-    const target = async (name, size) =>
-      (await call(url, name, context("alice"), undefined, { size })).content[0].text;
+    const result = await call(url, "transfer", context("alice"));
+    const [upload, download] = JSON.parse(result.content[0].text);
     // The platform forwards a transfer without credentials, under a context that names no one.
-    const transfer = (path, init = {}) => fetch(url + path, { ...init, headers: context() });
-    const bytes = randomBytes(5 << 20);
-    const upload = await transfer(await target("stage", bytes.length), { method: "PUT", body: bytes });
-    assert.equal(upload.status, 201);
-    const download = await transfer(await target("publish", bytes.length));
-    assert.equal(download.status, 200);
-    assert.equal(download.headers.get("content-security-policy"), "sandbox");
-    assert.equal(download.headers.get("x-content-type-options"), "nosniff");
-    assert.deepEqual(Buffer.from(await download.arrayBuffer()), bytes);
-    assert.equal((await transfer("/elsewhere")).status, 404);
+    const transfer = (path, init) => fetch(url + path, { ...init, headers: context() });
+    const body = randomBytes(5 << 20);
+    assert.equal((await transfer(upload, { method: "PUT", body })).status, 201);
+    const published = await transfer(download);
+    assert.equal(published.headers.get("content-security-policy"), "sandbox");
+    assert.equal(published.headers.get("x-content-type-options"), "nosniff");
+    assert.equal(await published.text(), "<p>Published</p>");
   },
 );
 

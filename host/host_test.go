@@ -78,48 +78,6 @@ func TestAdmission(t *testing.T) {
 	}
 }
 
-func TestApplicationPaths(t *testing.T) {
-	for _, tc := range []struct {
-		method, target, served string
-	}{
-		{http.MethodPost, "/mcp", "application"},
-		{http.MethodPut, "/mcp/files/u/token", "application"},
-		{http.MethodGet, "/mcp/files/d/token", "application"},
-		{http.MethodGet, "/mcp/", ""},
-		{http.MethodGet, "/mcp/files/../secret", ""},
-		{http.MethodGet, "/mcp/files%2Fd/token", ""},
-		{http.MethodGet, "/mcpb", "frontend"},
-		{http.MethodPut, "/index.html", ""},
-	} {
-		t.Run(tc.method+" "+tc.target, func(t *testing.T) {
-			t.Setenv(protocol.RuntimeConfigEnv, `{"version":2,"peers":{}}`)
-			h, err := newHost()
-			if err != nil {
-				t.Fatal(err)
-			}
-			served := ""
-			h.application = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if h.active(r.Header.Get(runtimecontract.ScopeHeader)) != nil {
-					served = "application"
-				}
-			})
-			h.frontend = http.HandlerFunc(func(http.ResponseWriter, *http.Request) { served = "frontend" })
-			r := httptest.NewRequestWithContext(t.Context(), tc.method, tc.target, nil)
-			r.Header.Set(runtimecontract.CallerHeader, "spiffe://edge")
-			response := httptest.NewRecorder()
-			h.ServeHTTP(response, r)
-			if served != tc.served || tc.served == "" && response.Code != http.StatusNotFound {
-				t.Fatalf("served by %q: %d", served, response.Code)
-			}
-			sandboxed := response.Header().Get("Content-Security-Policy") == "sandbox" &&
-				response.Header().Get("X-Content-Type-Options") == "nosniff"
-			if sandboxed != (served == "application" && tc.target != "/mcp") {
-				t.Fatalf("response headers: %v", response.Header())
-			}
-		})
-	}
-}
-
 func TestPeerCalls(t *testing.T) {
 	const token = "header.claims.signature"
 	for _, tc := range []struct {

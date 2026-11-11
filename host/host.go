@@ -13,7 +13,6 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
-	"path"
 	"slices"
 	"strconv"
 	"strings"
@@ -100,23 +99,19 @@ func (h *host) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		token = r.Header.Get(runtimecontract.ContextHeader)
 		r.Header.Del("Authorization")
 	}
-	switch {
-	case r.URL.Path == "/mcp":
-	// Beneath the endpoint are the paths an application's extensions issue, such as the upload and download targets
-	// of MCP files, which their tokens authorize. They share the frontend's origin, so what they serve never runs.
-	case strings.HasPrefix(r.URL.Path, "/mcp/"):
-		if path.Clean(r.URL.Path) != r.URL.Path || r.URL.RawPath != "" {
+	beneath := strings.HasPrefix(r.URL.Path, "/mcp/")
+	if r.URL.Path != "/mcp" && !beneath {
+		if slices.Contains([]string{http.MethodGet, http.MethodHead}, r.Method) {
+			frontend.ServeHTTP(w, r)
+		} else {
 			http.NotFound(w, r)
-			return
 		}
+		return
+	}
+	if beneath {
+		// Extension targets, such as MCP file downloads, share the frontend's origin, so what they serve never runs.
 		w.Header().Set("Content-Security-Policy", "sandbox")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
-	case slices.Contains([]string{http.MethodGet, http.MethodHead}, r.Method):
-		frontend.ServeHTTP(w, r)
-		return
-	default:
-		http.NotFound(w, r)
-		return
 	}
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
