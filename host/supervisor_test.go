@@ -256,7 +256,6 @@ func TestFailedReloadLeavesTheAppDownUntilTheNext(t *testing.T) {
 }
 
 func TestStopEndsEverythingTheCommandStarted(t *testing.T) {
-	// The shell keeps a child of its own, as an install would.
 	r := run(t, nil, "sh", "-c", "python3 main.py; true")
 	if status, body := r.reload(overlay(t, map[string]string{"main.py": app("first")}), runtimecontract.OverlayMediaType); status != http.StatusNoContent {
 		t.Fatalf("reload: %d %s", status, body)

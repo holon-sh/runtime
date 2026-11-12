@@ -119,7 +119,6 @@ func extract(blob io.Reader, directory string) ([]string, error) {
 		if err := root.MkdirAll(filepath.Dir(name), 0o755); err != nil {
 			return written, err
 		}
-		// The owner keeps write access so that a later overlay can replace or remove what this one writes.
 		permissions := header.FileInfo().Mode().Perm()
 		if info, err := root.Lstat(name); err == nil && !(info.IsDir() && header.Typeflag == tar.TypeDir) {
 			if err := root.RemoveAll(name); err != nil {

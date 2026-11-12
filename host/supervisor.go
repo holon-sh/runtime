@@ -32,11 +32,11 @@ type supervisor struct {
 	command   []string
 	root      string
 	transport *http.Transport
-	turn      chan struct{} // held by whichever of the boot and the reloads is replacing the app
+	turn      chan struct{}
 	mu        sync.Mutex
 	child     *child
-	app       http.Handler // the child's proxy once it accepts connections, and nil until then
-	written   []string     // the paths the last overlay wrote, which the next one removes unless it writes them too
+	app       http.Handler
+	written   []string
 }
 
 type failure struct {
@@ -52,7 +52,7 @@ func Run(ctx context.Context, command []string) error {
 	if !filepath.IsAbs(root) {
 		return errors.New(reloadDirEnv + " must name the source directory")
 	}
-	// A restarted container finds what an earlier one unpacked, which the overlays to come know nothing of.
+	// A writable volume outlives the container, and overlays from before this boot are of no use.
 	if err := errors.Join(os.RemoveAll(root), os.MkdirAll(root, 0o700)); err != nil {
 		return err
 	}
@@ -83,7 +83,6 @@ func Run(ctx context.Context, command []string) error {
 }
 
 func (s *supervisor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// The mesh admits this route only from holon-api, and only to development apps.
 	if r.Method == http.MethodPost && r.URL.Path == runtimecontract.ReloadPath {
 		s.reload(w, r)
 		return
@@ -166,7 +165,6 @@ func (s *supervisor) launch(ctx context.Context) *failure {
 		Rewrite: func(p *httputil.ProxyRequest) {
 			p.SetURL(target)
 			p.Out.Host = p.In.Host
-			// The waypoint names the origin the app is served at, which Rewrite would otherwise drop.
 			for _, name := range []string{"X-Forwarded-Host", "X-Forwarded-Proto"} {
 				p.Out.Header[name] = p.In.Header[name]
 			}
@@ -206,7 +204,7 @@ func (s *supervisor) stop() {
 	if c != nil {
 		c.stop()
 	}
-	// Connections to the stopped app are dead, and a request that reuses one cannot always be retried.
+	// Connections to a previous child are dead, and a request that reuses one cannot always be retried.
 	s.transport.CloseIdleConnections()
 }
 
@@ -226,7 +224,6 @@ func (s *supervisor) start() (*child, error) {
 	command.Dir = s.root
 	command.Env = append(os.Environ(), "PWD="+s.root, "HOST=127.0.0.1", "PORT="+port)
 	command.Stdout, command.Stderr = os.Stdout, os.Stderr
-	// Its own process group lets a stop reach whatever the command started, such as an install still running.
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := command.Start(); err != nil {
 		return nil, fmt.Errorf("start application: %w", err)
