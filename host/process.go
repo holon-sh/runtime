@@ -44,6 +44,16 @@ func (p *process) stop() {
 	<-p.done
 }
 
+func (p *process) afterBuild(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-p.built:
+			next.ServeHTTP(w, r)
+		case <-r.Context().Done():
+		}
+	})
+}
+
 func Run(ctx context.Context, command []string) error {
 	port := 3000
 	if value, present := os.LookupEnv("PORT"); present {
@@ -108,7 +118,7 @@ func Run(ctx context.Context, command []string) error {
 			starting.ready <- err
 			return
 		}
-		h.connect(app.Port, handler, starting.directory)
+		h.connect(app.Port, starting.afterBuild(handler), starting.directory)
 		opening.Do(func() {
 			var listener net.Listener
 			if listener, err = new(net.ListenConfig).Listen(ctx, "tcp", ":"+strconv.Itoa(port)); err == nil {
@@ -219,10 +229,6 @@ func (h *host) restart(
 		job.readyAt = time.Now()
 		if current.directory != h.image {
 			_ = os.RemoveAll(current.directory)
-		}
-		select {
-		case <-next.built:
-		case <-time.After(time.Until(job.deadline)):
 		}
 		return next, nil, nil
 	}

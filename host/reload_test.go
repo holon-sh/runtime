@@ -444,24 +444,35 @@ func TestBootOverlayFile(t *testing.T) {
 	}
 }
 
-func TestReloadBuildsBesideTheStart(t *testing.T) {
+func blockingBuild(t *testing.T, message string) []byte {
+	t.Helper()
 	bin := t.TempDir()
 	writeTree(t, bin, map[string]string{
-		"npm": "#!/bin/sh\n[ \"$1\" = run ] || exit 0\npython3 -c 'import time; print(time.time())' > build-started\nsleep 0.3\necho built > web/index.html\n",
+		"npm": "#!/bin/sh\n[ \"$1\" = run ] || exit 0\npython3 -c 'import time; print(time.time())' > build-started\nwhile [ ! -e release ]; do sleep 0.01; done\necho built > web/index.html\n",
 	})
 	if err := os.Chmod(filepath.Join(bin, "npm"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-	source := sourceFiles("unbuilt", "time.sleep(0.3)")
+	source := sourceFiles(message, "time.sleep(0.3)")
 	source["package.json"] = `{"scripts":{"build":"build"}}`
+	return overlay(t, source)
+}
+
+func TestReloadDoesNotWaitForTheBuild(t *testing.T) {
+	blob := blockingBuild(t, "unbuilt")
 	rt := startRuntime(t, nil)
-	status, body := rt.reload(apiCaller, overlayMediaType, overlay(t, source))
+	began := time.Now()
+	status, body := rt.reload(apiCaller, overlayMediaType, blob)
 	var reply reloadReply
 	if status != http.StatusOK || json.Unmarshal(body, &reply) != nil {
 		t.Fatalf("reload answered %d %s", status, body)
 	}
-	started, err := os.ReadFile(filepath.Join(rt.child().Cwd, "build-started"))
+	if waited := time.Since(began); waited >= reloadTimeout {
+		t.Fatalf("the reload waited %s for the build", waited)
+	}
+	directory := rt.child().Cwd
+	started, err := os.ReadFile(filepath.Join(directory, "build-started"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -472,8 +483,25 @@ func TestReloadBuildsBesideTheStart(t *testing.T) {
 	if began := time.UnixMicro(int64(seconds * 1e6)); !began.Before(reply.ReadyAt) {
 		t.Fatalf("the build began at %s, after the application was ready at %s", began, reply.ReadyAt)
 	}
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		_ = os.WriteFile(filepath.Join(directory, "release"), nil, 0o644)
+	}()
 	page, _ := io.ReadAll(rt.get("/").Body)
 	if strings.TrimSpace(string(page)) != "built" {
-		t.Fatalf("the reply came before the build finished: %q", page)
+		t.Fatalf("the page was served before the build finished: %q", page)
+	}
+}
+
+func TestReloadStopsThePreviousBuild(t *testing.T) {
+	blob := blockingBuild(t, "building")
+	rt := startRuntime(t, nil)
+	for _, source := range [][]byte{blob, overlay(t, sourceFiles("next", ""))} {
+		if status, body := rt.reload(apiCaller, overlayMediaType, source); status != http.StatusOK {
+			t.Fatalf("reload answered %d %s", status, body)
+		}
+	}
+	if child := rt.child(); child.Message != "next" {
+		t.Fatalf("%q is serving after a reload during the previous build", child.Message)
 	}
 }
