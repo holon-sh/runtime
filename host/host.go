@@ -78,9 +78,9 @@ func newHost() (*host, error) {
 
 func (h *host) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// A reload is admitted by its mesh caller, without platform context; any other caller is answered like any request.
-	if h.development && slices.Contains(h.callers, meshCaller(r)) {
+	if slices.Contains(h.callers, meshCaller(r)) {
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == reloadPath:
+		case h.development && r.Method == http.MethodPost && r.URL.Path == reloadPath:
 			h.reload(w, r)
 			return
 		case r.Method == http.MethodGet && r.URL.Path == contractPath:
