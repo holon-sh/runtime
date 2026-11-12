@@ -38,7 +38,7 @@ type host struct {
 	port        uint16
 	overlays    string // the directory that holds each overlay's directory
 	development bool
-	callers     []string // the mesh identities that may reload the application
+	callers     []string // the platform's mesh identities, which may reload the application and are not apps
 	reloading   atomic.Bool
 	reloads     chan *reloadJob
 	mu          sync.Mutex
@@ -77,8 +77,10 @@ func newHost() (*host, error) {
 }
 
 func (h *host) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	mesh := meshCaller(r)
+	platform := slices.Contains(h.callers, mesh)
 	// A reload is admitted by its mesh caller, without platform context; any other caller is answered like any request.
-	if slices.Contains(h.callers, meshCaller(r)) {
+	if platform {
 		switch {
 		case h.development && r.Method == http.MethodPost && r.URL.Path == reloadPath:
 			h.reload(w, r)
@@ -109,7 +111,7 @@ func (h *host) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var token string
 	if h.peers != nil {
 		var accepted bool
-		identity, accepted = admit(r)
+		identity, accepted = admit(r, mesh, platform)
 		if !accepted {
 			w.Header().Set("Cache-Control", "no-store")
 			http.Error(w, "Invalid platform request context", http.StatusForbidden)

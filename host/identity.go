@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/holon-sh/protocol"
 	"github.com/holon-sh/protocol/runtimecontract"
 )
 
@@ -29,41 +30,43 @@ func meshCaller(r *http.Request) string {
 	return caller
 }
 
-func admit(r *http.Request) (*identity, bool) {
-	caller := meshCaller(r)
-	if caller == "" {
-		return nil, false
-	}
+func admit(r *http.Request, mesh string, platform bool) (*identity, bool) {
 	contexts := r.Header.Values(runtimecontract.ContextHeader)
-	if len(contexts) == 0 {
-		return nil, true
-	}
-	if len(contexts) > 1 || len(contexts[0]) > 16384 {
+	if mesh == "" || len(contexts) > 1 {
 		return nil, false
 	}
-	token := contexts[0]
 	var claims struct {
-		Expires   float64        `json:"exp"`
-		Audience  []string       `json:"aud"`
-		Principal map[string]any `json:"principal"`
-		Hook      map[string]any `json:"hook"`
+		Expires   float64                  `json:"exp"`
+		Audience  []string                 `json:"aud"`
+		Principal map[string]any           `json:"principal"`
+		Hook      *protocol.HookInvocation `json:"hook"`
 	}
-	if runtimecontract.DecodeContextClaims(token, &claims) != nil || claims.Expires <= float64(time.Now().UnixNano())/1e9 || len(claims.Audience) != 1 {
-		return nil, false
+	admitted := &identity{Scopes: []string{}, Extra: map[string]any{}}
+	// The platform's discovery and an app's call made outside a request carry no context.
+	if len(contexts) == 1 {
+		token := contexts[0]
+		if len(token) > 16384 || runtimecontract.DecodeContextClaims(token, &claims) != nil ||
+			claims.Expires <= float64(time.Now().UnixNano())/1e9 || len(claims.Audience) != 1 {
+			return nil, false
+		}
+		if resource, err := url.Parse(claims.Audience[0]); err != nil || !resource.IsAbs() {
+			return nil, false
+		}
+		admitted.Token, admitted.ExpiresAt, admitted.Resource = token, claims.Expires, claims.Audience[0]
 	}
-	resource, err := url.Parse(claims.Audience[0])
-	if err != nil || !resource.IsAbs() {
-		return nil, false
-	}
-	if claims.Principal == nil && claims.Hook == nil {
+	// Besides the platform's own callers, only the apps of this app's session reach it, each as the service account
+	// named after it; a lifecycle hook's job calls as its app.
+	namespaced, inCluster := strings.CutPrefix(mesh, "spiffe://cluster.local/ns/")
+	session, account, named := strings.Cut(namespaced, "/sa/")
+	fromApp := inCluster && named && !platform
+	if claims.Principal == nil && !fromApp {
 		return nil, true
 	}
-	admitted := &identity{
-		Token: token, Scopes: []string{}, ExpiresAt: claims.Expires,
-		Resource: claims.Audience[0], Extra: map[string]any{"caller": caller},
-	}
-	if claims.Hook != nil {
-		admitted.Extra["hook"] = claims.Hook
+	if fromApp {
+		if claims.Hook != nil && account == claims.Hook.Job {
+			account = claims.Hook.App
+		}
+		admitted.Extra["caller"] = map[string]string{"app": account, "session": session}
 	}
 	if claims.Principal == nil {
 		return admitted, true

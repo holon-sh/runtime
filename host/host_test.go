@@ -14,31 +14,49 @@ import (
 )
 
 func TestAdmission(t *testing.T) {
-	const reporter = "spiffe://cluster.local/ns/session/sa/reporter"
+	const (
+		api      = "spiffe://cluster.local/ns/holon-system/sa/holon-api"
+		reporter = "spiffe://cluster.local/ns/session/sa/reporter"
+		job      = "spiffe://cluster.local/ns/session/sa/install-accounts"
+	)
 	valid := `{"exp":4102444800,"aud":["https://holon.example"],"principal":{"iss":"issuer","sub":"user","client_id":"client","scope":"read write"}}`
+	anonymous := `{"exp":4102444800,"aud":["https://holon.example"]}`
+	hook := `{"exp":4102444800,"aud":["https://holon.example"],"hook":{"app":"accounts","job":"install-accounts"}}`
+	hookForPerson := `{"exp":4102444800,"aud":["https://holon.example"],"hook":{"app":"accounts","job":"install-accounts"},` +
+		`"principal":{"iss":"issuer","sub":"user","client_id":"client","scope":"read write"}}`
 	// A mistyped standard claim reads as absent; other claims pass through.
 	profile := `{"address":{"country":1,"locality":"Tokyo"},"custom":{"values":[1,null]},"email_verified":"true","name":"Ada","updated_at":1}`
-	principal := `{"token":"TOKEN","clientId":"client","scopes":["read","write"],"expiresAt":4102444800,"resource":"https://holon.example","extra":{"caller":"spiffe://edge","iss":"issuer","sub":"user"}}`
+	admitted := func(fields, extra string) string { return `{"token":"TOKEN",` + fields + `,"extra":{` + extra + `}}` }
+	person := `"clientId":"client","scopes":["read","write"],"expiresAt":4102444800,"resource":"https://holon.example"`
+	nobody := `"clientId":"","scopes":[],"expiresAt":4102444800,"resource":"https://holon.example"`
+	user := `"iss":"issuer","sub":"user"`
+	reporting, installing := `"caller":{"app":"reporter","session":"session"}`, `"caller":{"app":"accounts","session":"session"}`
 	for _, tc := range []struct {
 		name, caller, claims, duplicate, identity string
 	}{
-		{"principal context", "spiffe://edge", valid, "", principal},
-		{"principal-less context", "spiffe://edge", `{"exp":4102444800,"aud":["https://holon.example"]}`, "", "null"},
-		{"expired", "spiffe://edge", strings.Replace(valid, "4102444800", "1", 1), "", ""},
-		{"multiple audiences", "spiffe://edge", `{"exp":4102444800,"aud":["https://one.example","https://two.example"]}`, "", ""},
-		{"relative audience", "spiffe://edge", `{"exp":4102444800,"aud":["/relative"]}`, "", ""},
-		{"invalid principal", "spiffe://edge", strings.Replace(valid, `"client_id":"client"`, `"client_id":null`, 1), "", ""},
-		{"invalid scopes", "spiffe://edge", strings.Replace(valid, `"scope":"read write"`, `"scope":[]`, 1), "", ""},
-		{"identity claims", "spiffe://edge", strings.Replace(valid, `}}`, `,"claims":`+profile+`}}`, 1), "",
-			strings.Replace(principal, `"iss"`, `"claims":`+strings.NewReplacer(`"country":1,`, "", `"email_verified":"true",`, "").Replace(profile)+`,"iss"`, 1)},
-		{"non-object actor", "spiffe://edge", strings.Replace(valid, `}}`, `,"act":[{"sub":"agent"}]}}`, 1), "", ""},
-		{"workload call", reporter, "", "", "null"},
+		{"signed-in person", api, valid, "", admitted(person, user)},
+		{"signed-out person", api, anonymous, "", "null"},
+		{"platform discovery", api, "", "", "null"},
+		{"app for a signed-in person", reporter, valid, "", admitted(person, reporting+","+user)},
+		{"app for a signed-out person", reporter, anonymous, "", admitted(nobody, reporting)},
+		{"app outside a request", reporter, "", "", `{"token":"","clientId":"","scopes":[],"expiresAt":0,"resource":"","extra":{` + reporting + `}}`},
+		{"lifecycle hook job", job, hook, "", admitted(nobody, installing)},
+		{"lifecycle hook job for a person", job, hookForPerson, "", admitted(person, installing+","+user)},
+		{"app called by a hook job", reporter, hook, "", admitted(nobody, reporting)},
+		{"expired", api, strings.Replace(valid, "4102444800", "1", 1), "", ""},
+		{"multiple audiences", api, `{"exp":4102444800,"aud":["https://one.example","https://two.example"]}`, "", ""},
+		{"relative audience", api, `{"exp":4102444800,"aud":["/relative"]}`, "", ""},
+		{"invalid principal", api, strings.Replace(valid, `"client_id":"client"`, `"client_id":null`, 1), "", ""},
+		{"invalid scopes", api, strings.Replace(valid, `"scope":"read write"`, `"scope":[]`, 1), "", ""},
+		{"identity claims", api, strings.Replace(valid, `}}`, `,"claims":`+profile+`}}`, 1), "",
+			admitted(person, `"claims":`+strings.NewReplacer(`"country":1,`, "", `"email_verified":"true",`, "").Replace(profile)+","+user)},
+		{"non-object actor", api, strings.Replace(valid, `}}`, `,"act":[{"sub":"agent"}]}}`, 1), "", ""},
 		{"caller outside the mesh", "https://edge", "", "", ""},
-		{"two callers", "spiffe://edge", "", runtimecontract.CallerHeader, ""},
-		{"two contexts", "spiffe://edge", valid, runtimecontract.ContextHeader, ""},
+		{"two callers", api, "", runtimecontract.CallerHeader, ""},
+		{"two contexts", api, valid, runtimecontract.ContextHeader, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv(protocol.RuntimeConfigEnv, `{"version":2,"peers":{}}`)
+			t.Setenv(protocol.RuntimeConfigEnv, `{"version":2,"peers":{},"callers":["`+api+`"]}`)
 			h, err := newHost()
 			if err != nil {
 				t.Fatal(err)

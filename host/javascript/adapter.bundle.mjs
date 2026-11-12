@@ -665,7 +665,8 @@ async function start(loadApplication) {
     const identity = await context.json();
     const authInfo = identity ? {
       ...identity,
-      resource: new URL(identity.resource)
+      // An app's call made outside a request carries no context, so names no resource.
+      resource: identity.resource ? new URL(identity.resource) : void 0
     } : void 0;
     const headers = new Headers(request.headers);
     headers.delete("x-holon-scope");
