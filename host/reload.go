@@ -2,6 +2,7 @@ package host
 
 import (
 	"archive/tar"
+	"bytes"
 	"cmp"
 	"context"
 	"crypto/sha256"
@@ -42,12 +43,29 @@ type reloadReply struct {
 	RestartedAt time.Time `json:"restartedAt"`
 	ReadyAt     time.Time `json:"readyAt"`
 	Digest      string    `json:"digest"`
+	Output      string    `json:"output,omitempty"`
 }
 
 type reloadFailure struct {
 	status  int
 	Message string `json:"error"`
 	Exit    string `json:"exit,omitempty"`
+	Output  string `json:"output,omitempty"`
+}
+
+const tailBytes = 4 << 10
+
+type tail []byte
+
+func (t *tail) Write(p []byte) (int, error) {
+	*t = append(*t, p...)
+	if extra := len(*t) - tailBytes; extra > 0 {
+		*t = (*t)[extra:]
+		if _, rest, found := bytes.Cut(*t, []byte("\n")); found {
+			*t = rest
+		}
+	}
+	return len(p), nil
 }
 
 func (f *reloadFailure) Error() string { return f.Message }
@@ -55,6 +73,7 @@ func (f *reloadFailure) Error() string { return f.Message }
 // reloadJob hands an unpacked overlay to Run, which owns the child. Run fills in the times before a nil reply.
 type reloadJob struct {
 	directory            string
+	page                 bool
 	gone                 <-chan struct{}
 	restartedAt, readyAt time.Time
 	reply                chan *reloadFailure
@@ -85,8 +104,10 @@ func (h *host) reload(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, reloadFailure{Message: err.Error()})
 		return
 	}
-	job := &reloadJob{directory: directory, gone: r.Context().Done(), reply: make(chan *reloadFailure, 1)}
-	failure := prepare(r.Context(), job.directory, previous)
+	job := &reloadJob{
+		directory: directory, page: r.URL.Query().Get("build") != "false", gone: r.Context().Done(), reply: make(chan *reloadFailure, 1),
+	}
+	output, failure := prepare(r.Context(), job.directory, previous)
 	if failure == nil {
 		h.reloads <- job
 		failure = <-job.reply
@@ -95,7 +116,7 @@ func (h *host) reload(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, failure.status, failure)
 		return
 	}
-	writeJSON(w, http.StatusOK, reloadReply{job.restartedAt.UTC(), job.readyAt.UTC(), digest})
+	writeJSON(w, http.StatusOK, reloadReply{job.restartedAt.UTC(), job.readyAt.UTC(), digest, output})
 }
 
 // bootOverlay unpacks the overlay the platform recorded.
@@ -112,8 +133,8 @@ func (h *host) bootOverlay(ctx context.Context, recorded []byte) (string, error)
 		return "", fmt.Errorf("boot overlay %s: %w", request.Digest, err)
 	}
 	if directory != "" {
-		if failure := prepare(ctx, directory, h.image); failure != nil {
-			fmt.Fprintln(os.Stderr, failure)
+		if _, failure := prepare(ctx, directory, h.image); failure != nil {
+			fmt.Fprintln(os.Stderr, failure.Output+failure.Message)
 			return "", nil
 		}
 	}
