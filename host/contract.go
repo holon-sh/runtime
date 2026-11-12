@@ -50,7 +50,7 @@ func (h *host) contract(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, reloadFailure{Message: "application restarting"})
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), reloadTimeout)
+	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	id := rand.Text()
 	h.mu.Lock()

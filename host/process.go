@@ -59,16 +59,14 @@ func Run(ctx context.Context, command []string) error {
 	if h.image, err = os.Getwd(); err != nil {
 		return err
 	}
-	// An unset variable reads as an absent file, and either boots the image.
-	boot, _ := os.ReadFile(os.Getenv(overlayFileEnv))
-	if h.callers != nil || len(boot) != 0 {
+	directory := h.image
+	var record string
+	if record, h.development = os.LookupEnv(overlayFileEnv); h.development {
 		// A writable volume outlives the container, and overlays from before this boot are of no use.
 		if err := errors.Join(os.RemoveAll(h.overlays), os.MkdirAll(h.overlays, 0o700)); err != nil {
 			return err
 		}
-	}
-	directory := h.image
-	if len(boot) != 0 {
+		boot, _ := os.ReadFile(record)
 		if directory, err = h.bootOverlay(ctx, boot); err != nil {
 			return err
 		}
@@ -85,6 +83,15 @@ func Run(ctx context.Context, command []string) error {
 		BaseContext: func(net.Listener) context.Context { return ctx },
 	}
 	var opening sync.Once
+	listen := func() (err error) {
+		opening.Do(func() {
+			var listener net.Listener
+			if listener, err = new(net.ListenConfig).Listen(ctx, "tcp", ":"+strconv.Itoa(port)); err == nil {
+				go func() { servers <- public.Serve(listener) }()
+			}
+		})
+		return err
+	}
 	prefix := "/" + rand.Text()
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+prefix+"/ready", func(w http.ResponseWriter, r *http.Request) {
@@ -108,14 +115,8 @@ func Run(ctx context.Context, command []string) error {
 			starting.ready <- err
 			return
 		}
-		h.connect(app.Port, handler, starting.directory)
-		opening.Do(func() {
-			var listener net.Listener
-			if listener, err = new(net.ListenConfig).Listen(ctx, "tcp", ":"+strconv.Itoa(port)); err == nil {
-				go func() { servers <- public.Serve(listener) }()
-			}
-		})
-		if err != nil {
+		h.connect(app.Port, handler, starting)
+		if err = listen(); err != nil {
 			http.Error(w, "Application listener unavailable", http.StatusServiceUnavailable)
 			starting.ready <- err
 			return
@@ -174,18 +175,30 @@ func Run(ctx context.Context, command []string) error {
 		}()
 		return p, nil
 	}
-	current, failure := awaitReady(ctx, start, directory, nil)
-	if failure != nil {
+	var current *process
+	if directory == "" {
+		if err := listen(); err != nil {
+			return err
+		}
+	} else if started, failure := awaitReady(ctx, start, directory, nil); failure != nil {
 		return errors.Join(failure, ctx.Err())
+	} else {
+		current = started
 	}
 	defer func() {
 		_ = public.Close()
 		cancel()
-		<-current.done
+		if current != nil {
+			<-current.done
+		}
 	}()
 	for {
+		var exited <-chan struct{}
+		if current != nil {
+			exited = current.done
+		}
 		select {
-		case <-current.done:
+		case <-exited:
 			return errors.Join(errors.New("application exited"), current.err, ctx.Err())
 		case err := <-servers:
 			return err
@@ -213,20 +226,21 @@ func (h *host) restart(
 ) (*process, *reloadFailure, error) {
 	job.restartedAt = time.Now()
 	h.disconnect()
-	current.stop()
-	next, failure := awaitReady(ctx, start, job.directory, time.After(time.Until(job.deadline)))
+	if current != nil {
+		current.stop()
+	}
+	next, failure := awaitReady(ctx, start, job.directory, job.gone)
 	if failure == nil {
 		job.readyAt = time.Now()
-		if current.directory != h.image {
+		if current != nil {
 			_ = os.RemoveAll(current.directory)
-		}
-		select {
-		case <-next.built:
-		case <-time.After(time.Until(job.deadline)):
 		}
 		return next, nil, nil
 	}
 	_ = os.RemoveAll(job.directory)
+	if current == nil {
+		return nil, failure, nil
+	}
 	// The previous source started before, so it gets as long as a first boot.
 	previous, restored := awaitReady(ctx, start, current.directory, nil)
 	if restored != nil {
@@ -238,7 +252,7 @@ func (h *host) restart(
 // awaitReady starts a child and returns it once it has posted ready; if it will not, it is not left running. A nil
 // timeout waits as long as the child runs.
 func awaitReady(
-	ctx context.Context, start func(string) (*process, error), directory string, timeout <-chan time.Time,
+	ctx context.Context, start func(string) (*process, error), directory string, timeout <-chan struct{},
 ) (*process, *reloadFailure) {
 	p, err := start(directory)
 	if err != nil {

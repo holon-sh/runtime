@@ -137,9 +137,28 @@ type testRuntime struct {
 	exited   chan error
 }
 
-// startRuntime runs the supervisor on a child that serves the "image" source from a fresh working directory. A boot
-// request becomes the file HOLON_OVERLAY_FILE names, aimed at the runtime's registry; without one the file is absent.
 func startRuntime(t *testing.T, blobs map[string][]byte, boot ...reloadRequest) *testRuntime {
+	t.Helper()
+	return launch(t, true, blobs, boot...)
+}
+
+func startImage(t *testing.T) *testRuntime {
+	t.Helper()
+	return launch(t, false, nil)
+}
+
+func startServing(t *testing.T) *testRuntime {
+	t.Helper()
+	rt := startRuntime(t, nil)
+	first := sourceFiles("first", "")
+	first["node_modules/marker"] = "from first"
+	if status, body := rt.reload(apiCaller, overlayMediaType, overlay(t, first)); status != http.StatusOK {
+		t.Fatalf("first source answered %d %s", status, body)
+	}
+	return rt
+}
+
+func launch(t *testing.T, development bool, blobs map[string][]byte, boot ...reloadRequest) *testRuntime {
 	t.Helper()
 	python, err := exec.LookPath("python3")
 	if err != nil {
@@ -149,8 +168,9 @@ func startRuntime(t *testing.T, blobs map[string][]byte, boot ...reloadRequest) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	writeTree(t, image, sourceFiles("image", ""))
-	writeTree(t, image, map[string]string{"node_modules/marker": "from image"})
+	if !development {
+		writeTree(t, image, sourceFiles("image", ""))
+	}
 	t.Chdir(image)
 	reserved, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -172,6 +192,9 @@ func startRuntime(t *testing.T, blobs map[string][]byte, boot ...reloadRequest) 
 		registry: fakeRegistry(t, blobs), exited: make(chan error, 1),
 	}
 	t.Setenv(overlayFileEnv, filepath.Join(base, "overlay"))
+	if !development {
+		_ = errors.Join(os.Unsetenv(overlayFileEnv), os.Unsetenv(reloadDirEnv))
+	}
 	for _, request := range boot {
 		request.Registry = rt.registry
 		value, _ := json.Marshal(request)
@@ -259,6 +282,29 @@ func (rt *testRuntime) get(path string) *http.Response {
 	return response
 }
 
+func (rt *testRuntime) abandon(blob []byte, after time.Duration) {
+	rt.t.Helper()
+	ctx, cancel := context.WithTimeout(rt.t.Context(), after)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, rt.url+reloadPath, bytes.NewReader(blob))
+	if err != nil {
+		rt.t.Fatal(err)
+	}
+	request.Header.Set(runtimecontract.CallerHeader, apiCaller)
+	request.Header.Set("Content-Type", overlayMediaType)
+	if response, err := http.DefaultClient.Do(request); err == nil {
+		_ = response.Body.Close()
+		rt.t.Fatalf("the reload answered %d before its caller gave up", response.StatusCode)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for rt.get("/mcp").StatusCode != http.StatusOK {
+		if time.Now().After(deadline) {
+			rt.t.Fatal("no application is serving after an abandoned reload")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func (rt *testRuntime) child() childReply {
 	rt.t.Helper()
 	var reply childReply
@@ -298,49 +344,45 @@ func TestReload(t *testing.T) {
 		caller    string // the request's mesh identity
 		mediaType string
 		blob      []byte
-		image     map[string]string // written over the image after boot
-		timeout   time.Duration
+		previous  map[string]string
+		patience  time.Duration
 		status    int
-		exit      string // the failed child's status in the reply
+		exit      string
 		child     string // the source serving afterwards, or "" when the runtime has exited
 	}{
 		{name: "new source", caller: apiCaller, blob: source, status: http.StatusOK, child: "new"},
 		{name: "src layout", caller: apiCaller, blob: packaged, status: http.StatusOK, child: "src layout"},
 		{name: "package at the root", caller: apiCaller, blob: rootPackage, status: http.StatusOK, child: "root package"},
-		{name: "caller not allowed to reload", caller: edgeCaller, blob: source, status: http.StatusNotFound, child: "image"},
-		{name: "no mesh caller", blob: source, status: http.StatusForbidden, child: "image"},
-		{name: "not an overlay", caller: apiCaller, mediaType: "application/json", blob: source, status: http.StatusUnsupportedMediaType, child: "image"},
-		{name: "corrupt overlay", caller: apiCaller, blob: source[:len(source)/2], status: http.StatusBadRequest, child: "image"},
-		{name: "archive escapes", caller: apiCaller, blob: escapes, status: http.StatusBadRequest, child: "image"},
+		{name: "caller not allowed to reload", caller: edgeCaller, blob: source, status: http.StatusNotFound, child: "first"},
+		{name: "no mesh caller", blob: source, status: http.StatusForbidden, child: "first"},
+		{name: "not an overlay", caller: apiCaller, mediaType: "application/json", blob: source, status: http.StatusUnsupportedMediaType, child: "first"},
+		{name: "corrupt overlay", caller: apiCaller, blob: source[:len(source)/2], status: http.StatusBadRequest, child: "first"},
+		{name: "archive escapes", caller: apiCaller, blob: escapes, status: http.StatusBadRequest, child: "first"},
 		{
 			name: "new child exits", caller: apiCaller, blob: exits,
-			status: http.StatusInternalServerError, exit: "exit status 3", child: "image",
+			status: http.StatusInternalServerError, exit: "exit status 3", child: "first",
 		},
+		{name: "caller gives up before the new child is ready", blob: silent, patience: 500 * time.Millisecond, child: "first"},
 		{
-			name: "new child never ready", caller: apiCaller, blob: silent, timeout: 500 * time.Millisecond,
-			status: http.StatusGatewayTimeout, child: "image",
-		},
-		{
-			name: "rollback fails", caller: apiCaller, blob: exits, image: map[string]string{"main.py": "raise SystemExit(4)"},
+			name: "rollback fails", caller: apiCaller, blob: exits, previous: map[string]string{"main.py": "raise SystemExit(4)"},
 			status: http.StatusInternalServerError, exit: "exit status 3",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if tc.timeout != 0 {
-				previous := reloadTimeout
-				reloadTimeout = tc.timeout
-				t.Cleanup(func() { reloadTimeout = previous })
-			}
-			rt := startRuntime(t, nil)
-			writeTree(t, rt.image, tc.image)
-			status, body := rt.reload(tc.caller, cmp.Or(tc.mediaType, overlayMediaType), tc.blob)
-			var reply struct {
-				reloadFailure
-				reloadReply
-			}
-			_ = json.Unmarshal(body, &reply)
-			if status != tc.status || reply.Exit != tc.exit || status == http.StatusOK && reply.Digest != blobDigest(tc.blob) {
-				t.Fatalf("%d %s", status, body)
+			rt := startServing(t)
+			writeTree(t, rt.child().Cwd, tc.previous)
+			if tc.patience != 0 {
+				rt.abandon(tc.blob, tc.patience)
+			} else {
+				status, body := rt.reload(tc.caller, cmp.Or(tc.mediaType, overlayMediaType), tc.blob)
+				var reply struct {
+					reloadFailure
+					reloadReply
+				}
+				_ = json.Unmarshal(body, &reply)
+				if status != tc.status || reply.Exit != tc.exit || status == http.StatusOK && reply.Digest != blobDigest(tc.blob) {
+					t.Fatalf("%d %s", status, body)
+				}
 			}
 			if tc.child == "" {
 				select {
@@ -356,14 +398,10 @@ func TestReload(t *testing.T) {
 			}
 			got := rt.child()
 			page, _ := io.ReadAll(rt.get("/").Body)
-			if got.Message != tc.child || got.Leaked != nil || got.Modules == nil || *got.Modules != "from image" || string(page) != tc.child {
+			if got.Message != tc.child || got.Leaked != nil || got.Modules == nil || *got.Modules != "from first" || string(page) != tc.child {
 				t.Fatalf("serving %+v %q", got, page)
 			}
-			running := 0
-			if filepath.Dir(got.Cwd) == rt.overlays {
-				running = 1
-			}
-			if directories := rt.overlayDirectories(); len(directories) != running {
+			if directories := rt.overlayDirectories(); len(directories) != 1 {
 				t.Fatalf("overlays: %v", directories)
 			}
 			if _, err := os.Lstat(filepath.Join(filepath.Dir(rt.overlays), "outside")); !errors.Is(err, os.ErrNotExist) {
@@ -414,17 +452,32 @@ func TestBootOverlayFile(t *testing.T) {
 	recorded := reloadRequest{Repository: "holon/app", Token: "pull", Digest: blobDigest(kept), MediaType: overlayMediaType}
 	tampered := recorded
 	tampered.Digest = "sha256:" + strings.Repeat("a", 64)
+	unsent := recorded
+	unsent.Digest = "sha256:" + strings.Repeat("b", 64)
 	for _, tc := range []struct {
 		name  string
 		boot  []reloadRequest
+		send  map[string]string
 		child string
 	}{
-		{"absent file", nil, "image"},
-		{"recorded overlay", []reloadRequest{recorded}, "kept"},
-		{"digest mismatch", []reloadRequest{tampered}, ""},
+		{"no record", nil, sourceFiles("sent", ""), "sent"},
+		{"recorded overlay", []reloadRequest{recorded}, nil, "kept"},
+		{"overlay the registry does not hold", []reloadRequest{unsent}, sourceFiles("sent", ""), "sent"},
+		{"digest mismatch", []reloadRequest{tampered}, nil, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rt := startRuntime(t, map[string][]byte{recorded.Digest: kept, tampered.Digest: kept}, tc.boot...)
+			if tc.send != nil {
+				if status := rt.get("/mcp").StatusCode; status != http.StatusServiceUnavailable {
+					t.Fatalf("a runtime without source answered %d", status)
+				}
+				if status, body := rt.reload(apiCaller, overlayMediaType, overlay(t, sourceFiles("", "raise SystemExit(1)"))); status == http.StatusOK {
+					t.Fatalf("a source that exits before ready started: %s", body)
+				}
+				if status, body := rt.reload(apiCaller, overlayMediaType, overlay(t, tc.send)); status != http.StatusOK {
+					t.Fatalf("first source answered %d %s", status, body)
+				}
+			}
 			if tc.child == "" {
 				select {
 				case err := <-rt.exited:
@@ -444,36 +497,67 @@ func TestBootOverlayFile(t *testing.T) {
 	}
 }
 
-func TestReloadBuildsBesideTheStart(t *testing.T) {
+func blockingBuild(t *testing.T, message string) []byte {
+	t.Helper()
 	bin := t.TempDir()
 	writeTree(t, bin, map[string]string{
-		"npm": "#!/bin/sh\n[ \"$1\" = run ] || exit 0\npython3 -c 'import time; print(time.time())' > build-started\nsleep 0.3\necho built > web/index.html\n",
+		"npm": "#!/bin/sh\n[ \"$1\" = run ] || exit 0\nwhile [ ! -e release ]; do sleep 0.01; done\necho built > web/index.html\n",
 	})
 	if err := os.Chmod(filepath.Join(bin, "npm"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-	source := sourceFiles("unbuilt", "time.sleep(0.3)")
+	source := sourceFiles(message, "")
 	source["package.json"] = `{"scripts":{"build":"build"}}`
+	return overlay(t, source)
+}
+
+func TestReloadAnswersBeforeTheBuildAndRequestsAfterIt(t *testing.T) {
 	rt := startRuntime(t, nil)
-	status, body := rt.reload(apiCaller, overlayMediaType, overlay(t, source))
-	var reply reloadReply
-	if status != http.StatusOK || json.Unmarshal(body, &reply) != nil {
+	if status, body := rt.reload(apiCaller, overlayMediaType, blockingBuild(t, "unbuilt")); status != http.StatusOK {
 		t.Fatalf("reload answered %d %s", status, body)
 	}
-	started, err := os.ReadFile(filepath.Join(rt.child().Cwd, "build-started"))
-	if err != nil {
+	answers := make(chan string)
+	for _, path := range []string{"/", "/mcp"} {
+		go func() {
+			body, _ := io.ReadAll(rt.get(path).Body)
+			answers <- path + " " + strings.TrimSpace(string(body))
+		}()
+	}
+	select {
+	case answer := <-answers:
+		t.Fatalf("answered before the build finished: %s", answer)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if err := os.WriteFile(filepath.Join(rt.overlays, rt.overlayDirectories()[0], "release"), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	seconds, err := strconv.ParseFloat(strings.TrimSpace(string(started)), 64)
-	if err != nil {
-		t.Fatal(err)
+	got := []string{<-answers, <-answers}
+	slices.Sort(got)
+	if got[0] != "/ built" || !strings.Contains(got[1], `"message": "unbuilt"`) {
+		t.Fatalf("after the build: %q", got)
 	}
-	if began := time.UnixMicro(int64(seconds * 1e6)); !began.Before(reply.ReadyAt) {
-		t.Fatalf("the build began at %s, after the application was ready at %s", began, reply.ReadyAt)
+}
+
+func TestImageTakesNoSource(t *testing.T) {
+	rt := startImage(t)
+	if status, body := rt.reload(apiCaller, overlayMediaType, overlay(t, sourceFiles("sent", ""))); status == http.StatusOK {
+		t.Fatalf("an image took source: %s", body)
 	}
-	page, _ := io.ReadAll(rt.get("/").Body)
-	if strings.TrimSpace(string(page)) != "built" {
-		t.Fatalf("the reply came before the build finished: %q", page)
+	if got := rt.child(); got.Message != "image" {
+		t.Fatalf("serving %+v", got)
+	}
+}
+
+func TestReloadStopsThePreviousBuild(t *testing.T) {
+	blob := blockingBuild(t, "building")
+	rt := startRuntime(t, nil)
+	for _, source := range [][]byte{blob, overlay(t, sourceFiles("next", ""))} {
+		if status, body := rt.reload(apiCaller, overlayMediaType, source); status != http.StatusOK {
+			t.Fatalf("reload answered %d %s", status, body)
+		}
+	}
+	if child := rt.child(); child.Message != "next" {
+		t.Fatalf("%q is serving after a reload during the previous build", child.Message)
 	}
 }

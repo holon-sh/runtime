@@ -1,7 +1,6 @@
 package host
 
 import (
-	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -37,13 +36,15 @@ type host struct {
 	image       string
 	serving     string
 	port        uint16
-	overlays    string   // the directory that holds each overlay's directory
+	overlays    string // the directory that holds each overlay's directory
+	development bool
 	callers     []string // the mesh identities that may reload the application
 	reloading   atomic.Bool
 	reloads     chan *reloadJob
 	mu          sync.Mutex
 	application http.Handler // nil from a restart's start until its child is ready
 	frontend    http.Handler
+	built       chan struct{}
 	starting    *process
 	scopes      map[string]*scope
 }
@@ -66,24 +67,34 @@ func newHost() (*host, error) {
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
+	built := make(chan struct{})
+	close(built)
 	return &host{
-		peers: peers, transport: transport, scopes: map[string]*scope{},
-		overlays: cmp.Or(os.Getenv(reloadDirEnv), defaultReloadDir),
+		peers: peers, transport: transport, scopes: map[string]*scope{}, built: built,
+		overlays: os.Getenv(reloadDirEnv),
 		callers:  settings.Callers, reloads: make(chan *reloadJob),
 	}, nil
 }
 
 func (h *host) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// A reload is admitted by its mesh caller, without platform context; any other caller is answered like any request.
-	if caller := meshCaller(r); caller != "" && slices.Contains(h.callers, caller) {
+	if slices.Contains(h.callers, meshCaller(r)) {
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == reloadPath:
+		case h.development && r.Method == http.MethodPost && r.URL.Path == reloadPath:
 			h.reload(w, r)
 			return
 		case r.Method == http.MethodGet && r.URL.Path == contractPath:
 			h.contract(w, r)
 			return
 		}
+	}
+	h.mu.Lock()
+	built := h.built
+	h.mu.Unlock()
+	select {
+	case <-built:
+	case <-r.Context().Done():
+		return
 	}
 	h.mu.Lock()
 	application, frontend := h.application, h.frontend
@@ -213,7 +224,7 @@ func (h *host) proxy(rewrite func(*httputil.ProxyRequest)) *httputil.ReverseProx
 	}
 }
 
-func (h *host) connect(port uint16, frontend http.Handler, directory string) {
+func (h *host) connect(port uint16, frontend http.Handler, p *process) {
 	target := &url.URL{Scheme: "http", Host: "127.0.0.1:" + strconv.Itoa(int(port))}
 	application := h.proxy(func(p *httputil.ProxyRequest) {
 		p.SetURL(target)
@@ -223,7 +234,7 @@ func (h *host) connect(port uint16, frontend http.Handler, directory string) {
 		}
 	})
 	h.mu.Lock()
-	h.application, h.frontend, h.serving, h.port = application, frontend, directory, port
+	h.application, h.frontend, h.built, h.serving, h.port = application, frontend, p.built, p.directory, port
 	h.mu.Unlock()
 	// Connections to a previous child are dead, and a request that reuses one cannot always be retried.
 	h.transport.CloseIdleConnections()
