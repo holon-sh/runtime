@@ -90,7 +90,15 @@ func (h *host) reload(w http.ResponseWriter, r *http.Request) {
 	defer h.reloading.Store(false)
 	job := &reloadJob{deadline: deadline, reply: make(chan *reloadFailure, 1)}
 	var failure *reloadFailure
-	if job.directory, failure = h.fetchOverlay(r.Context(), blob, request, deadline); failure == nil {
+	h.mu.Lock()
+	previous := h.serving
+	h.mu.Unlock()
+	ctx, cancel := context.WithDeadline(r.Context(), deadline)
+	defer cancel()
+	if job.directory, failure = h.fetchOverlay(ctx, blob, request); failure == nil {
+		failure = prepare(ctx, job.directory, previous)
+	}
+	if failure == nil {
 		// Run receives unless it is returning, and the restart then waits for it even if the caller has gone.
 		h.reloads <- job
 		failure = <-job.reply
@@ -109,7 +117,10 @@ func (h *host) bootOverlay(ctx context.Context, recorded []byte) (string, error)
 	if protocol.DecodeJSONNonNull(recorded, &request) != nil || request.blob() == nil {
 		return "", errors.New("invalid " + overlayFileEnv)
 	}
-	directory, failure := h.fetchOverlay(ctx, request.blob(), request, time.Now().Add(reloadTimeout))
+	directory, failure := h.fetchOverlay(ctx, request.blob(), request)
+	if failure == nil {
+		failure = prepare(ctx, directory, h.image)
+	}
 	if failure != nil {
 		return "", fmt.Errorf("boot overlay %s: %w", request.Digest, failure)
 	}
@@ -128,9 +139,7 @@ func (request reloadRequest) blob() *url.URL {
 
 // fetchOverlay streams the blob into a fresh directory while hashing it. Nothing runs from the directory until the
 // digest has matched, and it is removed if it does not.
-func (h *host) fetchOverlay(ctx context.Context, blob *url.URL, request reloadRequest, deadline time.Time) (string, *reloadFailure) {
-	ctx, cancel := context.WithDeadline(ctx, deadline)
-	defer cancel()
+func (h *host) fetchOverlay(ctx context.Context, blob *url.URL, request reloadRequest) (string, *reloadFailure) {
 	get, err := http.NewRequestWithContext(ctx, http.MethodGet, blob.String(), nil)
 	if err != nil {
 		return "", &reloadFailure{status: http.StatusBadRequest, Message: "invalid reload request"}
@@ -150,7 +159,7 @@ func (h *host) fetchOverlay(ctx context.Context, blob *url.URL, request reloadRe
 	if err != nil {
 		return "", &reloadFailure{status: http.StatusInternalServerError, Message: "prepare source directory: " + err.Error()}
 	}
-	failure := unpackVerified(response.Body, directory, request.Digest, h.image)
+	failure := unpackVerified(response.Body, directory, request.Digest)
 	if failure != nil {
 		_ = os.RemoveAll(directory)
 		return "", failure
@@ -158,7 +167,7 @@ func (h *host) fetchOverlay(ctx context.Context, blob *url.URL, request reloadRe
 	return directory, nil
 }
 
-func unpackVerified(blob io.Reader, directory, digest, image string) *reloadFailure {
+func unpackVerified(blob io.Reader, directory, digest string) *reloadFailure {
 	hash := sha256.New()
 	stream := io.TeeReader(blob, hash)
 	unpacked := extractOverlay(stream, directory)
@@ -168,8 +177,8 @@ func unpackVerified(blob io.Reader, directory, digest, image string) *reloadFail
 	if "sha256:"+hex.EncodeToString(hash.Sum(nil)) != digest {
 		return &reloadFailure{status: http.StatusBadGateway, Message: "digest mismatch"}
 	}
-	if err := errors.Join(unpacked, linkImageEntries(image, directory)); err != nil {
-		return &reloadFailure{status: http.StatusInternalServerError, Message: "unpack source: " + err.Error()}
+	if unpacked != nil {
+		return &reloadFailure{status: http.StatusInternalServerError, Message: "unpack source: " + unpacked.Error()}
 	}
 	return nil
 }
@@ -231,26 +240,6 @@ func extractOverlay(blob io.Reader, directory string) error {
 			return fmt.Errorf("unsupported entry %q", header.Name)
 		}
 	}
-}
-
-// linkImageEntries makes what the image's application directory holds beside the source, such as node_modules or a
-// built dist, visible from the overlay. The overlay wins, so a top-level source file deleted since the image was
-// built stays visible until the next image build. Bytecode stays out: Python trusts a cache by its source's size and
-// modification time, which do not tell two overlays apart.
-func linkImageEntries(image, directory string) error {
-	entries, err := os.ReadDir(image)
-	if err != nil {
-		return err
-	}
-	for _, entry := range entries {
-		link := filepath.Join(directory, entry.Name())
-		if _, err := os.Lstat(link); errors.Is(err, os.ErrNotExist) && entry.Name() != "__pycache__" {
-			if err := os.Symlink(filepath.Join(image, entry.Name()), link); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
 }
 
 // srcLayout reports an overlay whose packages live under its own src/. A project packaged that way is also installed

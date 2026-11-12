@@ -67,7 +67,7 @@ server.serve_forever()
 
 // sourceFiles is a whole application tree whose message and static page are recognisable.
 func sourceFiles(message, beforeReady string) map[string]string {
-	return map[string]string{"main.py": childSource(message, beforeReady), "web/index.html": message}
+	return map[string]string{"main.py": childSource(message, beforeReady), "server.py": "", "web/index.html": message}
 }
 
 // overlay packs files, then entries without contents, into a zstd tar.
@@ -282,15 +282,17 @@ func (rt *testRuntime) overlayDirectories() []string {
 }
 
 func TestReload(t *testing.T) {
-	// The new source lacks the image's frontend and node_modules, which it is served with.
-	source := overlay(t, map[string]string{"main.py": childSource("new", "")})
+	source := overlay(t, sourceFiles("new", ""))
 	exits := overlay(t, sourceFiles("exits", "sys.exit(3)"))
 	silent := overlay(t, sourceFiles("silent", "time.sleep(60)"))
 	escapes := overlay(t, nil, &tar.Header{Name: "../../outside", Typeflag: tar.TypeReg, Mode: 0o644})
 	tampered := "sha256:" + strings.Repeat("a", 64)
-	packaged := overlay(t, map[string]string{"main.py": childSource("src layout", "import overlaid"), "src/overlaid/__init__.py": ""})
+	packaged := overlay(t, map[string]string{
+		"main.py": childSource("src layout", "import overlaid"), "server.py": "", "src/overlaid/__init__.py": "", "web/index.html": "src layout",
+	})
 	rootPackage := overlay(t, map[string]string{
-		"main.py": childSource("root package", `assert "PYTHONPATH" not in os.environ`), "flat/__init__.py": "", "src/index.ts": "",
+		"main.py": childSource("root package", `assert "PYTHONPATH" not in os.environ`), "server.py": "", "flat/__init__.py": "", "src/index.ts": "",
+		"web/index.html": "root package",
 	})
 	blobs := map[string][]byte{
 		blobDigest(source): source, blobDigest(exits): exits, blobDigest(silent): silent, blobDigest(escapes): escapes, tampered: source,
@@ -355,7 +357,7 @@ func TestReload(t *testing.T) {
 			}
 			got := rt.child()
 			page, _ := io.ReadAll(rt.get("/").Body)
-			if got.Message != tc.child || got.Leaked != nil || got.Modules == nil || *got.Modules != "from image" || string(page) != "image" {
+			if got.Message != tc.child || got.Leaked != nil || got.Modules == nil || *got.Modules != "from image" || string(page) != tc.child {
 				t.Fatalf("serving %+v %q", got, page)
 			}
 			running := 0
