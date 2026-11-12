@@ -39,8 +39,7 @@ type supervisor struct {
 
 type failure struct {
 	status  int
-	Message string `json:"error"`
-	Exit    string `json:"exit,omitempty"`
+	message string
 }
 
 // Run serves PORT and proxies it to command, which it starts in the source directory with a loopback HOST and PORT
@@ -112,7 +111,7 @@ func (s *supervisor) boot(ctx context.Context) error {
 		return err
 	}
 	if failure := s.launch(ctx); failure != nil {
-		fmt.Fprintln(os.Stderr, "application did not start:", failure.Message, failure.Exit)
+		fmt.Fprintln(os.Stderr, "application did not start:", failure.message)
 	}
 	return nil
 }
@@ -128,7 +127,7 @@ func (s *supervisor) reload(w http.ResponseWriter, r *http.Request) {
 	defer func() { <-s.turn }()
 	s.stop()
 	if _, err := s.unpack(r.Body); err != nil {
-		writeFailure(w, &failure{status: http.StatusBadRequest, Message: err.Error()})
+		writeFailure(w, &failure{status: http.StatusBadRequest, message: err.Error()})
 		return
 	}
 	if failure := s.launch(r.Context()); failure != nil {
@@ -142,7 +141,7 @@ func (s *supervisor) reload(w http.ResponseWriter, r *http.Request) {
 func (s *supervisor) launch(ctx context.Context) *failure {
 	c, err := s.start()
 	if err != nil {
-		return &failure{status: http.StatusInternalServerError, Message: err.Error()}
+		return &failure{status: http.StatusInternalServerError, message: err.Error()}
 	}
 	if failure := c.ready(ctx); failure != nil {
 		c.stop()
@@ -219,11 +218,10 @@ func (c *child) ready(ctx context.Context) *failure {
 		select {
 		case <-c.done:
 			return &failure{
-				status: http.StatusInternalServerError, Message: "application exited before ready",
-				Exit: c.command.ProcessState.String(),
+				status: http.StatusInternalServerError, message: "application exited before ready: " + c.command.ProcessState.String(),
 			}
 		case <-ctx.Done():
-			return &failure{status: http.StatusGatewayTimeout, Message: "application did not become ready"}
+			return &failure{status: http.StatusGatewayTimeout, message: "application did not become ready"}
 		case <-time.After(25 * time.Millisecond):
 		}
 	}
@@ -252,7 +250,7 @@ func loopbackAddress() (string, error) {
 }
 
 func writeFailure(w http.ResponseWriter, f *failure) {
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set(protocol.HeaderContentType, protocol.MIMEApplicationJSON)
 	w.WriteHeader(f.status)
-	_ = json.NewEncoder(w).Encode(f)
+	_ = json.NewEncoder(w).Encode(runtimecontract.ReloadFailure{Error: f.message})
 }

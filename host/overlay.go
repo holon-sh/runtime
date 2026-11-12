@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"slices"
 
+	"github.com/holon-sh/protocol"
 	"github.com/holon-sh/protocol/runtimecontract"
 	"github.com/klauspost/compress/zstd"
 )
@@ -24,7 +25,7 @@ func (s *supervisor) fetch(ctx context.Context, record runtimecontract.OverlayRe
 	if err != nil {
 		return false, err
 	}
-	request.Header.Set("Authorization", "Bearer "+record.Token)
+	request.Header.Set(protocol.HeaderAuthorization, protocol.BearerPrefix+record.Token)
 	response, err := (&http.Client{Transport: s.transport}).Do(request)
 	if err != nil {
 		return false, errors.New("registry unavailable")
