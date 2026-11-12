@@ -14,7 +14,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/holon-sh/protocol"
@@ -24,12 +23,11 @@ import (
 // A source overlay lets `holon dev` restart the application in place from new source. The platform records the latest
 // one in the file HOLON_OVERLAY_FILE names, which a new container starts from.
 const (
-	reloadPath        = "/.holon/reload"
-	reloadDirEnv      = "HOLON_RELOAD_DIR"
-	overlayFileEnv    = "HOLON_OVERLAY_FILE"
-	defaultReloadDir  = "/tmp/holon-source"
-	overlayMediaType  = "application/vnd.holon.source-overlay.v0.tar+zstd"
-	maxReloadBodySize = 64 << 10
+	reloadPath       = "/.holon/reload"
+	reloadDirEnv     = "HOLON_RELOAD_DIR"
+	overlayFileEnv   = "HOLON_OVERLAY_FILE"
+	defaultReloadDir = "/tmp/holon-source"
+	overlayMediaType = "application/vnd.holon.source-overlay.v0.tar+zstd"
 )
 
 // reloadTimeout bounds a reload from its request to the new child's ready, inside the minute the caller waits.
@@ -74,13 +72,8 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 
 func (h *host) reload(w http.ResponseWriter, r *http.Request) {
 	deadline := time.Now().Add(reloadTimeout)
-	var request reloadRequest
-	var blob *url.URL
-	if data, err := io.ReadAll(io.LimitReader(r.Body, maxReloadBodySize)); err == nil && protocol.DecodeJSONNonNull(data, &request) == nil {
-		blob = request.blob()
-	}
-	if blob == nil {
-		writeJSON(w, http.StatusBadRequest, reloadFailure{Message: "invalid reload request"})
+	if r.Header.Get("Content-Type") != overlayMediaType {
+		writeJSON(w, http.StatusUnsupportedMediaType, reloadFailure{Message: "invalid reload request"})
 		return
 	}
 	if !h.reloading.CompareAndSwap(false, true) {
@@ -89,15 +82,18 @@ func (h *host) reload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer h.reloading.Store(false)
 	job := &reloadJob{deadline: deadline, reply: make(chan *reloadFailure, 1)}
-	var failure *reloadFailure
 	h.mu.Lock()
 	previous := h.serving
 	h.mu.Unlock()
 	ctx, cancel := context.WithDeadline(r.Context(), deadline)
 	defer cancel()
-	if job.directory, failure = h.fetchOverlay(ctx, blob, request); failure == nil {
-		failure = prepare(ctx, job.directory, previous)
+	directory, digest, err := h.unpackOverlay(r.Body)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, reloadFailure{Message: err.Error()})
+		return
 	}
+	job.directory = directory
+	failure := prepare(ctx, job.directory, previous)
 	if failure == nil {
 		// Run receives unless it is returning, and the restart then waits for it even if the caller has gone.
 		h.reloads <- job
@@ -107,7 +103,7 @@ func (h *host) reload(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, failure.status, failure)
 		return
 	}
-	writeJSON(w, http.StatusOK, reloadReply{job.restartedAt.UTC(), job.readyAt.UTC(), request.Digest})
+	writeJSON(w, http.StatusOK, reloadReply{job.restartedAt.UTC(), job.readyAt.UTC(), digest})
 }
 
 // bootOverlay unpacks the overlay the platform recorded. A development image holds no source of its own, so a failure
@@ -117,12 +113,14 @@ func (h *host) bootOverlay(ctx context.Context, recorded []byte) (string, error)
 	if protocol.DecodeJSONNonNull(recorded, &request) != nil || request.blob() == nil {
 		return "", errors.New("invalid " + overlayFileEnv)
 	}
-	directory, failure := h.fetchOverlay(ctx, request.blob(), request)
-	if failure == nil {
-		failure = prepare(ctx, directory, h.image)
+	directory, err := h.fetchOverlay(ctx, request)
+	if err == nil {
+		if failure := prepare(ctx, directory, h.image); failure != nil {
+			err = failure
+		}
 	}
-	if failure != nil {
-		return "", fmt.Errorf("boot overlay %s: %w", request.Digest, failure)
+	if err != nil {
+		return "", fmt.Errorf("boot overlay %s: %w", request.Digest, err)
 	}
 	return directory, nil
 }
@@ -139,48 +137,46 @@ func (request reloadRequest) blob() *url.URL {
 
 // fetchOverlay streams the blob into a fresh directory while hashing it. Nothing runs from the directory until the
 // digest has matched, and it is removed if it does not.
-func (h *host) fetchOverlay(ctx context.Context, blob *url.URL, request reloadRequest) (string, *reloadFailure) {
-	get, err := http.NewRequestWithContext(ctx, http.MethodGet, blob.String(), nil)
+func (h *host) fetchOverlay(ctx context.Context, request reloadRequest) (string, error) {
+	get, err := http.NewRequestWithContext(ctx, http.MethodGet, request.blob().String(), nil)
 	if err != nil {
-		return "", &reloadFailure{status: http.StatusBadRequest, Message: "invalid reload request"}
+		return "", err
 	}
 	get.Header.Set("Authorization", "Bearer "+request.Token)
 	response, err := (&http.Client{Transport: h.transport}).Do(get)
 	if err != nil {
-		return "", &reloadFailure{status: http.StatusBadGateway, Message: "registry unavailable"}
+		return "", errors.New("registry unavailable")
 	}
 	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusOK {
-		return "", &reloadFailure{status: http.StatusBadGateway, Message: fmt.Sprintf("registry answered %d", response.StatusCode)}
+		return "", fmt.Errorf("registry answered %d", response.StatusCode)
 	}
-	// The suffix keeps the directory fresh when a digest returns while its earlier directory is in use.
-	short := strings.TrimPrefix(request.Digest, "sha256:")[:12]
-	directory, err := os.MkdirTemp(h.overlays, short+"-")
-	if err != nil {
-		return "", &reloadFailure{status: http.StatusInternalServerError, Message: "prepare source directory: " + err.Error()}
-	}
-	failure := unpackVerified(response.Body, directory, request.Digest)
-	if failure != nil {
+	directory, digest, err := h.unpackOverlay(response.Body)
+	if err == nil && digest != request.Digest {
 		_ = os.RemoveAll(directory)
-		return "", failure
+		err = errors.New("digest mismatch")
+	}
+	if err != nil {
+		return "", err
 	}
 	return directory, nil
 }
 
-func unpackVerified(blob io.Reader, directory, digest string) *reloadFailure {
+func (h *host) unpackOverlay(overlay io.Reader) (string, string, error) {
+	directory, err := os.MkdirTemp(h.overlays, "")
+	if err != nil {
+		return "", "", fmt.Errorf("prepare source directory: %w", err)
+	}
 	hash := sha256.New()
-	stream := io.TeeReader(blob, hash)
-	unpacked := extractOverlay(stream, directory)
-	if _, err := io.Copy(io.Discard, stream); err != nil {
-		return &reloadFailure{status: http.StatusBadGateway, Message: "registry read failed"}
+	stream := io.TeeReader(overlay, hash)
+	if err = extractOverlay(stream, directory); err == nil {
+		_, err = io.Copy(io.Discard, stream)
 	}
-	if "sha256:"+hex.EncodeToString(hash.Sum(nil)) != digest {
-		return &reloadFailure{status: http.StatusBadGateway, Message: "digest mismatch"}
+	if err != nil {
+		_ = os.RemoveAll(directory)
+		return "", "", fmt.Errorf("unpack source: %w", err)
 	}
-	if unpacked != nil {
-		return &reloadFailure{status: http.StatusInternalServerError, Message: "unpack source: " + unpacked.Error()}
-	}
-	return nil
+	return directory, "sha256:" + hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 func extractOverlay(blob io.Reader, directory string) error {
