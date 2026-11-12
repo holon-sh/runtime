@@ -149,7 +149,7 @@ test(
         downstream.url,
         {
           method: req.method,
-          headers: { ...req.headers, "x-holon-caller": "spiffe://app-a" },
+          headers: { ...req.headers, "x-holon-caller": "spiffe://cluster.local/ns/session/sa/app-a" },
         },
         (reply) => {
           res.writeHead(reply.statusCode, reply.headers);
@@ -160,6 +160,7 @@ test(
       res.on("close", () => forwarded.destroy());
       req.pipe(forwarded);
     });
+    const caller = { app: "app-a", session: "session" };
     const peer = `http://127.0.0.1:${await listen(mesh)}/mcp`;
     t.after(() => mesh.close());
     const upstream = await app(
@@ -197,7 +198,7 @@ test(
           token: headers["x-holon-context"],
           extra: {
             sub: subject,
-            caller: "spiffe://app-a",
+            caller,
             iss: "https://issuer.example",
             ...actor,
           },
@@ -241,10 +242,7 @@ test(
       operation: "install", step: 1, attempt: 1, deadline: "2030-03-17T17:47:40Z",
     };
     const invoked = await call(upstream.url, "inspect", context(undefined, {}, hook));
-    assert.deepEqual(JSON.parse(invoked.content[0].text).identity.extra, {
-      caller: "spiffe://app-a",
-      hook,
-    });
+    assert.deepEqual(JSON.parse(invoked.content[0].text).identity.extra, { caller });
     const response = await call(upstream.url, "external", context("user"));
     assert(
       !Object.keys(JSON.parse(response.content[0].text)).some((name) =>
@@ -265,7 +263,10 @@ test(
     await event(upstream, "stream-peer-ready");
     release(upstream, "stream");
     await streaming.text();
-    assert.equal((await event(upstream, "stream-late-forwarded")).identity, null);
+    // A call made after its request ended carries no context, only the calling app.
+    assert.deepEqual((await event(upstream, "stream-late-forwarded")).identity, {
+      token: "", clientId: "", scopes: [], expiresAt: 0, extra: { caller }, ...(python && { resource: "" }),
+    });
     await event(downstream, "peer-stream-closed");
     redirect = true;
     externalRequests.length = 0;

@@ -56,7 +56,8 @@ export async function start(loadApplication: () => Promise<Application>) {
     const identity = await context.json() as (Omit<AuthInfo, "resource"> & { resource: string }) | null;
     const authInfo = identity ? {
       ...identity,
-      resource: new URL(identity.resource),
+      // An app's call made outside a request carries no context, so names no resource.
+      resource: identity.resource ? new URL(identity.resource) : undefined,
     } : undefined;
     const headers = new Headers(request.headers);
     headers.delete("x-holon-scope");
