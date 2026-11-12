@@ -344,5 +344,16 @@ test(
     ]) {
       assert.equal((await fetch(new URL(path, home))).status, 404);
     }
+    // A page at a path with no file gets index.html for the app to route; files, hidden or escaping paths don't.
+    const page = { headers: { accept: "text/html" } };
+    for (const path of ["/missing", "/hugh/30min"]) {
+      const response = await fetch(new URL(path, home), page);
+      assert.equal(response.status, 200);
+      assert.match(await response.text(), /Application frontend/);
+    }
+    for (const path of ["/missing.js", "/%2eprivate", "/escape"]) {
+      assert.equal((await fetch(new URL(path, home), page)).status, 404, path);
+    }
+    assert.equal((await fetch(new URL("/missing", home), { ...page, method: "POST" })).status, 404);
   },
 );

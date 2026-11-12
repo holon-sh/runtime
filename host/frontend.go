@@ -3,9 +3,11 @@ package host
 import (
 	"cmp"
 	"errors"
+	"io/fs"
 	"mime"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 )
@@ -15,6 +17,14 @@ func within(root, name string) bool {
 	return filepath.IsLocal(relative)
 }
 
+// navigation reports whether r asks for a page rather than a file: a browser loading /hugh, not /app.js.
+func navigation(r *http.Request) bool {
+	return (r.Method == http.MethodGet || r.Method == http.MethodHead) && path.Ext(r.URL.Path) == "" &&
+		strings.Contains(r.Header.Get("Accept"), "text/html")
+}
+
+// frontend serves the application's static files. A page at a path with no file, such as a single-page app's /hugh,
+// gets the frontend's index.html so the app can route it; a missing file still answers 404.
 func frontend(directory, source string) (http.Handler, error) {
 	if directory == "" {
 		return http.NotFoundHandler(), nil
@@ -41,6 +51,9 @@ func frontend(directory, source string) (http.Handler, error) {
 			return
 		}
 		name, err := filepath.EvalSymlinks(filepath.Join(root, r.URL.Path))
+		if errors.Is(err, fs.ErrNotExist) && navigation(r) {
+			name, err = filepath.EvalSymlinks(filepath.Join(root, "index.html"))
+		}
 		if err != nil || !within(root, name) {
 			http.NotFound(w, r)
 			return
