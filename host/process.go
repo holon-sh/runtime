@@ -69,16 +69,14 @@ func Run(ctx context.Context, command []string) error {
 	if h.image, err = os.Getwd(); err != nil {
 		return err
 	}
-	// An unset variable reads as an absent file, and either boots the image.
-	boot, _ := os.ReadFile(os.Getenv(overlayFileEnv))
-	if h.callers != nil || len(boot) != 0 {
+	directory := h.image
+	var record string
+	if record, h.development = os.LookupEnv(overlayFileEnv); h.development {
 		// A writable volume outlives the container, and overlays from before this boot are of no use.
 		if err := errors.Join(os.RemoveAll(h.overlays), os.MkdirAll(h.overlays, 0o700)); err != nil {
 			return err
 		}
-	}
-	directory := h.image
-	if len(boot) != 0 {
+		boot, _ := os.ReadFile(record)
 		if directory, err = h.bootOverlay(ctx, boot); err != nil {
 			return err
 		}
@@ -241,10 +239,10 @@ func (h *host) restart(
 	if current != nil {
 		current.stop()
 	}
-	next, failure := awaitReady(ctx, start, job.directory, time.After(time.Until(job.deadline)))
+	next, failure := awaitReady(ctx, start, job.directory, job.gone)
 	if failure == nil {
 		job.readyAt = time.Now()
-		if current != nil && current.directory != h.image {
+		if current != nil {
 			_ = os.RemoveAll(current.directory)
 		}
 		return next, nil, nil
@@ -264,7 +262,7 @@ func (h *host) restart(
 // awaitReady starts a child and returns it once it has posted ready; if it will not, it is not left running. A nil
 // timeout waits as long as the child runs.
 func awaitReady(
-	ctx context.Context, start func(string) (*process, error), directory string, timeout <-chan time.Time,
+	ctx context.Context, start func(string) (*process, error), directory string, timeout <-chan struct{},
 ) (*process, *reloadFailure) {
 	p, err := start(directory)
 	if err != nil {

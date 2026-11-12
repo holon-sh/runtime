@@ -1,7 +1,6 @@
 package host
 
 import (
-	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -37,7 +36,8 @@ type host struct {
 	image       string
 	serving     string
 	port        uint16
-	overlays    string   // the directory that holds each overlay's directory
+	overlays    string // the directory that holds each overlay's directory
+	development bool
 	callers     []string // the mesh identities that may reload the application
 	reloading   atomic.Bool
 	reloads     chan *reloadJob
@@ -68,14 +68,14 @@ func newHost() (*host, error) {
 	transport.Proxy = nil
 	return &host{
 		peers: peers, transport: transport, scopes: map[string]*scope{},
-		overlays: cmp.Or(os.Getenv(reloadDirEnv), defaultReloadDir),
+		overlays: os.Getenv(reloadDirEnv),
 		callers:  settings.Callers, reloads: make(chan *reloadJob),
 	}, nil
 }
 
 func (h *host) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// A reload is admitted by its mesh caller, without platform context; any other caller is answered like any request.
-	if caller := meshCaller(r); caller != "" && slices.Contains(h.callers, caller) {
+	if h.development && slices.Contains(h.callers, meshCaller(r)) {
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == reloadPath:
 			h.reload(w, r)

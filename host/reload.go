@@ -27,12 +27,8 @@ const (
 	reloadPath       = "/.holon/reload"
 	reloadDirEnv     = "HOLON_RELOAD_DIR"
 	overlayFileEnv   = "HOLON_OVERLAY_FILE"
-	defaultReloadDir = "/tmp/holon-source"
 	overlayMediaType = "application/vnd.holon.source-overlay.v0.tar+zstd"
 )
-
-// reloadTimeout bounds a reload from its request to the new child's ready, inside the minute the caller waits.
-var reloadTimeout = 45 * time.Second
 
 type reloadRequest struct {
 	Registry   string `json:"registry"`
@@ -59,7 +55,7 @@ func (f *reloadFailure) Error() string { return f.Message }
 // reloadJob hands an unpacked overlay to Run, which owns the child. Run fills in the times before a nil reply.
 type reloadJob struct {
 	directory            string
-	deadline             time.Time
+	gone                 <-chan struct{}
 	restartedAt, readyAt time.Time
 	reply                chan *reloadFailure
 }
@@ -72,7 +68,6 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 }
 
 func (h *host) reload(w http.ResponseWriter, r *http.Request) {
-	deadline := time.Now().Add(reloadTimeout)
 	if r.Header.Get("Content-Type") != overlayMediaType {
 		writeJSON(w, http.StatusUnsupportedMediaType, reloadFailure{Message: "invalid reload request"})
 		return
@@ -82,21 +77,17 @@ func (h *host) reload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer h.reloading.Store(false)
-	job := &reloadJob{deadline: deadline, reply: make(chan *reloadFailure, 1)}
 	h.mu.Lock()
 	previous := cmp.Or(h.serving, h.image)
 	h.mu.Unlock()
-	ctx, cancel := context.WithDeadline(r.Context(), deadline)
-	defer cancel()
 	directory, digest, err := h.unpackOverlay(r.Body)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, reloadFailure{Message: err.Error()})
 		return
 	}
-	job.directory = directory
-	failure := prepare(ctx, job.directory, previous)
+	job := &reloadJob{directory: directory, gone: r.Context().Done(), reply: make(chan *reloadFailure, 1)}
+	failure := prepare(r.Context(), job.directory, previous)
 	if failure == nil {
-		// Run receives unless it is returning, and the restart then waits for it even if the caller has gone.
 		h.reloads <- job
 		failure = <-job.reply
 	}
@@ -110,6 +101,9 @@ func (h *host) reload(w http.ResponseWriter, r *http.Request) {
 // bootOverlay unpacks the overlay the platform recorded. A development image holds no source of its own, so a failure
 // here fails the boot.
 func (h *host) bootOverlay(ctx context.Context, recorded []byte) (string, error) {
+	if len(recorded) == 0 {
+		return "", nil
+	}
 	var request reloadRequest
 	if protocol.DecodeJSONNonNull(recorded, &request) != nil || request.blob() == nil {
 		return "", errors.New("invalid " + overlayFileEnv)
