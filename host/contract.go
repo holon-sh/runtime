@@ -46,8 +46,12 @@ func (h *host) contract(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	port, serving := h.port, h.application != nil
 	h.mu.Unlock()
-	if !serving {
+	if !serving && h.reloading.Load() {
 		writeJSON(w, http.StatusServiceUnavailable, reloadFailure{Message: "application restarting"})
+		return
+	}
+	if !serving {
+		writeJSON(w, http.StatusNotFound, reloadFailure{Message: "no application"})
 		return
 	}
 	ctx, cancel := context.WithCancel(r.Context())

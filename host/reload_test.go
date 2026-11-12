@@ -305,6 +305,21 @@ func (rt *testRuntime) abandon(blob []byte, after time.Duration) {
 	}
 }
 
+func (rt *testRuntime) contract() int {
+	rt.t.Helper()
+	request, err := http.NewRequest(http.MethodGet, rt.url+contractPath, nil)
+	if err != nil {
+		rt.t.Fatal(err)
+	}
+	request.Header.Set(runtimecontract.CallerHeader, apiCaller)
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		rt.t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	return response.StatusCode
+}
+
 func (rt *testRuntime) child() childReply {
 	rt.t.Helper()
 	var reply childReply
@@ -435,6 +450,9 @@ func TestReloadAnswers503DuringRestart(t *testing.T) {
 	if response := rt.get("/mcp"); response.StatusCode != http.StatusServiceUnavailable || response.Header.Get("Retry-After") != "1" {
 		t.Fatalf("during restart: %d %v", response.StatusCode, response.Header)
 	}
+	if status := rt.contract(); status != http.StatusServiceUnavailable {
+		t.Fatalf("contract during restart: %d", status)
+	}
 	if status, body := rt.reload(apiCaller, overlayMediaType, gated); status != http.StatusConflict {
 		t.Fatalf("concurrent reload: %d %s", status, body)
 	}
@@ -454,6 +472,22 @@ func TestBootOverlayFile(t *testing.T) {
 	tampered.Digest = "sha256:" + strings.Repeat("a", 64)
 	unsent := recorded
 	unsent.Digest = "sha256:" + strings.Repeat("b", 64)
+	bin := t.TempDir()
+	writeTree(t, bin, map[string]string{"npm": "#!/bin/sh\nexit 1\n"})
+	if err := os.Chmod(filepath.Join(bin, "npm"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	exits := overlay(t, sourceFiles("exits", "raise SystemExit(1)"))
+	uninstallable := sourceFiles("uninstallable", "")
+	uninstallable["package.json"] = "{}"
+	broken := map[string][]byte{}
+	for _, blob := range [][]byte{exits, overlay(t, uninstallable)} {
+		broken[blobDigest(blob)] = blob
+	}
+	stored := func(blob []byte) []reloadRequest {
+		return []reloadRequest{{Repository: recorded.Repository, Token: recorded.Token, Digest: blobDigest(blob), MediaType: overlayMediaType}}
+	}
 	for _, tc := range []struct {
 		name  string
 		boot  []reloadRequest
@@ -463,13 +497,17 @@ func TestBootOverlayFile(t *testing.T) {
 		{"no record", nil, sourceFiles("sent", ""), "sent"},
 		{"recorded overlay", []reloadRequest{recorded}, nil, "kept"},
 		{"overlay the registry does not hold", []reloadRequest{unsent}, sourceFiles("sent", ""), "sent"},
+		{"recorded overlay that does not install", stored(overlay(t, uninstallable)), sourceFiles("sent", ""), "sent"},
+		{"recorded overlay that exits before it is ready", stored(exits), sourceFiles("sent", ""), "sent"},
 		{"digest mismatch", []reloadRequest{tampered}, nil, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			rt := startRuntime(t, map[string][]byte{recorded.Digest: kept, tampered.Digest: kept}, tc.boot...)
+			blobs := maps.Clone(broken)
+			blobs[recorded.Digest], blobs[tampered.Digest] = kept, kept
+			rt := startRuntime(t, blobs, tc.boot...)
 			if tc.send != nil {
-				if status := rt.get("/mcp").StatusCode; status != http.StatusServiceUnavailable {
-					t.Fatalf("a runtime without source answered %d", status)
+				if status, contract := rt.get("/mcp").StatusCode, rt.contract(); status != http.StatusServiceUnavailable || contract != http.StatusNotFound {
+					t.Fatalf("a runtime without source answered %d, and %d for its contract", status, contract)
 				}
 				if status, body := rt.reload(apiCaller, overlayMediaType, overlay(t, sourceFiles("", "raise SystemExit(1)"))); status == http.StatusOK {
 					t.Fatalf("a source that exits before ready started: %s", body)

@@ -176,14 +176,21 @@ func Run(ctx context.Context, command []string) error {
 		return p, nil
 	}
 	var current *process
-	if directory == "" {
+	if directory != "" {
+		started, failure := awaitReady(ctx, start, directory, nil)
+		if failure != nil && !h.development {
+			return errors.Join(failure, ctx.Err())
+		}
+		if failure != nil {
+			fmt.Fprintln(os.Stderr, failure.Message, failure.Exit)
+			_ = os.RemoveAll(directory)
+		}
+		current = started
+	}
+	if current == nil {
 		if err := listen(); err != nil {
 			return err
 		}
-	} else if started, failure := awaitReady(ctx, start, directory, nil); failure != nil {
-		return errors.Join(failure, ctx.Err())
-	} else {
-		current = started
 	}
 	defer func() {
 		_ = public.Close()
