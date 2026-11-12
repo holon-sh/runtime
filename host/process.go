@@ -139,7 +139,7 @@ func Run(ctx context.Context, command []string) error {
 		environment = append(environment, protocol.DependencyEnvName(name)+"="+brokerURL+"/peer/"+url.PathEscape(name))
 	}
 	environment = append(environment, "HOLON_HOST_URL="+brokerURL)
-	start := func(directory string) (*process, error) {
+	start := func(directory string, page bool) (*process, error) {
 		childCtx, cancelChild := context.WithCancel(ctx)
 		child := exec.CommandContext(childCtx, command[0], command[1:]...)
 		child.Dir = directory
@@ -168,7 +168,7 @@ func Run(ctx context.Context, command []string) error {
 			close(p.done)
 		}()
 		go func() {
-			if directory != h.image {
+			if page && directory != h.image {
 				build(childCtx, directory)
 			}
 			close(p.built)
@@ -177,7 +177,7 @@ func Run(ctx context.Context, command []string) error {
 	}
 	var current *process
 	if directory != "" {
-		started, failure := awaitReady(ctx, start, directory, nil)
+		started, failure := awaitReady(ctx, start, directory, true, nil)
 		if failure != nil && !h.development {
 			return errors.Join(failure, ctx.Err())
 		}
@@ -229,14 +229,14 @@ func Run(ctx context.Context, command []string) error {
 // restart replaces the child with one running from job's directory, or restores the previous directory's child if
 // the new one does not become ready. An error means neither is running.
 func (h *host) restart(
-	ctx context.Context, start func(string) (*process, error), current *process, job *reloadJob,
+	ctx context.Context, start func(string, bool) (*process, error), current *process, job *reloadJob,
 ) (*process, *reloadFailure, error) {
 	job.restartedAt = time.Now()
 	h.disconnect()
 	if current != nil {
 		current.stop()
 	}
-	next, failure := awaitReady(ctx, start, job.directory, job.gone)
+	next, failure := awaitReady(ctx, start, job.directory, job.page, job.gone)
 	if failure == nil {
 		job.readyAt = time.Now()
 		if current != nil {
@@ -249,7 +249,7 @@ func (h *host) restart(
 		return nil, failure, nil
 	}
 	// The previous source started before, so it gets as long as a first boot.
-	previous, restored := awaitReady(ctx, start, current.directory, nil)
+	previous, restored := awaitReady(ctx, start, current.directory, true, nil)
 	if restored != nil {
 		return nil, failure, fmt.Errorf("restore application after failed reload: %w", restored)
 	}
@@ -259,9 +259,9 @@ func (h *host) restart(
 // awaitReady starts a child and returns it once it has posted ready; if it will not, it is not left running. A nil
 // timeout waits as long as the child runs.
 func awaitReady(
-	ctx context.Context, start func(string) (*process, error), directory string, timeout <-chan struct{},
+	ctx context.Context, start func(string, bool) (*process, error), directory string, page bool, timeout <-chan struct{},
 ) (*process, *reloadFailure) {
-	p, err := start(directory)
+	p, err := start(directory, page)
 	if err != nil {
 		return nil, &reloadFailure{status: http.StatusInternalServerError, Message: err.Error()}
 	}

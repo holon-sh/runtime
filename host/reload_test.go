@@ -240,9 +240,9 @@ func writeTree(t *testing.T, root string, files map[string]string) {
 	}
 }
 
-func (rt *testRuntime) reload(caller, mediaType string, blob []byte) (int, []byte) {
+func (rt *testRuntime) reload(caller, mediaType string, blob []byte, query ...string) (int, []byte) {
 	rt.t.Helper()
-	request, err := http.NewRequest(http.MethodPost, rt.url+reloadPath, bytes.NewReader(blob))
+	request, err := http.NewRequest(http.MethodPost, rt.url+reloadPath+strings.Join(query, ""), bytes.NewReader(blob))
 	if err != nil {
 		rt.t.Fatal(err)
 	}
@@ -346,6 +346,20 @@ func TestReload(t *testing.T) {
 	source := overlay(t, sourceFiles("new", ""))
 	exits := overlay(t, sourceFiles("exits", "sys.exit(3)"))
 	silent := overlay(t, sourceFiles("silent", "time.sleep(60)"))
+	bin := t.TempDir()
+	writeTree(t, bin, map[string]string{"npm": "#!/bin/sh\ncat says\n[ ! -e fails ]\n"})
+	if err := os.Chmod(filepath.Join(bin, "npm"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	installing := func(message, says string, more ...string) []byte {
+		files := sourceFiles(message, "")
+		files["package.json"], files["says"] = "{}", says
+		for _, name := range more {
+			files[name] = ""
+		}
+		return overlay(t, files)
+	}
 	escapes := overlay(t, nil, &tar.Header{Name: "../../outside", Typeflag: tar.TypeReg, Mode: 0o644})
 	packaged := overlay(t, map[string]string{
 		"main.py": childSource("src layout", "import overlaid"), "server.py": "", "src/overlaid/__init__.py": "", "web/index.html": "src layout",
@@ -363,11 +377,25 @@ func TestReload(t *testing.T) {
 		patience  time.Duration
 		status    int
 		exit      string
+		output    string // what the install printed
 		child     string // the source serving afterwards, or "" when the runtime has exited
 	}{
 		{name: "new source", caller: apiCaller, blob: source, status: http.StatusOK, child: "new"},
 		{name: "src layout", caller: apiCaller, blob: packaged, status: http.StatusOK, child: "src layout"},
 		{name: "package at the root", caller: apiCaller, blob: rootPackage, status: http.StatusOK, child: "root package"},
+		{
+			name: "new source that installs", caller: apiCaller, blob: installing("installed", "added 1 package\n"),
+			status: http.StatusOK, output: "added 1 package\n", child: "installed",
+		},
+		{
+			name: "new source that does not install", caller: apiCaller, blob: installing("", "no such package\n", "fails"),
+			status: http.StatusInternalServerError, output: "no such package\n", child: "first",
+		},
+		{
+			name: "an install that prints more than a reply carries", caller: apiCaller,
+			blob:   installing("", strings.Repeat("a", 4999)+"\nthe end\n", "fails"),
+			status: http.StatusInternalServerError, output: "the end\n", child: "first",
+		},
 		{name: "caller not allowed to reload", caller: edgeCaller, blob: source, status: http.StatusNotFound, child: "first"},
 		{name: "no mesh caller", blob: source, status: http.StatusForbidden, child: "first"},
 		{name: "not an overlay", caller: apiCaller, mediaType: "application/json", blob: source, status: http.StatusUnsupportedMediaType, child: "first"},
@@ -390,12 +418,10 @@ func TestReload(t *testing.T) {
 				rt.abandon(tc.blob, tc.patience)
 			} else {
 				status, body := rt.reload(tc.caller, cmp.Or(tc.mediaType, overlayMediaType), tc.blob)
-				var reply struct {
-					reloadFailure
-					reloadReply
-				}
+				var reply struct{ Exit, Digest, Output string }
 				_ = json.Unmarshal(body, &reply)
-				if status != tc.status || reply.Exit != tc.exit || status == http.StatusOK && reply.Digest != blobDigest(tc.blob) {
+				if status != tc.status || reply.Exit != tc.exit || reply.Output != tc.output ||
+					status == http.StatusOK && reply.Digest != blobDigest(tc.blob) {
 					t.Fatalf("%d %s", status, body)
 				}
 			}
@@ -574,6 +600,64 @@ func TestReloadAnswersBeforeTheBuildAndRequestsAfterIt(t *testing.T) {
 	slices.Sort(got)
 	if got[0] != "/ built" || !strings.Contains(got[1], `"message": "unbuilt"`) {
 		t.Fatalf("after the build: %q", got)
+	}
+}
+
+func TestReloadWithoutABuildServesTheSourceAsSent(t *testing.T) {
+	rt := startRuntime(t, nil)
+	if status, body := rt.reload(apiCaller, overlayMediaType, blockingBuild(t, "as sent"), "?build=false"); status != http.StatusOK {
+		t.Fatalf("reload answered %d %s", status, body)
+	}
+	served := make(chan string)
+	go func() {
+		page, _ := io.ReadAll(rt.get("/").Body)
+		served <- string(page)
+	}()
+	select {
+	case page := <-served:
+		if page != "as sent" {
+			t.Fatalf("page %q", page)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the page waited for a build")
+	}
+}
+
+func TestOnlyAFailedBuildReachesTheLog(t *testing.T) {
+	bin := t.TempDir()
+	writeTree(t, bin, map[string]string{"npm": "#!/bin/sh\n[ \"$1\" = run ] || exit 0\necho building the page\n[ ! -e fails ]\n"})
+	if err := os.Chmod(filepath.Join(bin, "npm"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	for _, tc := range []struct {
+		name   string
+		files  map[string]string
+		logged bool
+	}{
+		{"a build that succeeds", nil, false},
+		{"a build that fails", map[string]string{"fails": ""}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			log, err := os.Create(filepath.Join(t.TempDir(), "log"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			stderr := os.Stderr
+			os.Stderr = log
+			t.Cleanup(func() { os.Stderr = stderr })
+			rt := startRuntime(t, nil)
+			source := sourceFiles("sent", "")
+			source["package.json"] = `{"scripts":{"build":"build"}}`
+			maps.Copy(source, tc.files)
+			if status, body := rt.reload(apiCaller, overlayMediaType, overlay(t, source)); status != http.StatusOK {
+				t.Fatalf("reload answered %d %s", status, body)
+			}
+			rt.get("/")
+			if logged, _ := os.ReadFile(log.Name()); strings.Contains(string(logged), "building the page") != tc.logged {
+				t.Fatalf("log %q", logged)
+			}
+		})
 	}
 }
 

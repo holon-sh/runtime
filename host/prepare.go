@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
 	"os"
@@ -31,16 +32,17 @@ var ecosystems = []ecosystem{
 	{manifest: "pyproject.toml", inputs: []string{"pyproject.toml", "uv.lock", ".python-version"}, dependencies: ".venv"},
 }
 
-func prepare(ctx context.Context, directory, previous string) *reloadFailure {
+func prepare(ctx context.Context, directory, previous string) (string, *reloadFailure) {
+	var output tail
 	err := launcher(directory)
 	if err == nil {
-		err = install(ctx, directory, previous)
+		err = install(ctx, directory, previous, &output)
 	}
 	if err != nil {
 		_ = os.RemoveAll(directory)
-		return &reloadFailure{status: http.StatusInternalServerError, Message: err.Error()}
+		return "", &reloadFailure{status: http.StatusInternalServerError, Message: err.Error(), Output: string(output)}
 	}
-	return nil
+	return string(output), nil
 }
 
 func launcher(directory string) error {
@@ -66,14 +68,14 @@ func launcher(directory string) error {
 	)
 }
 
-func install(ctx context.Context, directory, previous string) error {
+func install(ctx context.Context, directory, previous string, output io.Writer) error {
 	for _, e := range ecosystems {
 		if err := seed(filepath.Join(previous, e.dependencies), filepath.Join(directory, e.dependencies)); err != nil {
 			return err
 		}
 	}
 	for _, step := range installs(directory, previous) {
-		if err := run(ctx, directory, step); err != nil {
+		if err := run(ctx, directory, step, output); err != nil {
 			return err
 		}
 	}
@@ -102,14 +104,15 @@ func build(ctx context.Context, directory string) {
 	if err != nil || json.Unmarshal(data, &manifest) != nil || manifest.Scripts["build"] == "" {
 		return
 	}
-	if err := run(ctx, directory, []string{runner(directory), "run", "build"}); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+	var output tail
+	if err := run(ctx, directory, []string{runner(directory), "run", "build"}, &output); err != nil {
+		fmt.Fprintln(os.Stderr, string(output)+err.Error())
 	}
 }
 
-func run(ctx context.Context, directory string, step []string) error {
+func run(ctx context.Context, directory string, step []string, output io.Writer) error {
 	command := exec.CommandContext(ctx, step[0], step[1:]...)
-	command.Dir, command.Stdout, command.Stderr = directory, os.Stderr, os.Stderr
+	command.Dir, command.Stdout, command.Stderr = directory, output, output
 	if err := command.Run(); err != nil {
 		return fmt.Errorf("%s: %w", strings.Join(step, " "), err)
 	}
