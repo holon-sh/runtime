@@ -2,6 +2,7 @@ package host
 
 import (
 	"archive/tar"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -83,7 +84,7 @@ func (h *host) reload(w http.ResponseWriter, r *http.Request) {
 	defer h.reloading.Store(false)
 	job := &reloadJob{deadline: deadline, reply: make(chan *reloadFailure, 1)}
 	h.mu.Lock()
-	previous := h.serving
+	previous := cmp.Or(h.serving, h.image)
 	h.mu.Unlock()
 	ctx, cancel := context.WithDeadline(r.Context(), deadline)
 	defer cancel()
@@ -114,7 +115,7 @@ func (h *host) bootOverlay(ctx context.Context, recorded []byte) (string, error)
 		return "", errors.New("invalid " + overlayFileEnv)
 	}
 	directory, err := h.fetchOverlay(ctx, request)
-	if err == nil {
+	if err == nil && directory != "" {
 		if failure := prepare(ctx, directory, h.image); failure != nil {
 			err = failure
 		}
@@ -148,6 +149,9 @@ func (h *host) fetchOverlay(ctx context.Context, request reloadRequest) (string,
 		return "", errors.New("registry unavailable")
 	}
 	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode == http.StatusNotFound {
+		return "", nil
+	}
 	if response.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("registry answered %d", response.StatusCode)
 	}

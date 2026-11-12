@@ -414,17 +414,32 @@ func TestBootOverlayFile(t *testing.T) {
 	recorded := reloadRequest{Repository: "holon/app", Token: "pull", Digest: blobDigest(kept), MediaType: overlayMediaType}
 	tampered := recorded
 	tampered.Digest = "sha256:" + strings.Repeat("a", 64)
+	unsent := recorded
+	unsent.Digest = "sha256:" + strings.Repeat("b", 64)
 	for _, tc := range []struct {
 		name  string
 		boot  []reloadRequest
+		send  map[string]string
 		child string
 	}{
-		{"absent file", nil, "image"},
-		{"recorded overlay", []reloadRequest{recorded}, "kept"},
-		{"digest mismatch", []reloadRequest{tampered}, ""},
+		{"absent file", nil, nil, "image"},
+		{"recorded overlay", []reloadRequest{recorded}, nil, "kept"},
+		{"overlay the registry does not hold", []reloadRequest{unsent}, sourceFiles("sent", ""), "sent"},
+		{"digest mismatch", []reloadRequest{tampered}, nil, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rt := startRuntime(t, map[string][]byte{recorded.Digest: kept, tampered.Digest: kept}, tc.boot...)
+			if tc.send != nil {
+				if status := rt.get("/mcp").StatusCode; status != http.StatusServiceUnavailable {
+					t.Fatalf("a runtime without source answered %d", status)
+				}
+				if status, body := rt.reload(apiCaller, overlayMediaType, overlay(t, sourceFiles("", "raise SystemExit(1)"))); status == http.StatusOK {
+					t.Fatalf("a source that exits before ready started: %s", body)
+				}
+				if status, body := rt.reload(apiCaller, overlayMediaType, overlay(t, tc.send)); status != http.StatusOK {
+					t.Fatalf("first source answered %d %s", status, body)
+				}
+			}
 			if tc.child == "" {
 				select {
 				case err := <-rt.exited:

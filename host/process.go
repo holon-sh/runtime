@@ -95,6 +95,15 @@ func Run(ctx context.Context, command []string) error {
 		BaseContext: func(net.Listener) context.Context { return ctx },
 	}
 	var opening sync.Once
+	listen := func() (err error) {
+		opening.Do(func() {
+			var listener net.Listener
+			if listener, err = new(net.ListenConfig).Listen(ctx, "tcp", ":"+strconv.Itoa(port)); err == nil {
+				go func() { servers <- public.Serve(listener) }()
+			}
+		})
+		return err
+	}
 	prefix := "/" + rand.Text()
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+prefix+"/ready", func(w http.ResponseWriter, r *http.Request) {
@@ -119,13 +128,7 @@ func Run(ctx context.Context, command []string) error {
 			return
 		}
 		h.connect(app.Port, starting.afterBuild(handler), starting.directory)
-		opening.Do(func() {
-			var listener net.Listener
-			if listener, err = new(net.ListenConfig).Listen(ctx, "tcp", ":"+strconv.Itoa(port)); err == nil {
-				go func() { servers <- public.Serve(listener) }()
-			}
-		})
-		if err != nil {
+		if err = listen(); err != nil {
 			http.Error(w, "Application listener unavailable", http.StatusServiceUnavailable)
 			starting.ready <- err
 			return
@@ -184,18 +187,30 @@ func Run(ctx context.Context, command []string) error {
 		}()
 		return p, nil
 	}
-	current, failure := awaitReady(ctx, start, directory, nil)
-	if failure != nil {
+	var current *process
+	if directory == "" {
+		if err := listen(); err != nil {
+			return err
+		}
+	} else if started, failure := awaitReady(ctx, start, directory, nil); failure != nil {
 		return errors.Join(failure, ctx.Err())
+	} else {
+		current = started
 	}
 	defer func() {
 		_ = public.Close()
 		cancel()
-		<-current.done
+		if current != nil {
+			<-current.done
+		}
 	}()
 	for {
+		var exited <-chan struct{}
+		if current != nil {
+			exited = current.done
+		}
 		select {
-		case <-current.done:
+		case <-exited:
 			return errors.Join(errors.New("application exited"), current.err, ctx.Err())
 		case err := <-servers:
 			return err
@@ -223,16 +238,21 @@ func (h *host) restart(
 ) (*process, *reloadFailure, error) {
 	job.restartedAt = time.Now()
 	h.disconnect()
-	current.stop()
+	if current != nil {
+		current.stop()
+	}
 	next, failure := awaitReady(ctx, start, job.directory, time.After(time.Until(job.deadline)))
 	if failure == nil {
 		job.readyAt = time.Now()
-		if current.directory != h.image {
+		if current != nil && current.directory != h.image {
 			_ = os.RemoveAll(current.directory)
 		}
 		return next, nil, nil
 	}
 	_ = os.RemoveAll(job.directory)
+	if current == nil {
+		return nil, failure, nil
+	}
 	// The previous source started before, so it gets as long as a first boot.
 	previous, restored := awaitReady(ctx, start, current.directory, nil)
 	if restored != nil {
