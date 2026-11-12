@@ -28,5 +28,36 @@ jobs:
           prerelease=""
           case "$TAG" in *-*) prerelease="--prerelease" ;; esac
           gh release create "$TAG" --repo "$REPO" --title "runtime ${TAG#v}" --target "$GITHUB_SHA" $prerelease \
-            --notes "Application runtime for Holon app images. Import the host with \`go get github.com/holon-sh/runtime@$TAG\` or download the \`holon-mcp-runtime\` payloads below." \
+            --notes "The development supervisor Holon runs a development app under, in \`ghcr.io/holon-sh/development:$TAG\`." \
             dist/holon-mcp-runtime-linux-amd64 dist/holon-mcp-runtime-linux-arm64 dist/SHA256SUMS
+  development-image:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          name: runtime-payloads
+          path: dist
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Publish the development image
+        id: image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: development/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/holon-sh/development:${{ github.ref_name }}
+      - name: Report the digest the holon chart pins
+        run: echo "ghcr.io/holon-sh/development@${{ steps.image.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"

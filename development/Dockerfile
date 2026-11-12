@@ -4,11 +4,10 @@ RUN UV_PYTHON_INSTALL_DIR=/opt/uv/python UV_PYTHON_BIN_DIR=/usr/local/bin uv pyt
  && npm install -g pnpm@10.34.9 && npm cache clean --force && chmod -R a+rX /opt/uv
 ARG TARGETARCH
 COPY dist/holon-mcp-runtime-linux-${TARGETARCH} /holon-mcp-runtime
-COPY development/holon-app /usr/local/bin/holon-app
 ENV HOME=/app XDG_CACHE_HOME=/app/.cache npm_config_cache=/app/.cache/npm UV_CACHE_DIR=/app/.cache/uv \
     UV_PYTHON_INSTALL_DIR=/app/.cache/uv-python HOLON_RELOAD_DIR=/app/source \
     npm_config_audit=false npm_config_fund=false npm_config_update_notifier=false
 WORKDIR /app
 USER 10001:10001
 STOPSIGNAL SIGTERM
-ENTRYPOINT ["/holon-mcp-runtime", "--transport=hosted-http", "--", "holon-app"]
+ENTRYPOINT ["/holon-mcp-runtime"]
