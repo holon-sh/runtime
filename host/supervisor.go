@@ -17,7 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -33,9 +33,7 @@ type supervisor struct {
 	root      string
 	transport *http.Transport
 	turn      chan struct{}
-	mu        sync.Mutex
-	child     *child
-	app       http.Handler
+	app       atomic.Pointer[child]
 	written   []string
 }
 
@@ -87,15 +85,13 @@ func (s *supervisor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.reload(w, r)
 		return
 	}
-	s.mu.Lock()
-	app := s.app
-	s.mu.Unlock()
+	app := s.app.Load()
 	if app == nil {
 		w.Header().Set("Retry-After", "1")
 		http.Error(w, "Application restarting", http.StatusServiceUnavailable)
 		return
 	}
-	app.ServeHTTP(w, r)
+	app.proxy.ServeHTTP(w, r)
 }
 
 // boot starts the app from the overlay the platform recorded. Without one, or while the registry does not hold it
@@ -124,10 +120,6 @@ func (s *supervisor) boot(ctx context.Context) error {
 // reload replaces the app with one running from the posted overlay, and answers once it accepts connections. An app
 // that does not start stays down until the next reload.
 func (s *supervisor) reload(w http.ResponseWriter, r *http.Request) {
-	if r.Header.Get("Content-Type") != runtimecontract.OverlayMediaType {
-		writeFailure(w, &failure{status: http.StatusUnsupportedMediaType, Message: "invalid reload request"})
-		return
-	}
 	select {
 	case s.turn <- struct{}{}:
 	case <-r.Context().Done():
@@ -152,56 +144,22 @@ func (s *supervisor) launch(ctx context.Context) *failure {
 	if err != nil {
 		return &failure{status: http.StatusInternalServerError, Message: err.Error()}
 	}
-	s.mu.Lock()
-	s.child = c
-	s.mu.Unlock()
-	go s.watch(c)
 	if failure := c.ready(ctx); failure != nil {
-		s.stop()
+		c.stop()
 		return failure
 	}
-	target := &url.URL{Scheme: "http", Host: c.address}
-	proxy := &httputil.ReverseProxy{
-		Rewrite: func(p *httputil.ProxyRequest) {
-			p.SetURL(target)
-			p.Out.Host = p.In.Host
-			for _, name := range []string{"X-Forwarded-Host", "X-Forwarded-Proto"} {
-				p.Out.Header[name] = p.In.Header[name]
-			}
-		},
-		Transport: s.transport, FlushInterval: -1, ErrorLog: log.New(io.Discard, "", 0),
-		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, _ error) {
-			http.Error(w, "Application unavailable", http.StatusBadGateway)
-		},
-	}
-	s.mu.Lock()
-	if s.child == c {
-		s.app = proxy
-	}
-	s.mu.Unlock()
+	s.app.Store(c)
+	go func() {
+		<-c.done
+		if s.app.CompareAndSwap(c, nil) {
+			fmt.Fprintln(os.Stderr, "application exited:", c.command.ProcessState)
+		}
+	}()
 	return nil
 }
 
-// watch takes an app that exits on its own out of service until the next reload starts one.
-func (s *supervisor) watch(c *child) {
-	<-c.done
-	s.mu.Lock()
-	current := s.child == c
-	if current {
-		s.child, s.app = nil, nil
-	}
-	s.mu.Unlock()
-	if current {
-		fmt.Fprintln(os.Stderr, "application exited:", c.command.ProcessState)
-	}
-}
-
 func (s *supervisor) stop() {
-	s.mu.Lock()
-	c := s.child
-	s.child, s.app = nil, nil
-	s.mu.Unlock()
-	if c != nil {
+	if c := s.app.Swap(nil); c != nil {
 		c.stop()
 	}
 	// Connections to a previous child are dead, and a request that reuses one cannot always be retried.
@@ -211,6 +169,7 @@ func (s *supervisor) stop() {
 type child struct {
 	command *exec.Cmd
 	address string
+	proxy   http.Handler
 	done    chan struct{}
 }
 
@@ -228,7 +187,20 @@ func (s *supervisor) start() (*child, error) {
 	if err := command.Start(); err != nil {
 		return nil, fmt.Errorf("start application: %w", err)
 	}
-	c := &child{command: command, address: address, done: make(chan struct{})}
+	target := &url.URL{Scheme: "http", Host: address}
+	c := &child{command: command, address: address, done: make(chan struct{}), proxy: &httputil.ReverseProxy{
+		Rewrite: func(p *httputil.ProxyRequest) {
+			p.SetURL(target)
+			p.Out.Host = p.In.Host
+			for _, name := range []string{"X-Forwarded-Host", "X-Forwarded-Proto"} {
+				p.Out.Header[name] = p.In.Header[name]
+			}
+		},
+		Transport: s.transport, FlushInterval: -1, ErrorLog: log.New(io.Discard, "", 0),
+		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, _ error) {
+			http.Error(w, "Application unavailable", http.StatusBadGateway)
+		},
+	}}
 	go func() {
 		_ = command.Wait()
 		close(c.done)
@@ -281,7 +253,6 @@ func loopbackAddress() (string, error) {
 
 func writeFailure(w http.ResponseWriter, f *failure) {
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(f.status)
 	_ = json.NewEncoder(w).Encode(f)
 }

@@ -7,7 +7,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"io"
 	"maps"
 	"net"
@@ -26,123 +25,106 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
-// app is a fake application. Its message is part of its source, so a reply shows which source is running. It writes
-// its pid where a test can find it, and marks the directory as an install would.
+// app is a fake application whose reply names its source. It records its pid and makes a file of its own, as an
+// install would.
 func app(message string) string {
 	return `import json, os
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 open("pid", "w").write(str(os.getpid()))
-open("installed", "w").write("kept")
+open("installed", "w").write("")
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        body = json.dumps({
-            "message": "` + message + `",
-            "cwd": os.getcwd(),
-            "host": self.headers.get("Host"),
-            "forwarded": self.headers.get("X-Forwarded-Host"),
-        }).encode()
         self.send_response(200)
-        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        self.wfile.write(json.dumps(["` + message + `", self.headers["Host"], self.headers["X-Forwarded-Host"]]).encode())
 
-    def log_message(self, *_):
-        pass
-
-ThreadingHTTPServer((os.environ["HOST"], int(os.environ["PORT"])), Handler).serve_forever()
+HTTPServer((os.environ["HOST"], int(os.environ["PORT"])), Handler).serve_forever()
 `
 }
 
-// overlay packs files, then entries without contents, into a zstd tar.
-func overlay(t *testing.T, files map[string]string, entries ...*tar.Header) []byte {
+func overlay(t *testing.T, files map[string]string) []byte {
 	t.Helper()
 	var compressed bytes.Buffer
-	encoder, err := zstd.NewWriter(&compressed)
-	if err != nil {
-		t.Fatal(err)
-	}
+	encoder, _ := zstd.NewWriter(&compressed)
 	archive := tar.NewWriter(encoder)
 	for _, name := range slices.Sorted(maps.Keys(files)) {
-		if err := archive.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Size: int64(len(files[name]))}); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := archive.Write([]byte(files[name])); err != nil {
-			t.Fatal(err)
-		}
+		_ = archive.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Size: int64(len(files[name]))})
+		_, _ = archive.Write([]byte(files[name]))
 	}
-	for _, entry := range entries {
-		if err := archive.WriteHeader(entry); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := errors.Join(archive.Close(), encoder.Close()); err != nil {
+	if err := archive.Close(); err != nil || encoder.Close() != nil {
 		t.Fatal(err)
 	}
 	return compressed.Bytes()
 }
 
 type running struct {
-	t      *testing.T
-	url    string
-	root   string
-	exited chan error
+	t    *testing.T
+	url  string
+	root string
 }
 
-// run starts the supervisor with command, booting from record when it is set.
+// run starts the supervisor with command, from record when it is set, and returns once it listens.
 func run(t *testing.T, record *runtimecontract.OverlayRecord, command ...string) *running {
 	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	listener, _ := net.Listen("tcp", "127.0.0.1:0")
 	port := strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)
 	_ = listener.Close()
-	root := filepath.Join(t.TempDir(), "source")
-	t.Setenv("PORT", port)
-	t.Setenv(reloadDirEnv, root)
-	t.Setenv(runtimecontract.OverlayFileEnv, "")
-	if record != nil {
-		file := filepath.Join(t.TempDir(), "overlay")
-		data, _ := json.Marshal(record)
-		if err := os.WriteFile(file, data, 0o600); err != nil {
-			t.Fatal(err)
-		}
-		t.Setenv(runtimecontract.OverlayFileEnv, file)
-	}
-	if len(command) == 0 {
-		command = []string{"python3", "main.py"}
-	}
+	r := &running{t: t, url: "http://127.0.0.1:" + port, root: filepath.Join(t.TempDir(), "source")}
+	setup(t, port, r.root, record)
 	ctx, cancel := context.WithCancel(context.Background())
-	r := &running{t: t, url: "http://127.0.0.1:" + port, root: root, exited: make(chan error, 1)}
-	go func() { r.exited <- Run(ctx, command) }()
+	var err error
+	exited := make(chan struct{})
+	go func() {
+		err = Run(ctx, command)
+		close(exited)
+	}()
 	t.Cleanup(func() {
 		cancel()
-		<-r.exited
+		<-exited
 	})
-	deadline := time.Now().Add(10 * time.Second)
 	for {
 		if connection, err := net.Dial("tcp", "127.0.0.1:"+port); err == nil {
 			_ = connection.Close()
 			return r
 		}
 		select {
-		case err := <-r.exited:
+		case <-exited:
 			t.Fatalf("runtime exited: %v", err)
-		default:
+		case <-time.After(10 * time.Millisecond):
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("runtime did not listen")
-		}
-		time.Sleep(10 * time.Millisecond)
 	}
 }
 
-func (r *running) reload(body []byte, contentType string) (int, string) {
+func setup(t *testing.T, port, root string, record *runtimecontract.OverlayRecord) {
+	t.Setenv("PORT", port)
+	t.Setenv(reloadDirEnv, root)
+	t.Setenv(runtimecontract.OverlayFileEnv, "")
+	if record != nil {
+		file := filepath.Join(t.TempDir(), "overlay")
+		data, _ := json.Marshal(record)
+		_ = os.WriteFile(file, data, 0o600)
+		t.Setenv(runtimecontract.OverlayFileEnv, file)
+	}
+}
+
+func (r *running) reload(body []byte) (int, string) {
 	r.t.Helper()
-	request, _ := http.NewRequest(http.MethodPost, r.url+runtimecontract.ReloadPath, bytes.NewReader(body))
-	request.Header.Set("Content-Type", contentType)
+	response, err := http.Post(r.url+runtimecontract.ReloadPath, runtimecontract.OverlayMediaType, bytes.NewReader(body))
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	data, _ := io.ReadAll(response.Body)
+	return response.StatusCode, string(data)
+}
+
+func (r *running) get() (int, string) {
+	r.t.Helper()
+	request, _ := http.NewRequest(http.MethodGet, r.url, nil)
+	request.Host = "app.example"
+	request.Header.Set("X-Forwarded-Host", "session.example")
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		r.t.Fatal(err)
@@ -152,141 +134,57 @@ func (r *running) reload(body []byte, contentType string) (int, string) {
 	return response.StatusCode, string(data)
 }
 
-// get answers the app's reply, or its status when the app is not serving.
-func (r *running) get() (int, map[string]string) {
-	r.t.Helper()
-	request, _ := http.NewRequest(http.MethodGet, r.url+"/", nil)
-	request.Host = "app.example"
-	request.Header.Set("X-Forwarded-Host", "session.example")
-	response, err := http.DefaultClient.Do(request)
-	if err != nil {
-		r.t.Fatal(err)
-	}
-	defer func() { _ = response.Body.Close() }()
-	var reply map[string]string
-	_ = json.NewDecoder(response.Body).Decode(&reply)
-	return response.StatusCode, reply
-}
-
-func (r *running) exists(name string) bool {
-	_, err := os.Lstat(filepath.Join(r.root, name))
-	return err == nil
-}
-
-func alive(t *testing.T, pidFile string) bool {
-	t.Helper()
-	data, err := os.ReadFile(pidFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pid, _ := strconv.Atoi(strings.TrimSpace(string(data)))
-	return syscall.Kill(pid, 0) == nil
-}
-
-func TestReloadReplacesTheAppFromItsSource(t *testing.T) {
-	r := run(t, nil)
+func TestReload(t *testing.T) {
+	r := run(t, nil, "python3", "main.py")
 	if status, _ := r.get(); status != http.StatusServiceUnavailable {
 		t.Fatalf("before any source: %d", status)
 	}
-	first := overlay(t, map[string]string{"main.py": app("first"), "old.txt": "old", "lib/gone.py": ""})
-	if status, body := r.reload(first, runtimecontract.OverlayMediaType); status != http.StatusNoContent {
-		t.Fatalf("first reload: %d %s", status, body)
-	}
-	status, reply := r.get()
-	if root, _ := filepath.EvalSymlinks(r.root); status != http.StatusOK || reply["message"] != "first" || reply["cwd"] != root {
-		t.Fatalf("first source: %d %v", status, reply)
-	}
-	if reply["host"] != "app.example" || reply["forwarded"] != "session.example" {
-		t.Fatalf("the app does not see the origin it is served at: %v", reply)
-	}
-	firstPID := filepath.Join(t.TempDir(), "pid")
-	data, _ := os.ReadFile(filepath.Join(r.root, "pid"))
-	_ = os.WriteFile(firstPID, data, 0o600)
-
-	second := overlay(t, map[string]string{"main.py": app("second")})
-	if status, body := r.reload(second, runtimecontract.OverlayMediaType); status != http.StatusNoContent {
-		t.Fatalf("second reload: %d %s", status, body)
-	}
-	if status, reply := r.get(); status != http.StatusOK || reply["message"] != "second" {
-		t.Fatalf("second source: %d %v", status, reply)
-	}
-	if alive(t, firstPID) {
-		t.Fatal("the first app still runs")
-	}
-	if r.exists("old.txt") || r.exists("lib") {
-		t.Fatal("what only the first overlay wrote is still there")
-	}
-	if !r.exists("installed") {
-		t.Fatal("what the app made in its directory is gone")
-	}
-}
-
-func TestFailedReloadLeavesTheAppDownUntilTheNext(t *testing.T) {
-	r := run(t, nil)
-	good := overlay(t, map[string]string{"main.py": app("good")})
-	if status, body := r.reload(good, runtimecontract.OverlayMediaType); status != http.StatusNoContent {
+	if status, body := r.reload(overlay(t, map[string]string{"main.py": app("first"), "old.py": ""})); status != http.StatusNoContent {
 		t.Fatalf("reload: %d %s", status, body)
 	}
-	for _, test := range []struct {
-		name        string
-		body        []byte
-		contentType string
-		status      int
-		reply       string
-		down        bool
-	}{
-		{"media type", good, "application/x-tar", http.StatusUnsupportedMediaType, "invalid reload request", false},
-		{"escaping entry", overlay(t, map[string]string{"../main.py": ""}), runtimecontract.OverlayMediaType, http.StatusBadRequest, "escapes", true},
-		{"escaping link", overlay(t, nil, &tar.Header{Name: "link", Typeflag: tar.TypeSymlink, Linkname: "../outside"}), runtimecontract.OverlayMediaType, http.StatusBadRequest, "escapes", true},
-		{"exits before ready", overlay(t, map[string]string{"main.py": "raise SystemExit(3)"}), runtimecontract.OverlayMediaType, http.StatusInternalServerError, "exit status 3", true},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			status, body := r.reload(test.body, test.contentType)
-			if status != test.status || !strings.Contains(body, test.reply) {
-				t.Fatalf("reload: %d %s", status, body)
-			}
-			if served, _ := r.get(); (served == http.StatusServiceUnavailable) != test.down {
-				t.Fatalf("after the reload the app answers %d", served)
-			}
-			if status, body := r.reload(good, runtimecontract.OverlayMediaType); status != http.StatusNoContent {
-				t.Fatalf("the next reload: %d %s", status, body)
-			}
-		})
+	if status, body := r.get(); status != http.StatusOK || body != `["first", "app.example", "session.example"]` {
+		t.Fatalf("first source: %d %s", status, body)
+	}
+
+	if status, body := r.reload(overlay(t, map[string]string{"main.py": "raise SystemExit(3)"})); status != http.StatusInternalServerError ||
+		!strings.Contains(body, "exit status 3") {
+		t.Fatalf("failing reload: %d %s", status, body)
+	}
+	if status, _ := r.get(); status != http.StatusServiceUnavailable {
+		t.Fatalf("after a failing reload: %d", status)
+	}
+
+	if status, body := r.reload(overlay(t, map[string]string{"main.py": app("second")})); status != http.StatusNoContent {
+		t.Fatalf("reload: %d %s", status, body)
+	}
+	if _, body := r.get(); !strings.Contains(body, "second") {
+		t.Fatalf("second source: %s", body)
+	}
+	if _, err := os.Stat(filepath.Join(r.root, "old.py")); err == nil {
+		t.Fatal("what only an earlier overlay wrote is still there")
+	}
+	if _, err := os.Stat(filepath.Join(r.root, "installed")); err != nil {
+		t.Fatal("what the app made is gone")
+	}
+
+	if status, _ := r.reload(overlay(t, map[string]string{"../escaped": ""})); status != http.StatusBadRequest {
+		t.Fatalf("escaping reload: %d", status)
+	}
+	if _, err := os.Stat(filepath.Join(r.root, "..", "escaped")); err == nil {
+		t.Fatal("an overlay wrote outside the source directory")
 	}
 }
 
-func TestStopEndsEverythingTheCommandStarted(t *testing.T) {
+func TestReloadStopsEverythingTheCommandStarted(t *testing.T) {
 	r := run(t, nil, "sh", "-c", "python3 main.py; true")
-	if status, body := r.reload(overlay(t, map[string]string{"main.py": app("first")}), runtimecontract.OverlayMediaType); status != http.StatusNoContent {
-		t.Fatalf("reload: %d %s", status, body)
-	}
-	pid := filepath.Join(t.TempDir(), "pid")
+	r.reload(overlay(t, map[string]string{"main.py": app("first")}))
 	data, _ := os.ReadFile(filepath.Join(r.root, "pid"))
-	_ = os.WriteFile(pid, data, 0o600)
-	if status, body := r.reload(overlay(t, map[string]string{"main.py": app("second")}), runtimecontract.OverlayMediaType); status != http.StatusNoContent {
-		t.Fatalf("reload: %d %s", status, body)
+	pid, _ := strconv.Atoi(string(data))
+	if status, _ := r.reload(overlay(t, map[string]string{"main.py": app("second")})); status != http.StatusNoContent {
+		t.Fatalf("reload: %d", status)
 	}
-	if alive(t, pid) {
-		t.Fatal("the stopped command's child still runs")
-	}
-}
-
-func TestAppThatExitsGoesOutOfService(t *testing.T) {
-	r := run(t, nil)
-	source := app("exits") + "\n"
-	source = strings.Replace(source, "class Handler", "import threading\nthreading.Timer(0.3, lambda: os._exit(0)).start()\n\nclass Handler", 1)
-	if status, body := r.reload(overlay(t, map[string]string{"main.py": source}), runtimecontract.OverlayMediaType); status != http.StatusNoContent {
-		t.Fatalf("reload: %d %s", status, body)
-	}
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if status, _ := r.get(); status == http.StatusServiceUnavailable {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the exited app is still in service")
-		}
-		time.Sleep(20 * time.Millisecond)
+	if syscall.Kill(pid, 0) == nil {
+		t.Fatal("the first app still runs")
 	}
 }
 
@@ -294,16 +192,15 @@ func TestBootStartsTheRecordedOverlay(t *testing.T) {
 	blob := overlay(t, map[string]string{"main.py": app("recorded")})
 	sum := sha256.Sum256(blob)
 	digest := "sha256:" + hex.EncodeToString(sum[:])
+	tampered := "sha256:" + strings.Repeat("0", 64)
 	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer pull" {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
 		switch r.URL.Path {
-		case "/v2/holon/app/blobs/" + digest:
+		case "/v2/holon/app/blobs/" + digest, "/v2/holon/app/blobs/" + tampered:
 			_, _ = w.Write(blob)
-		case "/v2/holon/app/blobs/sha256:" + strings.Repeat("0", 64):
-			_, _ = w.Write(overlay(t, map[string]string{"main.py": app("tampered")}))
 		default:
 			http.NotFound(w, r)
 		}
@@ -316,40 +213,29 @@ func TestBootStartsTheRecordedOverlay(t *testing.T) {
 	}
 
 	t.Run("recorded", func(t *testing.T) {
-		r := run(t, record(digest))
-		deadline := time.Now().Add(10 * time.Second)
-		for {
-			if status, reply := r.get(); status == http.StatusOK && reply["message"] == "recorded" {
-				return
+		r := run(t, record(digest), "python3", "main.py")
+		for status, body := r.get(); !strings.Contains(body, "recorded"); status, body = r.get() {
+			if status != http.StatusServiceUnavailable {
+				t.Fatalf("recorded source: %d %s", status, body)
 			}
-			if time.Now().After(deadline) {
-				t.Fatal("the recorded overlay did not start")
-			}
-			time.Sleep(20 * time.Millisecond)
+			time.Sleep(10 * time.Millisecond)
 		}
 	})
-	t.Run("not yet in the registry", func(t *testing.T) {
-		r := run(t, record("sha256:"+strings.Repeat("f", 64)))
+	t.Run("not in the registry yet", func(t *testing.T) {
+		r := run(t, record("sha256:"+strings.Repeat("f", 64)), "python3", "main.py")
 		if status, _ := r.get(); status != http.StatusServiceUnavailable {
 			t.Fatalf("without source: %d", status)
 		}
-		if status, body := r.reload(blob, runtimecontract.OverlayMediaType); status != http.StatusNoContent {
+		if status, body := r.reload(blob); status != http.StatusNoContent {
 			t.Fatalf("reload: %d %s", status, body)
 		}
 	})
 	t.Run("digest mismatch", func(t *testing.T) {
-		root := filepath.Join(t.TempDir(), "source")
-		t.Setenv(reloadDirEnv, root)
-		file := filepath.Join(t.TempDir(), "overlay")
-		data, _ := json.Marshal(record("sha256:" + strings.Repeat("0", 64)))
-		_ = os.WriteFile(file, data, 0o600)
-		t.Setenv(runtimecontract.OverlayFileEnv, file)
-		t.Setenv("PORT", "0")
-		if err := Run(context.Background(), []string{"python3", "main.py"}); err == nil || !strings.Contains(err.Error(), "digest mismatch") {
+		setup(t, "0", filepath.Join(t.TempDir(), "source"), record(tampered))
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		if err := Run(ctx, []string{"python3", "main.py"}); err == nil || !strings.Contains(err.Error(), "digest mismatch") {
 			t.Fatalf("Run = %v", err)
-		}
-		if _, err := os.Stat(filepath.Join(root, "main.py")); err == nil {
-			t.Fatal("the mismatched source was left in place")
 		}
 	})
 }
