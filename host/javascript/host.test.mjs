@@ -294,6 +294,25 @@ test(
 );
 
 test(
+  "the platform reads the running server's contract without a caller identity",
+  { timeout: 10000 },
+  async (t) => {
+    const hosted = await app(t, {}, {
+      HOLON_MCP_RUNTIME_CONFIG: JSON.stringify({ version: 2, peers: {}, callers: ["spiffe://holon-api"] }),
+    });
+    const contract = new URL("/.holon/contract", hosted.url);
+    const read = await fetch(contract, { headers: { "x-holon-caller": "spiffe://holon-api" } });
+    assert.equal(read.status, 200);
+    const { capabilities, lists } = await read.json();
+    assert.ok(capabilities.tools);
+    const tools = lists["tools/list"].pages.flatMap((page) => page.tools.map((tool) => tool.name));
+    assert.ok(tools.includes("inspect"), tools.join(", "));
+    const other = await fetch(contract, { headers: { "x-holon-caller": "spiffe://edge" } });
+    assert.notEqual(other.status, 200);
+  },
+);
+
+test(
   "standalone SDK applications ignore untrusted identity and serve static files",
   { timeout: 10000 },
   async (t) => {
