@@ -3,6 +3,7 @@
 package host
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"encoding/json"
@@ -17,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -35,11 +37,6 @@ type supervisor struct {
 	turn      chan struct{}
 	app       atomic.Pointer[child]
 	written   []string
-}
-
-type failure struct {
-	status  int
-	message string
 }
 
 // Run serves PORT and proxies it to command, which it starts in the source directory with a loopback HOST and PORT
@@ -110,14 +107,14 @@ func (s *supervisor) boot(ctx context.Context) error {
 	if err != nil || !found {
 		return err
 	}
-	if failure := s.launch(ctx); failure != nil {
-		fmt.Fprintln(os.Stderr, "application did not start:", failure.message)
+	if status, reply := s.launch(ctx); status != http.StatusOK {
+		fmt.Fprintln(os.Stderr, "application did not start:", reply.Error)
 	}
 	return nil
 }
 
-// reload replaces the app with one running from the posted overlay, and answers once it accepts connections. An app
-// that does not start stays down until the next reload.
+// reload replaces the app with one running from the posted overlay, and answers once it accepts connections, with the
+// end of what it printed until then. An app that does not start stays down until the next reload.
 func (s *supervisor) reload(w http.ResponseWriter, r *http.Request) {
 	select {
 	case s.turn <- struct{}{}:
@@ -127,25 +124,24 @@ func (s *supervisor) reload(w http.ResponseWriter, r *http.Request) {
 	defer func() { <-s.turn }()
 	s.stop()
 	if _, err := s.unpack(r.Body); err != nil {
-		writeFailure(w, &failure{status: http.StatusBadRequest, message: err.Error()})
+		writeReply(w, http.StatusBadRequest, runtimecontract.ReloadReply{Error: err.Error()})
 		return
 	}
-	if failure := s.launch(r.Context()); failure != nil {
-		writeFailure(w, failure)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
+	status, reply := s.launch(r.Context())
+	writeReply(w, status, reply)
 }
 
-// launch starts the app and waits, for as long as ctx lasts, until it accepts connections.
-func (s *supervisor) launch(ctx context.Context) *failure {
+// launch starts the app and waits, for as long as ctx lasts, until it accepts connections. It answers with the status a
+// reload replies with and the end of what the app printed.
+func (s *supervisor) launch(ctx context.Context) (int, runtimecontract.ReloadReply) {
 	c, err := s.start()
 	if err != nil {
-		return &failure{status: http.StatusInternalServerError, message: err.Error()}
+		return http.StatusInternalServerError, runtimecontract.ReloadReply{Error: err.Error()}
 	}
-	if failure := c.ready(ctx); failure != nil {
+	status, problem := c.ready(ctx)
+	if status != http.StatusOK {
 		c.stop()
-		return failure
+		return status, runtimecontract.ReloadReply{Error: problem, Output: c.output.String()}
 	}
 	s.app.Store(c)
 	go func() {
@@ -154,7 +150,7 @@ func (s *supervisor) launch(ctx context.Context) *failure {
 			fmt.Fprintln(os.Stderr, "application exited:", c.command.ProcessState)
 		}
 	}()
-	return nil
+	return status, runtimecontract.ReloadReply{Output: c.output.String()}
 }
 
 func (s *supervisor) stop() {
@@ -169,6 +165,7 @@ type child struct {
 	command *exec.Cmd
 	address string
 	proxy   http.Handler
+	output  *tail
 	done    chan struct{}
 }
 
@@ -181,13 +178,14 @@ func (s *supervisor) start() (*child, error) {
 	command := exec.Command(s.command[0], s.command[1:]...)
 	command.Dir = s.root
 	command.Env = append(os.Environ(), "PWD="+s.root, "HOST=127.0.0.1", "PORT="+port)
-	command.Stdout, command.Stderr = os.Stdout, os.Stderr
+	output := &tail{}
+	command.Stdout, command.Stderr = io.MultiWriter(os.Stdout, output), io.MultiWriter(os.Stderr, output)
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := command.Start(); err != nil {
 		return nil, fmt.Errorf("start application: %w", err)
 	}
 	target := &url.URL{Scheme: "http", Host: address}
-	c := &child{command: command, address: address, done: make(chan struct{}), proxy: &httputil.ReverseProxy{
+	c := &child{command: command, address: address, output: output, done: make(chan struct{}), proxy: &httputil.ReverseProxy{
 		Rewrite: func(p *httputil.ProxyRequest) {
 			p.SetURL(target)
 			p.Out.Host = p.In.Host
@@ -208,20 +206,18 @@ func (s *supervisor) start() (*child, error) {
 }
 
 // ready waits until the app accepts connections, and fails once it exits or ctx ends first.
-func (c *child) ready(ctx context.Context) *failure {
+func (c *child) ready(ctx context.Context) (int, string) {
 	for {
 		connection, err := new(net.Dialer).DialContext(ctx, "tcp", c.address)
 		if err == nil {
 			_ = connection.Close()
-			return nil
+			return http.StatusOK, ""
 		}
 		select {
 		case <-c.done:
-			return &failure{
-				status: http.StatusInternalServerError, message: "application exited before ready: " + c.command.ProcessState.String(),
-			}
+			return http.StatusInternalServerError, "application exited before ready: " + c.command.ProcessState.String()
 		case <-ctx.Done():
-			return &failure{status: http.StatusGatewayTimeout, message: "application did not become ready"}
+			return http.StatusGatewayTimeout, "application did not become ready"
 		case <-time.After(25 * time.Millisecond):
 		}
 	}
@@ -249,8 +245,36 @@ func loopbackAddress() (string, error) {
 	return listener.Addr().String(), nil
 }
 
-func writeFailure(w http.ResponseWriter, f *failure) {
+func writeReply(w http.ResponseWriter, status int, reply runtimecontract.ReloadReply) {
 	w.Header().Set(protocol.HeaderContentType, protocol.MIMEApplicationJSON)
-	w.WriteHeader(f.status)
-	_ = json.NewEncoder(w).Encode(runtimecontract.ReloadFailure{Error: f.message})
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(reply)
+}
+
+// tailBytes bounds what a reload's reply carries of what the app printed.
+const tailBytes = 4 << 10
+
+// tail keeps the end of what the app printed: at most tailBytes, from a line's start once it has dropped any.
+type tail struct {
+	mu   sync.Mutex
+	data []byte
+}
+
+func (t *tail) Write(p []byte) (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.data = append(t.data, p...)
+	if extra := len(t.data) - tailBytes; extra > 0 {
+		t.data = t.data[extra:]
+		if _, rest, found := bytes.Cut(t.data, []byte("\n")); found {
+			t.data = rest
+		}
+	}
+	return len(p), nil
+}
+
+func (t *tail) String() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return string(t.data)
 }

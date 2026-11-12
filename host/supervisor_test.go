@@ -139,22 +139,25 @@ func TestReload(t *testing.T) {
 	if status, _ := r.get(); status != http.StatusServiceUnavailable {
 		t.Fatalf("before any source: %d", status)
 	}
-	if status, body := r.reload(overlay(t, map[string]string{"main.py": app("first"), "old.py": ""})); status != http.StatusNoContent {
+	if status, body := r.reload(overlay(t, map[string]string{"main.py": app("first"), "old.py": ""})); status != http.StatusOK {
 		t.Fatalf("reload: %d %s", status, body)
 	}
 	if status, body := r.get(); status != http.StatusOK || body != `["first", "app.example", "session.example"]` {
 		t.Fatalf("first source: %d %s", status, body)
 	}
 
-	if status, body := r.reload(overlay(t, map[string]string{"main.py": "raise SystemExit(3)"})); status != http.StatusInternalServerError ||
-		!strings.Contains(body, "exit status 3") {
+	failing := `import sys; sys.stderr.write("a" * 4999 + "\nno such package\n"); raise SystemExit(3)`
+	status, body := r.reload(overlay(t, map[string]string{"main.py": failing}))
+	var reply runtimecontract.ReloadReply
+	if _ = json.Unmarshal([]byte(body), &reply); status != http.StatusInternalServerError || !strings.Contains(reply.Error, "exit status 3") ||
+		reply.Output != "no such package\n" {
 		t.Fatalf("failing reload: %d %s", status, body)
 	}
 	if status, _ := r.get(); status != http.StatusServiceUnavailable {
 		t.Fatalf("after a failing reload: %d", status)
 	}
 
-	if status, body := r.reload(overlay(t, map[string]string{"main.py": app("second")})); status != http.StatusNoContent {
+	if status, body := r.reload(overlay(t, map[string]string{"main.py": app("second")})); status != http.StatusOK {
 		t.Fatalf("reload: %d %s", status, body)
 	}
 	if _, body := r.get(); !strings.Contains(body, "second") {
@@ -180,7 +183,7 @@ func TestReloadStopsEverythingTheCommandStarted(t *testing.T) {
 	r.reload(overlay(t, map[string]string{"main.py": app("first")}))
 	data, _ := os.ReadFile(filepath.Join(r.root, "pid"))
 	pid, _ := strconv.Atoi(string(data))
-	if status, _ := r.reload(overlay(t, map[string]string{"main.py": app("second")})); status != http.StatusNoContent {
+	if status, _ := r.reload(overlay(t, map[string]string{"main.py": app("second")})); status != http.StatusOK {
 		t.Fatalf("reload: %d", status)
 	}
 	if syscall.Kill(pid, 0) == nil {
@@ -226,7 +229,7 @@ func TestBootStartsTheRecordedOverlay(t *testing.T) {
 		if status, _ := r.get(); status != http.StatusServiceUnavailable {
 			t.Fatalf("without source: %d", status)
 		}
-		if status, body := r.reload(blob); status != http.StatusNoContent {
+		if status, body := r.reload(blob); status != http.StatusOK {
 			t.Fatalf("reload: %d %s", status, body)
 		}
 	})
