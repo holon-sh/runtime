@@ -98,8 +98,7 @@ func (h *host) reload(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, reloadReply{job.restartedAt.UTC(), job.readyAt.UTC(), digest})
 }
 
-// bootOverlay unpacks the overlay the platform recorded. A development image holds no source of its own, so a failure
-// here fails the boot.
+// bootOverlay unpacks the overlay the platform recorded.
 func (h *host) bootOverlay(ctx context.Context, recorded []byte) (string, error) {
 	if len(recorded) == 0 {
 		return "", nil
@@ -109,13 +108,14 @@ func (h *host) bootOverlay(ctx context.Context, recorded []byte) (string, error)
 		return "", errors.New("invalid " + overlayFileEnv)
 	}
 	directory, err := h.fetchOverlay(ctx, request)
-	if err == nil && directory != "" {
-		if failure := prepare(ctx, directory, h.image); failure != nil {
-			err = failure
-		}
-	}
 	if err != nil {
 		return "", fmt.Errorf("boot overlay %s: %w", request.Digest, err)
+	}
+	if directory != "" {
+		if failure := prepare(ctx, directory, h.image); failure != nil {
+			fmt.Fprintln(os.Stderr, failure)
+			return "", nil
+		}
 	}
 	return directory, nil
 }
