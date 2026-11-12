@@ -44,16 +44,6 @@ func (p *process) stop() {
 	<-p.done
 }
 
-func (p *process) afterBuild(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		select {
-		case <-p.built:
-			next.ServeHTTP(w, r)
-		case <-r.Context().Done():
-		}
-	})
-}
-
 func Run(ctx context.Context, command []string) error {
 	port := 3000
 	if value, present := os.LookupEnv("PORT"); present {
@@ -125,7 +115,7 @@ func Run(ctx context.Context, command []string) error {
 			starting.ready <- err
 			return
 		}
-		h.connect(app.Port, starting.afterBuild(handler), starting.directory)
+		h.connect(app.Port, handler, starting)
 		if err = listen(); err != nil {
 			http.Error(w, "Application listener unavailable", http.StatusServiceUnavailable)
 			starting.ready <- err

@@ -512,27 +512,30 @@ func blockingBuild(t *testing.T, message string) []byte {
 	return overlay(t, source)
 }
 
-func TestReloadAnswersBeforeTheBuildAndThePageAfterIt(t *testing.T) {
+func TestReloadAnswersBeforeTheBuildAndRequestsAfterIt(t *testing.T) {
 	rt := startRuntime(t, nil)
 	if status, body := rt.reload(apiCaller, overlayMediaType, blockingBuild(t, "unbuilt")); status != http.StatusOK {
 		t.Fatalf("reload answered %d %s", status, body)
 	}
-	directory := rt.child().Cwd
-	page := make(chan string)
-	go func() {
-		body, _ := io.ReadAll(rt.get("/").Body)
-		page <- strings.TrimSpace(string(body))
-	}()
+	answers := make(chan string)
+	for _, path := range []string{"/", "/mcp"} {
+		go func() {
+			body, _ := io.ReadAll(rt.get(path).Body)
+			answers <- path + " " + strings.TrimSpace(string(body))
+		}()
+	}
 	select {
-	case served := <-page:
-		t.Fatalf("the page was served before the build finished: %q", served)
+	case answer := <-answers:
+		t.Fatalf("answered before the build finished: %s", answer)
 	case <-time.After(300 * time.Millisecond):
 	}
-	if err := os.WriteFile(filepath.Join(directory, "release"), nil, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(rt.overlays, rt.overlayDirectories()[0], "release"), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if served := <-page; served != "built" {
-		t.Fatalf("the page after the build: %q", served)
+	got := []string{<-answers, <-answers}
+	slices.Sort(got)
+	if got[0] != "/ built" || !strings.Contains(got[1], `"message": "unbuilt"`) {
+		t.Fatalf("after the build: %q", got)
 	}
 }
 
