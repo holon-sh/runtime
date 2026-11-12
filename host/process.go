@@ -34,6 +34,7 @@ type process struct {
 	cancel    context.CancelFunc
 	ready     chan error
 	done      chan struct{}
+	built     chan struct{}
 	err       error
 }
 
@@ -150,7 +151,7 @@ func Run(ctx context.Context, command []string) error {
 		child.WaitDelay = 5 * time.Second
 		p := &process{
 			directory: directory, command: child, cancel: cancelChild,
-			ready: make(chan error, 1), done: make(chan struct{}),
+			ready: make(chan error, 1), done: make(chan struct{}), built: make(chan struct{}),
 		}
 		h.mu.Lock()
 		h.starting = p
@@ -162,16 +163,20 @@ func Run(ctx context.Context, command []string) error {
 		go func() {
 			p.err = child.Wait()
 			cancelChild()
+			<-p.built
 			close(p.done)
+		}()
+		go func() {
+			if directory != h.image {
+				build(childCtx, directory)
+			}
+			close(p.built)
 		}()
 		return p, nil
 	}
 	current, failure := awaitReady(ctx, start, directory, nil)
 	if failure != nil {
 		return errors.Join(failure, ctx.Err())
-	}
-	if directory != h.image {
-		build(ctx, directory)
 	}
 	defer func() {
 		_ = public.Close()
@@ -215,9 +220,10 @@ func (h *host) restart(
 		if current.directory != h.image {
 			_ = os.RemoveAll(current.directory)
 		}
-		built, cancel := context.WithDeadline(ctx, job.deadline)
-		defer cancel()
-		build(built, next.directory)
+		select {
+		case <-next.built:
+		case <-time.After(time.Until(job.deadline)):
+		}
 		return next, nil, nil
 	}
 	_ = os.RemoveAll(job.directory)

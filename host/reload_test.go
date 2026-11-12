@@ -443,3 +443,37 @@ func TestBootOverlayFile(t *testing.T) {
 		})
 	}
 }
+
+func TestReloadBuildsBesideTheStart(t *testing.T) {
+	bin := t.TempDir()
+	writeTree(t, bin, map[string]string{
+		"npm": "#!/bin/sh\n[ \"$1\" = run ] || exit 0\npython3 -c 'import time; print(time.time())' > build-started\nsleep 0.3\necho built > web/index.html\n",
+	})
+	if err := os.Chmod(filepath.Join(bin, "npm"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	source := sourceFiles("unbuilt", "time.sleep(0.3)")
+	source["package.json"] = `{"scripts":{"build":"build"}}`
+	rt := startRuntime(t, nil)
+	status, body := rt.reload(apiCaller, overlayMediaType, overlay(t, source))
+	var reply reloadReply
+	if status != http.StatusOK || json.Unmarshal(body, &reply) != nil {
+		t.Fatalf("reload answered %d %s", status, body)
+	}
+	started, err := os.ReadFile(filepath.Join(rt.child().Cwd, "build-started"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	seconds, err := strconv.ParseFloat(strings.TrimSpace(string(started)), 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if began := time.UnixMicro(int64(seconds * 1e6)); !began.Before(reply.ReadyAt) {
+		t.Fatalf("the build began at %s, after the application was ready at %s", began, reply.ReadyAt)
+	}
+	page, _ := io.ReadAll(rt.get("/").Body)
+	if strings.TrimSpace(string(page)) != "built" {
+		t.Fatalf("the reply came before the build finished: %q", page)
+	}
+}
