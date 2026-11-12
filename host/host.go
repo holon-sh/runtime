@@ -34,7 +34,9 @@ type scope struct {
 type host struct {
 	peers       map[string]*url.URL
 	transport   *http.Transport
-	image       string   // the application directory, which an overlay falls back to and which is never removed
+	image       string
+	serving     string
+	port        uint16
 	overlays    string   // the directory that holds each overlay's directory
 	callers     []string // the mesh identities that may reload the application
 	reloading   atomic.Bool
@@ -73,9 +75,15 @@ func newHost() (*host, error) {
 
 func (h *host) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// A reload is admitted by its mesh caller, without platform context; any other caller is answered like any request.
-	if caller := meshCaller(r); caller != "" && slices.Contains(h.callers, caller) && r.Method == http.MethodPost && r.URL.Path == reloadPath {
-		h.reload(w, r)
-		return
+	if caller := meshCaller(r); caller != "" && slices.Contains(h.callers, caller) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == reloadPath:
+			h.reload(w, r)
+			return
+		case r.Method == http.MethodGet && r.URL.Path == contractPath:
+			h.contract(w, r)
+			return
+		}
 	}
 	h.mu.Lock()
 	application, frontend := h.application, h.frontend
@@ -205,7 +213,7 @@ func (h *host) proxy(rewrite func(*httputil.ProxyRequest)) *httputil.ReverseProx
 	}
 }
 
-func (h *host) connect(port uint16, frontend http.Handler) {
+func (h *host) connect(port uint16, frontend http.Handler, directory string) {
 	target := &url.URL{Scheme: "http", Host: "127.0.0.1:" + strconv.Itoa(int(port))}
 	application := h.proxy(func(p *httputil.ProxyRequest) {
 		p.SetURL(target)
@@ -215,7 +223,7 @@ func (h *host) connect(port uint16, frontend http.Handler) {
 		}
 	})
 	h.mu.Lock()
-	h.application, h.frontend = application, frontend
+	h.application, h.frontend, h.serving, h.port = application, frontend, directory, port
 	h.mu.Unlock()
 	// Connections to a previous child are dead, and a request that reuses one cannot always be retried.
 	h.transport.CloseIdleConnections()

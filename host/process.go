@@ -101,13 +101,13 @@ func Run(ctx context.Context, command []string) error {
 			http.Error(w, "Application already started", http.StatusConflict)
 			return
 		}
-		handler, err := frontend(app.Frontend, starting.directory, h.image)
+		handler, err := frontend(app.Frontend, starting.directory)
 		if err != nil {
 			http.Error(w, "Invalid application frontend", http.StatusBadRequest)
 			starting.ready <- err
 			return
 		}
-		h.connect(app.Port, handler)
+		h.connect(app.Port, handler, starting.directory)
 		opening.Do(func() {
 			var listener net.Listener
 			if listener, err = new(net.ListenConfig).Listen(ctx, "tcp", ":"+strconv.Itoa(port)); err == nil {
@@ -170,6 +170,9 @@ func Run(ctx context.Context, command []string) error {
 	if failure != nil {
 		return errors.Join(failure, ctx.Err())
 	}
+	if directory != h.image {
+		build(ctx, directory)
+	}
 	defer func() {
 		_ = public.Close()
 		cancel()
@@ -212,6 +215,9 @@ func (h *host) restart(
 		if current.directory != h.image {
 			_ = os.RemoveAll(current.directory)
 		}
+		built, cancel := context.WithDeadline(ctx, job.deadline)
+		defer cancel()
+		build(built, next.directory)
 		return next, nil, nil
 	}
 	_ = os.RemoveAll(job.directory)
