@@ -29,6 +29,7 @@ const (
 	reloadDirEnv     = "HOLON_RELOAD_DIR"
 	overlayFileEnv   = "HOLON_OVERLAY_FILE"
 	overlayMediaType = "application/vnd.holon.source-overlay.v0.tar+zstd"
+	buildHeader      = "Holon-Build"
 )
 
 type reloadRequest struct {
@@ -105,7 +106,7 @@ func (h *host) reload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	job := &reloadJob{
-		directory: directory, page: r.URL.Query().Get("build") != "false", gone: r.Context().Done(), reply: make(chan *reloadFailure, 1),
+		directory: directory, page: r.Header.Get(buildHeader) != "false", gone: r.Context().Done(), reply: make(chan *reloadFailure, 1),
 	}
 	output, failure := prepare(r.Context(), job.directory, previous)
 	if failure == nil {
