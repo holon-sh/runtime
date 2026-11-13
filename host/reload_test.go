@@ -240,14 +240,15 @@ func writeTree(t *testing.T, root string, files map[string]string) {
 	}
 }
 
-func (rt *testRuntime) reload(caller, mediaType string, blob []byte, query ...string) (int, []byte) {
+func (rt *testRuntime) reload(caller, mediaType string, blob []byte, build ...string) (int, []byte) {
 	rt.t.Helper()
-	request, err := http.NewRequest(http.MethodPost, rt.url+reloadPath+strings.Join(query, ""), bytes.NewReader(blob))
+	request, err := http.NewRequest(http.MethodPost, rt.url+reloadPath, bytes.NewReader(blob))
 	if err != nil {
 		rt.t.Fatal(err)
 	}
 	request.Header.Set(runtimecontract.CallerHeader, caller)
 	request.Header.Set("Content-Type", mediaType)
+	request.Header[buildHeader] = build
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		rt.t.Fatal(err)
@@ -605,7 +606,7 @@ func TestReloadAnswersBeforeTheBuildAndRequestsAfterIt(t *testing.T) {
 
 func TestReloadWithoutABuildServesTheSourceAsSent(t *testing.T) {
 	rt := startRuntime(t, nil)
-	if status, body := rt.reload(apiCaller, overlayMediaType, blockingBuild(t, "as sent"), "?build=false"); status != http.StatusOK {
+	if status, body := rt.reload(apiCaller, overlayMediaType, blockingBuild(t, "as sent"), "false"); status != http.StatusOK {
 		t.Fatalf("reload answered %d %s", status, body)
 	}
 	served := make(chan string)
