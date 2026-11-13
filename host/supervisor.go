@@ -1,5 +1,6 @@
 // Package host supervises a development app: it holds the app's port and restarts the app from the source holon-api
-// posts to it, so a save reaches the app without a new pod.
+// posts to it, so a save reaches the app without a new pod. Each source carries the protocol's PrepareFile and
+// StartFile, which the supervisor runs in turn.
 package host
 
 import (
@@ -31,7 +32,6 @@ import (
 const reloadDirEnv = "HOLON_RELOAD_DIR"
 
 type supervisor struct {
-	command   []string
 	root      string
 	transport *http.Transport
 	turn      chan struct{}
@@ -39,9 +39,9 @@ type supervisor struct {
 	written   []string
 }
 
-// Run serves PORT and proxies it to command, which it starts in the source directory with a loopback HOST and PORT
-// of the child's own. The app starts from the overlay the platform recorded, or else from the first reload.
-func Run(ctx context.Context, command []string) error {
+// Run serves PORT and proxies it to the app, which it starts in the source directory with a loopback HOST and PORT of
+// the app's own. The app starts from the overlay the platform recorded, or else from the first reload.
+func Run(ctx context.Context) error {
 	root := os.Getenv(reloadDirEnv)
 	if !filepath.IsAbs(root) {
 		return errors.New(reloadDirEnv + " must name the source directory")
@@ -52,7 +52,7 @@ func Run(ctx context.Context, command []string) error {
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
-	s := &supervisor{command: command, root: root, transport: transport, turn: make(chan struct{}, 1)}
+	s := &supervisor{root: root, transport: transport, turn: make(chan struct{}, 1)}
 	listener, err := new(net.ListenConfig).Listen(ctx, "tcp", ":"+cmp.Or(os.Getenv("PORT"), "3000"))
 	if err != nil {
 		return err
@@ -108,13 +108,14 @@ func (s *supervisor) boot(ctx context.Context) error {
 		return err
 	}
 	if status, reply := s.launch(ctx); status != http.StatusOK {
+		fmt.Fprint(os.Stderr, reply.Output)
 		fmt.Fprintln(os.Stderr, "application did not start:", reply.Error)
 	}
 	return nil
 }
 
-// reload replaces the app with one running from the posted overlay, and answers once it accepts connections, with the
-// end of what it printed until then. An app that does not start stays down until the next reload.
+// reload replaces the app with one running from the posted overlay, and answers once it accepts connections. An app
+// that does not start stays down until the next reload.
 func (s *supervisor) reload(w http.ResponseWriter, r *http.Request) {
 	select {
 	case s.turn <- struct{}{}:
@@ -131,9 +132,13 @@ func (s *supervisor) reload(w http.ResponseWriter, r *http.Request) {
 	writeReply(w, status, reply)
 }
 
-// launch starts the app and waits, for as long as ctx lasts, until it accepts connections. It answers with the status a
-// reload replies with and the end of what the app printed.
+// launch prepares the app, starts it and waits, for as long as ctx lasts, until it accepts connections. It answers with
+// the status a reload replies with and, unless the app itself fails, the end of what preparing it printed.
 func (s *supervisor) launch(ctx context.Context) (int, runtimecontract.ReloadReply) {
+	var output tail
+	if err := s.prepare(ctx, &output); err != nil {
+		return http.StatusInternalServerError, runtimecontract.ReloadReply{Error: "the install or build failed: " + err.Error(), Output: output.String()}
+	}
 	c, err := s.start()
 	if err != nil {
 		return http.StatusInternalServerError, runtimecontract.ReloadReply{Error: err.Error()}
@@ -141,7 +146,7 @@ func (s *supervisor) launch(ctx context.Context) (int, runtimecontract.ReloadRep
 	status, problem := c.ready(ctx)
 	if status != http.StatusOK {
 		c.stop()
-		return status, runtimecontract.ReloadReply{Error: problem, Output: c.output.String()}
+		return status, runtimecontract.ReloadReply{Error: problem}
 	}
 	s.app.Store(c)
 	go func() {
@@ -150,7 +155,17 @@ func (s *supervisor) launch(ctx context.Context) (int, runtimecontract.ReloadRep
 			fmt.Fprintln(os.Stderr, "application exited:", c.command.ProcessState)
 		}
 	}()
-	return status, runtimecontract.ReloadReply{Output: c.output.String()}
+	return status, runtimecontract.ReloadReply{Output: output.String()}
+}
+
+// prepare runs PrepareFile in the source directory, writing what it prints to output instead of the app's log.
+func (s *supervisor) prepare(ctx context.Context, output io.Writer) error {
+	command := exec.CommandContext(ctx, "sh", runtimecontract.PrepareFile)
+	command.Dir, command.Env = s.root, append(os.Environ(), "PWD="+s.root)
+	command.Stdout, command.Stderr = output, output
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	command.Cancel = func() error { return syscall.Kill(-command.Process.Pid, syscall.SIGKILL) }
+	return command.Run()
 }
 
 func (s *supervisor) stop() {
@@ -165,7 +180,6 @@ type child struct {
 	command *exec.Cmd
 	address string
 	proxy   http.Handler
-	output  *tail
 	done    chan struct{}
 }
 
@@ -175,17 +189,16 @@ func (s *supervisor) start() (*child, error) {
 		return nil, err
 	}
 	_, port, _ := net.SplitHostPort(address)
-	command := exec.Command(s.command[0], s.command[1:]...)
+	command := exec.Command("sh", runtimecontract.StartFile)
 	command.Dir = s.root
 	command.Env = append(os.Environ(), "PWD="+s.root, "HOST=127.0.0.1", "PORT="+port)
-	output := &tail{}
-	command.Stdout, command.Stderr = io.MultiWriter(os.Stdout, output), io.MultiWriter(os.Stderr, output)
+	command.Stdout, command.Stderr = os.Stdout, os.Stderr
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := command.Start(); err != nil {
 		return nil, fmt.Errorf("start application: %w", err)
 	}
 	target := &url.URL{Scheme: "http", Host: address}
-	c := &child{command: command, address: address, output: output, done: make(chan struct{}), proxy: &httputil.ReverseProxy{
+	c := &child{command: command, address: address, done: make(chan struct{}), proxy: &httputil.ReverseProxy{
 		Rewrite: func(p *httputil.ProxyRequest) {
 			p.SetURL(target)
 			p.Out.Host = p.In.Host
@@ -251,10 +264,10 @@ func writeReply(w http.ResponseWriter, status int, reply runtimecontract.ReloadR
 	_ = json.NewEncoder(w).Encode(reply)
 }
 
-// tailBytes bounds what a reload's reply carries of what the app printed.
+// tailBytes bounds what a reload's reply carries of what preparing the app printed.
 const tailBytes = 4 << 10
 
-// tail keeps the end of what the app printed: at most tailBytes, from a line's start once it has dropped any.
+// tail keeps the end of what was written to it: at most tailBytes, from a line's start once it has dropped any.
 type tail struct {
 	mu   sync.Mutex
 	data []byte

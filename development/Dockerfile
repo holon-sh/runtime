@@ -18,4 +18,4 @@ ENV HOME=/app XDG_CACHE_HOME=/app/.cache npm_config_cache=/app/.cache/npm UV_CAC
 WORKDIR /app
 USER 10001:10001
 STOPSIGNAL SIGTERM
-ENTRYPOINT ["/holon-mcp-runtime", "sh", ".holon/start"]
+ENTRYPOINT ["/holon-mcp-runtime"]
