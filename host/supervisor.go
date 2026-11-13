@@ -1,6 +1,6 @@
 // Package host supervises a development app: it holds the app's port and restarts the app from the source holon-api
-// posts to it, so a save reaches the app without a new pod. Preparation precedes app startup and the optional build;
-// the app receives traffic only once startup and build have both succeeded.
+// posts to it, so a save reaches the app without a new pod. Each source carries the protocol's PrepareFile and
+// StartFile, which the supervisor runs in turn.
 package host
 
 import (
@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/holon-sh/protocol"
@@ -71,9 +72,7 @@ func Run(ctx context.Context) error {
 		}
 	}
 	_ = server.Close()
-	s.turn <- struct{}{}
 	s.stop()
-	<-s.turn
 	return err
 }
 
@@ -124,9 +123,6 @@ func (s *supervisor) reload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { <-s.turn }()
-	if r.Context().Err() != nil {
-		return
-	}
 	s.stop()
 	if _, err := s.unpack(r.Body); err != nil {
 		writeReply(w, http.StatusBadRequest, runtimecontract.ReloadReply{Error: err.Error()})
@@ -136,38 +132,21 @@ func (s *supervisor) reload(w http.ResponseWriter, r *http.Request) {
 	writeReply(w, status, reply)
 }
 
-// launch prepares dependencies, then starts the app and its optional build together. Neither traffic nor a successful
-// reload reaches the app until it accepts connections and the build finishes.
+// launch prepares the app, starts it and waits, for as long as ctx lasts, until it accepts connections. It answers with
+// the status a reload replies with and, unless the app itself fails, the end of what preparing it printed.
 func (s *supervisor) launch(ctx context.Context) (int, runtimecontract.ReloadReply) {
 	var output tail
-	prepare, err := startProcess(s.script(runtimecontract.PrepareFile, &output, runtimecontract.ConcurrentBuildEnv+"=1"))
-	if err == nil {
-		err = prepare.wait(ctx)
-	}
-	if err != nil {
+	if err := s.prepare(ctx, &output); err != nil {
 		return http.StatusInternalServerError, runtimecontract.ReloadReply{Error: "the install or build failed: " + err.Error(), Output: output.String()}
 	}
 	c, err := s.start()
 	if err != nil {
 		return http.StatusInternalServerError, runtimecontract.ReloadReply{Error: err.Error()}
 	}
-	var build *process
-	if _, err = os.Stat(filepath.Join(s.root, runtimecontract.BuildFile)); err == nil {
-		build, err = startProcess(s.script(runtimecontract.BuildFile, &output))
-	} else if errors.Is(err, os.ErrNotExist) {
-		err = nil
-	}
-	if err != nil {
-		c.stop()
-		return http.StatusInternalServerError, runtimecontract.ReloadReply{Error: "start build: " + err.Error(), Output: output.String()}
-	}
-	status, problem := c.ready(ctx, build)
-	if build != nil {
-		build.kill()
-	}
+	status, problem := c.ready(ctx)
 	if status != http.StatusOK {
 		c.stop()
-		return status, runtimecontract.ReloadReply{Error: problem, Output: output.String()}
+		return status, runtimecontract.ReloadReply{Error: problem}
 	}
 	s.app.Store(c)
 	go func() {
@@ -179,11 +158,14 @@ func (s *supervisor) launch(ctx context.Context) (int, runtimecontract.ReloadRep
 	return status, runtimecontract.ReloadReply{Output: output.String()}
 }
 
-func (s *supervisor) script(file string, output io.Writer, environment ...string) *exec.Cmd {
-	command := exec.Command("sh", file)
-	command.Dir, command.Env = s.root, append(os.Environ(), append(environment, "PWD="+s.root)...)
+// prepare runs PrepareFile in the source directory, writing what it prints to output instead of the app's log.
+func (s *supervisor) prepare(ctx context.Context, output io.Writer) error {
+	command := exec.CommandContext(ctx, "sh", runtimecontract.PrepareFile)
+	command.Dir, command.Env = s.root, append(os.Environ(), "PWD="+s.root)
 	command.Stdout, command.Stderr = output, output
-	return command
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	command.Cancel = func() error { return syscall.Kill(-command.Process.Pid, syscall.SIGKILL) }
+	return command.Run()
 }
 
 func (s *supervisor) stop() {
@@ -195,9 +177,10 @@ func (s *supervisor) stop() {
 }
 
 type child struct {
-	*process
+	command *exec.Cmd
 	address string
 	proxy   http.Handler
+	done    chan struct{}
 }
 
 func (s *supervisor) start() (*child, error) {
@@ -206,14 +189,16 @@ func (s *supervisor) start() (*child, error) {
 		return nil, err
 	}
 	_, port, _ := net.SplitHostPort(address)
-	command := s.script(runtimecontract.StartFile, os.Stdout, "HOST=127.0.0.1", "PORT="+port)
-	command.Stderr = os.Stderr
-	p, err := startProcess(command)
-	if err != nil {
+	command := exec.Command("sh", runtimecontract.StartFile)
+	command.Dir = s.root
+	command.Env = append(os.Environ(), "PWD="+s.root, "HOST=127.0.0.1", "PORT="+port)
+	command.Stdout, command.Stderr = os.Stdout, os.Stderr
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := command.Start(); err != nil {
 		return nil, fmt.Errorf("start application: %w", err)
 	}
 	target := &url.URL{Scheme: "http", Host: address}
-	c := &child{process: p, address: address, proxy: &httputil.ReverseProxy{
+	c := &child{command: command, address: address, done: make(chan struct{}), proxy: &httputil.ReverseProxy{
 		Rewrite: func(p *httputil.ProxyRequest) {
 			p.SetURL(target)
 			p.Out.Host = p.In.Host
@@ -226,31 +211,17 @@ func (s *supervisor) start() (*child, error) {
 			http.Error(w, "Application unavailable", http.StatusBadGateway)
 		},
 	}}
+	go func() {
+		_ = command.Wait()
+		_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
+		close(c.done)
+	}()
 	return c, nil
 }
 
-// ready waits for both the app listener and build, failing when either process fails or the request ends.
-func (c *child) ready(ctx context.Context, build *process) (int, string) {
-	if build != nil {
-		select {
-		case <-build.done:
-			if build.err != nil {
-				return http.StatusInternalServerError, "the build failed: " + build.err.Error()
-			}
-		case <-c.done:
-			return http.StatusInternalServerError, "application exited before ready: " + c.command.ProcessState.String()
-		case <-ctx.Done():
-			return http.StatusGatewayTimeout, "application did not become ready"
-		}
-	}
+// ready waits until the app accepts connections, and fails once it exits or ctx ends first.
+func (c *child) ready(ctx context.Context) (int, string) {
 	for {
-		select {
-		case <-c.done:
-			return http.StatusInternalServerError, "application exited before ready: " + c.command.ProcessState.String()
-		case <-ctx.Done():
-			return http.StatusGatewayTimeout, "application did not become ready"
-		default:
-		}
 		connection, err := new(net.Dialer).DialContext(ctx, "tcp", c.address)
 		if err == nil {
 			_ = connection.Close()
@@ -264,6 +235,18 @@ func (c *child) ready(ctx context.Context, build *process) (int, string) {
 		case <-time.After(25 * time.Millisecond):
 		}
 	}
+}
+
+// stop asks the app's process group to end, kills what remains of it after five seconds, and waits for the app.
+func (c *child) stop() {
+	group := -c.command.Process.Pid
+	_ = syscall.Kill(group, syscall.SIGTERM)
+	select {
+	case <-c.done:
+	case <-time.After(5 * time.Second):
+		_ = syscall.Kill(group, syscall.SIGKILL)
+	}
+	<-c.done
 }
 
 // loopbackAddress reserves a free loopback port for the app.
