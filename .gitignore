@@ -1,5 +1,0 @@
-dist/
-node_modules/
-.venv/
-__pycache__/
-/host/javascript/.host-test
