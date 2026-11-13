@@ -13,7 +13,7 @@ ENV UV_COMPILE_BYTECODE=1 PYTHONDONTWRITEBYTECODE=1
 RUN UV_PYTHON_INSTALL_DIR=/opt/uv/python UV_PYTHON_BIN_DIR=/usr/local/bin uv python install 3.13 3.15 \
  && npm install -g pnpm@10.34.9 && npm cache clean --force && chmod -R a+rX /opt/uv
 COPY --from=runtime /holon-mcp-runtime /holon-mcp-runtime
-ENV HOME=/app XDG_CACHE_HOME=/app/.cache npm_config_cache=/app/.cache/npm UV_CACHE_DIR=/app/.cache/uv \
+ENV HOME=/app npm_config_cache=/app/.cache/npm \
     UV_PYTHON_INSTALL_DIR=/app/.cache/uv-python HOLON_RELOAD_DIR=/app/source \
     npm_config_audit=false npm_config_fund=false npm_config_update_notifier=false
 WORKDIR /app
