@@ -26,13 +26,14 @@ import (
 )
 
 // app is a fake application whose reply names its source. It records its pid and makes a file of its own, as an
-// install would.
+// install would, and prints that it serves.
 func app(message string) string {
 	return `import json, os
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 open("pid", "w").write(str(os.getpid()))
-open("installed", "w").write("")
+open("made", "w").write("")
+print("serving", flush=True)
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -42,6 +43,11 @@ class Handler(BaseHTTPRequestHandler):
 
 HTTPServer((os.environ["HOST"], int(os.environ["PORT"])), Handler).serve_forever()
 `
+}
+
+// source is an app's files with the scripts that prepare and start it.
+func source(prepare, start, main string) map[string]string {
+	return map[string]string{runtimecontract.PrepareFile: prepare, runtimecontract.StartFile: start, "main.py": main}
 }
 
 func overlay(t *testing.T, files map[string]string) []byte {
@@ -65,8 +71,8 @@ type running struct {
 	root string
 }
 
-// run starts the supervisor with command, from record when it is set, and returns once it listens.
-func run(t *testing.T, record *runtimecontract.OverlayRecord, command ...string) *running {
+// run starts the supervisor, from record when it is set, and returns once it listens.
+func run(t *testing.T, record *runtimecontract.OverlayRecord) *running {
 	t.Helper()
 	listener, _ := net.Listen("tcp", "127.0.0.1:0")
 	port := strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)
@@ -77,7 +83,7 @@ func run(t *testing.T, record *runtimecontract.OverlayRecord, command ...string)
 	var err error
 	exited := make(chan struct{})
 	go func() {
-		err = Run(ctx, command)
+		err = Run(ctx)
 		close(exited)
 	}()
 	t.Cleanup(func() {
@@ -135,29 +141,44 @@ func (r *running) get() (int, string) {
 }
 
 func TestReload(t *testing.T) {
-	r := run(t, nil, "python3", "main.py")
+	log, err := os.Create(filepath.Join(t.TempDir(), "log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr := os.Stdout, os.Stderr
+	os.Stdout, os.Stderr = log, log
+	t.Cleanup(func() { os.Stdout, os.Stderr = stdout, stderr })
+	reply := func(body string) (reply runtimecontract.ReloadReply) {
+		_ = json.Unmarshal([]byte(body), &reply)
+		return reply
+	}
+	r := run(t, nil)
 	if status, _ := r.get(); status != http.StatusServiceUnavailable {
 		t.Fatalf("before any source: %d", status)
 	}
-	if status, body := r.reload(overlay(t, map[string]string{"main.py": app("first"), "old.py": ""})); status != http.StatusOK {
+	first := source("echo installed", "exec python3 main.py", app("first"))
+	first["old.py"] = ""
+	if status, body := r.reload(overlay(t, first)); status != http.StatusOK || reply(body).Output != "installed\n" {
 		t.Fatalf("reload: %d %s", status, body)
 	}
 	if status, body := r.get(); status != http.StatusOK || body != `["first", "app.example", "session.example"]` {
 		t.Fatalf("first source: %d %s", status, body)
 	}
 
-	failing := `import sys; sys.stderr.write("a" * 4999 + "\nno such package\n"); raise SystemExit(3)`
-	status, body := r.reload(overlay(t, map[string]string{"main.py": failing}))
-	var reply runtimecontract.ReloadReply
-	if _ = json.Unmarshal([]byte(body), &reply); status != http.StatusInternalServerError || !strings.Contains(reply.Error, "exit status 3") ||
-		reply.Output != "no such package\n" {
-		t.Fatalf("failing reload: %d %s", status, body)
+	failing := `head -c 4999 /dev/zero | tr '\0' a; printf '\nno such package\n'; exit 3`
+	if status, body := r.reload(overlay(t, source(failing, "exec python3 main.py", app("unprepared")))); status != http.StatusInternalServerError ||
+		!strings.Contains(reply(body).Error, "exit status 3") || reply(body).Output != "no such package\n" {
+		t.Fatalf("failing install: %d %s", status, body)
+	}
+	if status, body := r.reload(overlay(t, source("echo installed", "exec python3 main.py", "raise SystemExit(4)"))); status != http.StatusInternalServerError ||
+		!strings.Contains(reply(body).Error, "exit status 4") || reply(body).Output != "" {
+		t.Fatalf("failing start: %d %s", status, body)
 	}
 	if status, _ := r.get(); status != http.StatusServiceUnavailable {
 		t.Fatalf("after a failing reload: %d", status)
 	}
 
-	if status, body := r.reload(overlay(t, map[string]string{"main.py": app("second")})); status != http.StatusOK {
+	if status, body := r.reload(overlay(t, source("", "exec python3 main.py", app("second")))); status != http.StatusOK {
 		t.Fatalf("reload: %d %s", status, body)
 	}
 	if _, body := r.get(); !strings.Contains(body, "second") {
@@ -166,8 +187,11 @@ func TestReload(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(r.root, "old.py")); err == nil {
 		t.Fatal("what only an earlier overlay wrote is still there")
 	}
-	if _, err := os.Stat(filepath.Join(r.root, "installed")); err != nil {
+	if _, err := os.Stat(filepath.Join(r.root, "made")); err != nil {
 		t.Fatal("what the app made is gone")
+	}
+	if logged, _ := os.ReadFile(log.Name()); !strings.Contains(string(logged), "serving") || strings.Contains(string(logged), "installed") {
+		t.Fatalf("log %q", logged)
 	}
 
 	if status, _ := r.reload(overlay(t, map[string]string{"../escaped": ""})); status != http.StatusBadRequest {
@@ -179,11 +203,11 @@ func TestReload(t *testing.T) {
 }
 
 func TestReloadStopsEverythingTheCommandStarted(t *testing.T) {
-	r := run(t, nil, "sh", "-c", "python3 main.py; true")
-	r.reload(overlay(t, map[string]string{"main.py": app("first")}))
+	r := run(t, nil)
+	r.reload(overlay(t, source("", "python3 main.py; true", app("first"))))
 	data, _ := os.ReadFile(filepath.Join(r.root, "pid"))
 	pid, _ := strconv.Atoi(string(data))
-	if status, _ := r.reload(overlay(t, map[string]string{"main.py": app("second")})); status != http.StatusOK {
+	if status, _ := r.reload(overlay(t, source("", "python3 main.py; true", app("second")))); status != http.StatusOK {
 		t.Fatalf("reload: %d", status)
 	}
 	if syscall.Kill(pid, 0) == nil {
@@ -192,7 +216,7 @@ func TestReloadStopsEverythingTheCommandStarted(t *testing.T) {
 }
 
 func TestBootStartsTheRecordedOverlay(t *testing.T) {
-	blob := overlay(t, map[string]string{"main.py": app("recorded")})
+	blob := overlay(t, source("", "exec python3 main.py", app("recorded")))
 	sum := sha256.Sum256(blob)
 	digest := "sha256:" + hex.EncodeToString(sum[:])
 	tampered := "sha256:" + strings.Repeat("0", 64)
@@ -216,7 +240,7 @@ func TestBootStartsTheRecordedOverlay(t *testing.T) {
 	}
 
 	t.Run("recorded", func(t *testing.T) {
-		r := run(t, record(digest), "python3", "main.py")
+		r := run(t, record(digest))
 		for status, body := r.get(); !strings.Contains(body, "recorded"); status, body = r.get() {
 			if status != http.StatusServiceUnavailable {
 				t.Fatalf("recorded source: %d %s", status, body)
@@ -225,7 +249,7 @@ func TestBootStartsTheRecordedOverlay(t *testing.T) {
 		}
 	})
 	t.Run("not in the registry yet", func(t *testing.T) {
-		r := run(t, record("sha256:"+strings.Repeat("f", 64)), "python3", "main.py")
+		r := run(t, record("sha256:"+strings.Repeat("f", 64)))
 		if status, _ := r.get(); status != http.StatusServiceUnavailable {
 			t.Fatalf("without source: %d", status)
 		}
@@ -237,7 +261,7 @@ func TestBootStartsTheRecordedOverlay(t *testing.T) {
 		setup(t, "0", filepath.Join(t.TempDir(), "source"), record(tampered))
 		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 		defer cancel()
-		if err := Run(ctx, []string{"python3", "main.py"}); err == nil || !strings.Contains(err.Error(), "digest mismatch") {
+		if err := Run(ctx); err == nil || !strings.Contains(err.Error(), "digest mismatch") {
 			t.Fatalf("Run = %v", err)
 		}
 	})
