@@ -25,14 +25,12 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
-// app is a fake application whose reply names its source. It records its pid and makes a file of its own, as an
-// install would, and prints that it serves.
+// app is a fake application whose reply names its source. It records its pid and prints that it serves.
 func app(message string) string {
 	return `import json, os
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 open("pid", "w").write(str(os.getpid()))
-open("made", "w").write("")
 print("serving", flush=True)
 
 class Handler(BaseHTTPRequestHandler):
@@ -164,6 +162,9 @@ func TestReload(t *testing.T) {
 	if status, body := r.get(); status != http.StatusOK || body != `["first", "app.example", "session.example"]` {
 		t.Fatalf("first source: %d %s", status, body)
 	}
+	if err := os.WriteFile(filepath.Join(r.root, "made"), []byte("installed once"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	failing := `head -c 4999 /dev/zero | tr '\0' a; printf '\nno such package\n'; exit 3`
 	if status, body := r.reload(overlay(t, source(failing, "exec python3 main.py", app("unprepared")))); status != http.StatusInternalServerError ||
@@ -171,7 +172,7 @@ func TestReload(t *testing.T) {
 		t.Fatalf("failing install: %d %s", status, body)
 	}
 	if status, body := r.reload(overlay(t, source("echo installed", "exec python3 main.py", "raise SystemExit(4)"))); status != http.StatusInternalServerError ||
-		!strings.Contains(reply(body).Error, "exit status 4") || reply(body).Output != "" {
+		!strings.Contains(reply(body).Error, "exit status 4") || reply(body).Output != "installed\n" {
 		t.Fatalf("failing start: %d %s", status, body)
 	}
 	if status, _ := r.get(); status != http.StatusServiceUnavailable {
@@ -187,8 +188,8 @@ func TestReload(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(r.root, "old.py")); err == nil {
 		t.Fatal("what only an earlier overlay wrote is still there")
 	}
-	if _, err := os.Stat(filepath.Join(r.root, "made")); err != nil {
-		t.Fatal("what the app made is gone")
+	if data, err := os.ReadFile(filepath.Join(r.root, "made")); err != nil || string(data) != "installed once" {
+		t.Fatalf("installed files changed across reload and repair: %q, %v", data, err)
 	}
 	if logged, _ := os.ReadFile(log.Name()); !strings.Contains(string(logged), "serving") || strings.Contains(string(logged), "installed") {
 		t.Fatalf("log %q", logged)
