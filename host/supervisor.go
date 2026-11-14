@@ -1,6 +1,3 @@
-// Package host supervises a development app: it holds the app's port and restarts the app from the source holon-api
-// posts to it, so a save reaches the app without a new pod. Each source carries the protocol's PrepareFile and
-// StartFile, which the supervisor runs in turn.
 package host
 
 import (
@@ -19,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -37,6 +35,7 @@ type supervisor struct {
 	turn      chan struct{}
 	app       atomic.Pointer[child]
 	written   []string
+	installed runtimecontract.Install
 }
 
 // Run serves PORT and proxies it to the app, which it starts in the source directory with a loopback HOST and PORT of
@@ -132,14 +131,26 @@ func (s *supervisor) reload(w http.ResponseWriter, r *http.Request) {
 	writeReply(w, status, reply)
 }
 
-// launch prepares the app, starts it and waits, for as long as ctx lasts, until it accepts connections. It answers with
-// the status a reload replies with and, unless the app itself fails, the end of what preparing it printed.
 func (s *supervisor) launch(ctx context.Context) (int, runtimecontract.ReloadReply) {
 	var output tail
-	if err := s.prepare(ctx, &output); err != nil {
+	var plan runtimecontract.Plan
+	data, err := os.ReadFile(filepath.Join(s.root, runtimecontract.PlanFile))
+	if err == nil {
+		err = protocol.DecodeJSONStrict(data, &plan)
+	}
+	if err == nil && !reflect.DeepEqual(plan.Install, s.installed) {
+		s.installed = runtimecontract.Install{}
+		if err = s.run(ctx, plan.Install.Commands, &output); err == nil {
+			s.installed = plan.Install
+		}
+	}
+	if err == nil {
+		err = s.run(ctx, plan.Prepare, &output)
+	}
+	if err != nil {
 		return http.StatusInternalServerError, runtimecontract.ReloadReply{Error: "the install or build failed: " + err.Error(), Output: output.String()}
 	}
-	c, err := s.start()
+	c, err := s.start(plan.Start)
 	if err != nil {
 		return http.StatusInternalServerError, runtimecontract.ReloadReply{Error: err.Error()}
 	}
@@ -158,14 +169,29 @@ func (s *supervisor) launch(ctx context.Context) (int, runtimecontract.ReloadRep
 	return status, runtimecontract.ReloadReply{Output: output.String()}
 }
 
-// prepare runs PrepareFile in the source directory, writing what it prints to output instead of the app's log.
-func (s *supervisor) prepare(ctx context.Context, output io.Writer) error {
-	command := exec.CommandContext(ctx, "sh", runtimecontract.PrepareFile)
-	command.Dir, command.Env = s.root, append(os.Environ(), "PWD="+s.root)
-	command.Stdout, command.Stderr = output, output
+func (s *supervisor) run(ctx context.Context, commands [][]string, output io.Writer) error {
+	for _, argv := range commands {
+		command, err := s.command(ctx, argv)
+		if err != nil {
+			return err
+		}
+		command.Stdout, command.Stderr = output, output
+		if err := command.Run(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *supervisor) command(ctx context.Context, argv []string, env ...string) (*exec.Cmd, error) {
+	if len(argv) == 0 {
+		return nil, errors.New("the plan has an empty command")
+	}
+	command := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	command.Dir, command.Env = s.root, append(append(os.Environ(), "PWD="+s.root), env...)
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	command.Cancel = func() error { return syscall.Kill(-command.Process.Pid, syscall.SIGKILL) }
-	return command.Run()
+	return command, nil
 }
 
 func (s *supervisor) stop() {
@@ -183,17 +209,17 @@ type child struct {
 	done    chan struct{}
 }
 
-func (s *supervisor) start() (*child, error) {
+func (s *supervisor) start(argv []string) (*child, error) {
 	address, err := loopbackAddress()
 	if err != nil {
 		return nil, err
 	}
 	_, port, _ := net.SplitHostPort(address)
-	command := exec.Command("sh", runtimecontract.StartFile)
-	command.Dir = s.root
-	command.Env = append(os.Environ(), "PWD="+s.root, "HOST=127.0.0.1", "PORT="+port)
+	command, err := s.command(context.Background(), argv, "HOST=127.0.0.1", "PORT="+port)
+	if err != nil {
+		return nil, err
+	}
 	command.Stdout, command.Stderr = os.Stdout, os.Stderr
-	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := command.Start(); err != nil {
 		return nil, fmt.Errorf("start application: %w", err)
 	}
@@ -264,7 +290,6 @@ func writeReply(w http.ResponseWriter, status int, reply runtimecontract.ReloadR
 	_ = json.NewEncoder(w).Encode(reply)
 }
 
-// tailBytes bounds what a reload's reply carries of what preparing the app printed.
 const tailBytes = 4 << 10
 
 // tail keeps the end of what was written to it: at most tailBytes, from a line's start once it has dropped any.
