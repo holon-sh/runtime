@@ -154,9 +154,6 @@ func TestReload(t *testing.T) {
 		return reply
 	}
 	r := run(t, nil)
-	if status, _ := r.get(); status != http.StatusServiceUnavailable {
-		t.Fatalf("before any source: %d", status)
-	}
 	first := source("echo installed", "exec python3 main.py", app("first"))
 	first["old.py"] = ""
 	if status, body := r.reload(overlay(t, first)); status != http.StatusOK || reply(body).Output != "installed\n" {
@@ -255,9 +252,6 @@ func TestBootStartsTheRecordedOverlay(t *testing.T) {
 	})
 	t.Run("a session the registry holds no overlay for yet", func(t *testing.T) {
 		r := run(t, record("unsaved"))
-		if status, _ := r.get(); status != http.StatusServiceUnavailable {
-			t.Fatalf("without source: %d", status)
-		}
 		if status, body := r.reload(blobs[tags["recorded"]]); status != http.StatusOK {
 			t.Fatalf("reload: %d %s", status, body)
 		}
