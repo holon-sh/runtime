@@ -26,9 +26,10 @@ import (
 )
 
 // app is a fake application whose reply names its source. It records its pid and makes a file of its own, as an
-// install would, and prints that it serves.
+// install would, and prints that it serves. /held stays open until its client leaves. On SIGTERM it finishes any
+// request it serves, then makes a file named stopped and exits.
 func app(message string) string {
-	return `import json, os
+	return `import json, os, signal, threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 open("pid", "w").write(str(os.getpid()))
@@ -40,8 +41,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(json.dumps(["` + message + `", self.headers["Host"], self.headers["X-Forwarded-Host"]]).encode())
+        if self.path == "/held":
+            self.rfile.read()
 
-HTTPServer((os.environ["HOST"], int(os.environ["PORT"])), Handler).serve_forever()
+server = HTTPServer((os.environ["HOST"], int(os.environ["PORT"])), Handler)
+signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown).start())
+server.serve_forever(0.01)
+open("stopped", "w").write("")
 `
 }
 
@@ -164,11 +170,19 @@ func TestReload(t *testing.T) {
 	if status, body := r.get(); status != http.StatusOK || body != `["first", "app.example", "session.example"]` {
 		t.Fatalf("first source: %d %s", status, body)
 	}
+	held, err := http.Get(r.url + "/held")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = held.Body.Close() }()
 
 	failing := `head -c 4999 /dev/zero | tr '\0' a; printf '\nno such package\n'; exit 3`
 	if status, body := r.reload(overlay(t, source(failing, "exec python3 main.py", app("unprepared")))); status != http.StatusInternalServerError ||
 		!strings.Contains(reply(body).Error, "exit status 3") || reply(body).Output != "no such package\n" {
 		t.Fatalf("failing install: %d %s", status, body)
+	}
+	if _, err := os.Stat(filepath.Join(r.root, "stopped")); err != nil {
+		t.Fatal("the first app was killed while it served a request")
 	}
 	if status, body := r.reload(overlay(t, source("echo installed", "exec python3 main.py", "raise SystemExit(4)"))); status != http.StatusInternalServerError ||
 		!strings.Contains(reply(body).Error, "exit status 4") || reply(body).Output != "" {

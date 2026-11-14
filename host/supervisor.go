@@ -87,7 +87,10 @@ func (s *supervisor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Application restarting", http.StatusServiceUnavailable)
 		return
 	}
-	app.proxy.ServeHTTP(w, r)
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	defer context.AfterFunc(app.serving, cancel)()
+	app.proxy.ServeHTTP(w, r.WithContext(ctx))
 }
 
 // boot starts the app from the overlay the platform recorded. Without one, or while the registry does not hold it
@@ -172,14 +175,14 @@ func (s *supervisor) stop() {
 	if c := s.app.Swap(nil); c != nil {
 		c.stop()
 	}
-	// Connections to a previous child are dead, and a request that reuses one cannot always be retried.
-	s.transport.CloseIdleConnections()
 }
 
 type child struct {
 	command *exec.Cmd
 	address string
 	proxy   http.Handler
+	serving context.Context
+	end     context.CancelFunc
 	done    chan struct{}
 }
 
@@ -189,16 +192,20 @@ func (s *supervisor) start() (*child, error) {
 		return nil, err
 	}
 	_, port, _ := net.SplitHostPort(address)
-	command := exec.Command("sh", runtimecontract.StartFile)
+	serving, end := context.WithCancel(context.Background())
+	command := exec.CommandContext(serving, "sh", runtimecontract.StartFile)
 	command.Dir = s.root
 	command.Env = append(os.Environ(), "PWD="+s.root, "HOST=127.0.0.1", "PORT="+port)
 	command.Stdout, command.Stderr = os.Stdout, os.Stderr
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	command.Cancel = func() error { return syscall.Kill(-command.Process.Pid, syscall.SIGTERM) }
+	command.WaitDelay = 5 * time.Second
 	if err := command.Start(); err != nil {
+		end()
 		return nil, fmt.Errorf("start application: %w", err)
 	}
 	target := &url.URL{Scheme: "http", Host: address}
-	c := &child{command: command, address: address, done: make(chan struct{}), proxy: &httputil.ReverseProxy{
+	c := &child{command: command, address: address, serving: serving, end: end, done: make(chan struct{}), proxy: &httputil.ReverseProxy{
 		Rewrite: func(p *httputil.ProxyRequest) {
 			p.SetURL(target)
 			p.Out.Host = p.In.Host
@@ -236,16 +243,12 @@ func (c *child) ready(ctx context.Context) (int, string) {
 	}
 }
 
-// stop asks the app's process group to end, kills what remains of it after five seconds, and waits for the app.
+// stop ends the requests proxied to the app, asks the app's process group to end, kills what remains of it after five
+// seconds, and waits for the app.
 func (c *child) stop() {
-	group := -c.command.Process.Pid
-	_ = syscall.Kill(group, syscall.SIGTERM)
-	select {
-	case <-c.done:
-	case <-time.After(5 * time.Second):
-	}
-	_ = syscall.Kill(group, syscall.SIGKILL)
+	c.end()
 	<-c.done
+	_ = syscall.Kill(-c.command.Process.Pid, syscall.SIGKILL)
 }
 
 // loopbackAddress reserves a free loopback port for the app.
