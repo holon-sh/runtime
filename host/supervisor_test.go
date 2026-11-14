@@ -45,10 +45,9 @@ HTTPServer((os.environ["HOST"], int(os.environ["PORT"])), Handler).serve_forever
 `
 }
 
-func source(install, prepare, start, main string) map[string]string {
-	return map[string]string{
-		runtimecontract.InstallFile: install, runtimecontract.PrepareFile: prepare, runtimecontract.StartFile: start, "main.py": main,
-	}
+func source(install runtimecontract.Install, prepare [][]string, start []string, main string) map[string]string {
+	plan, _ := json.Marshal(runtimecontract.Plan{Install: install, Prepare: prepare, Start: start})
+	return map[string]string{runtimecontract.PlanFile: string(plan), "main.py": main}
 }
 
 func overlay(t *testing.T, files map[string]string) []byte {
@@ -161,8 +160,9 @@ func TestReload(t *testing.T) {
 	if status, _ := r.get(); status != http.StatusServiceUnavailable {
 		t.Fatalf("before any source: %d", status)
 	}
-	install := "echo once >>installs; echo installed"
-	first := source(install, "echo prepared", "exec python3 main.py", app("first"))
+	serve, prepare := []string{"python3", "main.py"}, [][]string{{"echo", "prepared"}}
+	install := runtimecontract.Install{Inputs: "sha256:one", Commands: [][]string{{"python3", "-c", `open("installs", "a").write("once\n")`}, {"echo", "installed"}}}
+	first := source(install, prepare, serve, app("first"))
 	first["old.py"] = ""
 	if status, body := r.reload(overlay(t, first)); status != http.StatusOK || reply(body).Output != "installed\nprepared\n" {
 		t.Fatalf("reload: %d %s", status, body)
@@ -170,19 +170,21 @@ func TestReload(t *testing.T) {
 	if status, body := r.get(); status != http.StatusOK || body != `["first", "app.example", "session.example"]` {
 		t.Fatalf("first source: %d %s", status, body)
 	}
-	if status, body := r.reload(overlay(t, source(install, "echo prepared", "exec python3 main.py", app("first")))); status != http.StatusOK ||
+	if status, body := r.reload(overlay(t, source(install, prepare, serve, app("first")))); status != http.StatusOK ||
 		reply(body).Output != "prepared\n" {
 		t.Fatalf("unchanged install: %d %s", status, body)
 	}
 
-	failing := `echo failed >>installs; head -c 4999 /dev/zero | tr '\0' a; printf '\nno such package\n'; exit 3`
+	failing := runtimecontract.Install{Inputs: "sha256:two", Commands: [][]string{
+		{"python3", "-c", `open("installs", "a").write("failed\n"); print("a" * 4999); print("no such package"); raise SystemExit(3)`}, {"echo", "after"},
+	}}
 	for range 2 {
-		if status, body := r.reload(overlay(t, source(failing, "", "exec python3 main.py", app("uninstalled")))); status != http.StatusInternalServerError ||
+		if status, body := r.reload(overlay(t, source(failing, nil, serve, app("uninstalled")))); status != http.StatusInternalServerError ||
 			!strings.Contains(reply(body).Error, "exit status 3") || reply(body).Output != "no such package\n" {
 			t.Fatalf("failing install: %d %s", status, body)
 		}
 	}
-	if status, body := r.reload(overlay(t, source(install, "", "exec python3 main.py", "raise SystemExit(4)"))); status != http.StatusInternalServerError ||
+	if status, body := r.reload(overlay(t, source(install, nil, serve, "raise SystemExit(4)"))); status != http.StatusInternalServerError ||
 		!strings.Contains(reply(body).Error, "exit status 4") || reply(body).Output != "" || installs() != "once\nfailed\nfailed\nonce\n" {
 		t.Fatalf("failing start after a failing install: %d %s, installs %q", status, body, installs())
 	}
@@ -190,7 +192,7 @@ func TestReload(t *testing.T) {
 		t.Fatalf("after a failing reload: %d", status)
 	}
 
-	if status, body := r.reload(overlay(t, source("", "", "exec python3 main.py", app("second")))); status != http.StatusOK {
+	if status, body := r.reload(overlay(t, source(runtimecontract.Install{}, nil, serve, app("second")))); status != http.StatusOK {
 		t.Fatalf("reload: %d %s", status, body)
 	}
 	if _, body := r.get(); !strings.Contains(body, "second") {
@@ -216,10 +218,10 @@ func TestReload(t *testing.T) {
 
 func TestReloadStopsEverythingTheCommandStarted(t *testing.T) {
 	r := run(t, nil)
-	r.reload(overlay(t, source("", "", "python3 main.py; true", app("first"))))
+	r.reload(overlay(t, source(runtimecontract.Install{}, nil, []string{"sh", "-c", "python3 main.py; true"}, app("first"))))
 	data, _ := os.ReadFile(filepath.Join(r.root, "pid"))
 	pid, _ := strconv.Atoi(string(data))
-	if status, _ := r.reload(overlay(t, source("", "", "python3 main.py; true", app("second")))); status != http.StatusOK {
+	if status, _ := r.reload(overlay(t, source(runtimecontract.Install{}, nil, []string{"sh", "-c", "python3 main.py; true"}, app("second")))); status != http.StatusOK {
 		t.Fatalf("reload: %d", status)
 	}
 	if syscall.Kill(pid, 0) == nil {
@@ -228,7 +230,7 @@ func TestReloadStopsEverythingTheCommandStarted(t *testing.T) {
 }
 
 func TestBootStartsTheRecordedOverlay(t *testing.T) {
-	blob := overlay(t, source("", "", "exec python3 main.py", app("recorded")))
+	blob := overlay(t, source(runtimecontract.Install{}, nil, []string{"python3", "main.py"}, app("recorded")))
 	sum := sha256.Sum256(blob)
 	digest := "sha256:" + hex.EncodeToString(sum[:])
 	tampered := "sha256:" + strings.Repeat("0", 64)
