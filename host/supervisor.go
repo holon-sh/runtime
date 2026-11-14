@@ -233,9 +233,15 @@ func (c *child) ready(ctx context.Context) (int, string) {
 	}
 }
 
-// stop kills the app's process group and waits for the app.
+// stop asks the app's process group to end, kills what remains of it after five seconds, and waits for the app.
 func (c *child) stop() {
-	_ = syscall.Kill(-c.command.Process.Pid, syscall.SIGKILL)
+	group := -c.command.Process.Pid
+	_ = syscall.Kill(group, syscall.SIGTERM)
+	select {
+	case <-c.done:
+	case <-time.After(5 * time.Second):
+	}
+	_ = syscall.Kill(group, syscall.SIGKILL)
 	<-c.done
 }
 
