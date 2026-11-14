@@ -98,7 +98,7 @@ func (s *supervisor) boot(ctx context.Context) error {
 		return nil
 	}
 	var record runtimecontract.OverlayRecord
-	if protocol.DecodeJSONNonNull(recorded, &record) != nil || record.Blob() == nil {
+	if protocol.DecodeJSONNonNull(recorded, &record) != nil || record.Location() == nil {
 		return errors.New("invalid " + runtimecontract.OverlayFileEnv)
 	}
 	s.turn <- struct{}{}

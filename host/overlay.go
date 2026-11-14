@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -18,31 +19,53 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
-// fetch unpacks the recorded overlay, and reports false while the registry does not hold it yet. Nothing runs from
-// the source until its digest has matched.
+// fetch unpacks the overlay that OverlayTag names in the recorded repository, and reports false while the registry
+// holds none yet. Nothing runs from the source until its digest has matched.
 func (s *supervisor) fetch(ctx context.Context, record runtimecontract.OverlayRecord) (bool, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, record.Blob().String(), nil)
-	if err != nil {
+	var manifest struct {
+		Layers []struct{ Digest string } `json:"layers"`
+	}
+	tagged, err := s.get(ctx, record, "manifests", runtimecontract.OverlayTag)
+	if tagged == nil {
 		return false, err
 	}
-	request.Header.Set(protocol.HeaderAuthorization, protocol.BearerPrefix+record.Token)
-	response, err := (&http.Client{Transport: s.transport}).Do(request)
-	if err != nil {
-		return false, errors.New("registry unavailable")
+	err = json.NewDecoder(tagged.Body).Decode(&manifest)
+	_ = tagged.Body.Close()
+	if err != nil || len(manifest.Layers) == 0 {
+		return false, errors.New("the tag names no overlay")
 	}
-	defer func() { _ = response.Body.Close() }()
-	switch response.StatusCode {
-	case http.StatusOK:
-	case http.StatusNotFound:
-		return false, nil
-	default:
-		return false, fmt.Errorf("registry answered %d", response.StatusCode)
+	blob, err := s.get(ctx, record, "blobs", manifest.Layers[0].Digest)
+	if blob == nil {
+		return false, err
 	}
-	digest, err := s.unpack(response.Body)
-	if err == nil && digest != record.Digest {
+	defer func() { _ = blob.Body.Close() }()
+	digest, err := s.unpack(blob.Body)
+	if err == nil && digest != manifest.Layers[0].Digest {
 		err = errors.New("digest mismatch")
 	}
 	return err == nil, err
+}
+
+// get reads a manifest or blob of the recorded repository. It answers nil for one the registry does not hold.
+func (s *supervisor) get(ctx context.Context, record runtimecontract.OverlayRecord, kind, reference string) (*http.Response, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, record.Location().JoinPath(kind, reference).String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set(protocol.HeaderAuthorization, protocol.BearerPrefix+record.Token)
+	request.Header.Set("Accept", "application/vnd.oci.image.manifest.v1+json")
+	response, err := (&http.Client{Transport: s.transport}).Do(request)
+	if err != nil {
+		return nil, errors.New("registry unavailable")
+	}
+	if response.StatusCode == http.StatusOK {
+		return response, nil
+	}
+	_ = response.Body.Close()
+	if response.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+	return nil, fmt.Errorf("registry answered %d", response.StatusCode)
 }
 
 // unpack removes what the previous overlay wrote, keeping what the app made beside it, such as its installed

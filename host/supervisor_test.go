@@ -220,27 +220,32 @@ func TestBootStartsTheRecordedOverlay(t *testing.T) {
 	sum := sha256.Sum256(blob)
 	digest := "sha256:" + hex.EncodeToString(sum[:])
 	tampered := "sha256:" + strings.Repeat("0", 64)
+	tagged := func(layer string) string {
+		return `{"layers":[{"mediaType":"` + runtimecontract.OverlayMediaType + `","digest":"` + layer + `"}]}`
+	}
 	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer pull" {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
 		switch r.URL.Path {
-		case "/v2/holon/app/blobs/" + digest, "/v2/holon/app/blobs/" + tampered:
+		case "/v2/holon/app/manifests/" + runtimecontract.OverlayTag:
+			_, _ = io.WriteString(w, tagged(digest))
+		case "/v2/holon/tampered/manifests/" + runtimecontract.OverlayTag:
+			_, _ = io.WriteString(w, tagged(tampered))
+		case "/v2/holon/app/blobs/" + digest, "/v2/holon/tampered/blobs/" + tampered:
 			_, _ = w.Write(blob)
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	t.Cleanup(registry.Close)
-	record := func(digest string) *runtimecontract.OverlayRecord {
-		return &runtimecontract.OverlayRecord{
-			Registry: registry.URL, Repository: "holon/app", Token: "pull", Digest: digest, MediaType: runtimecontract.OverlayMediaType,
-		}
+	record := func(repository string) *runtimecontract.OverlayRecord {
+		return &runtimecontract.OverlayRecord{Registry: registry.URL, Repository: repository, Token: "pull"}
 	}
 
 	t.Run("recorded", func(t *testing.T) {
-		r := run(t, record(digest))
+		r := run(t, record("holon/app"))
 		for status, body := r.get(); !strings.Contains(body, "recorded"); status, body = r.get() {
 			if status != http.StatusServiceUnavailable {
 				t.Fatalf("recorded source: %d %s", status, body)
@@ -249,7 +254,7 @@ func TestBootStartsTheRecordedOverlay(t *testing.T) {
 		}
 	})
 	t.Run("not in the registry yet", func(t *testing.T) {
-		r := run(t, record("sha256:"+strings.Repeat("f", 64)))
+		r := run(t, record("holon/unsaved"))
 		if status, _ := r.get(); status != http.StatusServiceUnavailable {
 			t.Fatalf("without source: %d", status)
 		}
@@ -258,7 +263,7 @@ func TestBootStartsTheRecordedOverlay(t *testing.T) {
 		}
 	})
 	t.Run("digest mismatch", func(t *testing.T) {
-		setup(t, "0", filepath.Join(t.TempDir(), "source"), record(tampered))
+		setup(t, "0", filepath.Join(t.TempDir(), "source"), record("holon/tampered"))
 		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 		defer cancel()
 		if err := Run(ctx); err == nil || !strings.Contains(err.Error(), "digest mismatch") {
