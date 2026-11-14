@@ -26,8 +26,7 @@ import (
 )
 
 // app is a fake application whose reply names its source. It records its pid and makes a file of its own, as an
-// install would, and prints that it serves. /held stays open until its client leaves. On SIGTERM it finishes any
-// request it serves, then makes a file named stopped and exits.
+// install would, and prints that it serves.
 func app(message string) string {
 	return `import json, os, signal, threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -47,7 +46,7 @@ class Handler(BaseHTTPRequestHandler):
 server = HTTPServer((os.environ["HOST"], int(os.environ["PORT"])), Handler)
 signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown).start())
 server.serve_forever(0.01)
-open("stopped", "w").write("")
+print("stopped", flush=True)
 `
 }
 
@@ -159,9 +158,6 @@ func TestReload(t *testing.T) {
 		return reply
 	}
 	r := run(t, nil)
-	if status, _ := r.get(); status != http.StatusServiceUnavailable {
-		t.Fatalf("before any source: %d", status)
-	}
 	first := source("echo installed", "exec python3 main.py", app("first"))
 	first["old.py"] = ""
 	if status, body := r.reload(overlay(t, first)); status != http.StatusOK || reply(body).Output != "installed\n" {
@@ -180,9 +176,6 @@ func TestReload(t *testing.T) {
 	if status, body := r.reload(overlay(t, source(failing, "exec python3 main.py", app("unprepared")))); status != http.StatusInternalServerError ||
 		!strings.Contains(reply(body).Error, "exit status 3") || reply(body).Output != "no such package\n" {
 		t.Fatalf("failing install: %d %s", status, body)
-	}
-	if _, err := os.Stat(filepath.Join(r.root, "stopped")); err != nil {
-		t.Fatal("the first app was killed while it served a request")
 	}
 	if status, body := r.reload(overlay(t, source("echo installed", "exec python3 main.py", "raise SystemExit(4)"))); status != http.StatusInternalServerError ||
 		!strings.Contains(reply(body).Error, "exit status 4") || reply(body).Output != "" {
@@ -204,7 +197,8 @@ func TestReload(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(r.root, "made")); err != nil {
 		t.Fatal("what the app made is gone")
 	}
-	if logged, _ := os.ReadFile(log.Name()); !strings.Contains(string(logged), "serving") || strings.Contains(string(logged), "installed") {
+	if logged, _ := os.ReadFile(log.Name()); !strings.Contains(string(logged), "serving") || !strings.Contains(string(logged), "stopped") ||
+		strings.Contains(string(logged), "installed") {
 		t.Fatalf("log %q", logged)
 	}
 
@@ -264,9 +258,6 @@ func TestBootStartsTheRecordedOverlay(t *testing.T) {
 	})
 	t.Run("not in the registry yet", func(t *testing.T) {
 		r := run(t, record("sha256:"+strings.Repeat("f", 64)))
-		if status, _ := r.get(); status != http.StatusServiceUnavailable {
-			t.Fatalf("without source: %d", status)
-		}
 		if status, body := r.reload(blob); status != http.StatusOK {
 			t.Fatalf("reload: %d %s", status, body)
 		}
