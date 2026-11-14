@@ -45,7 +45,6 @@ HTTPServer((os.environ["HOST"], int(os.environ["PORT"])), Handler).serve_forever
 `
 }
 
-// source is an app's files with the scripts that install, prepare and start it.
 func source(install, prepare, start, main string) map[string]string {
 	return map[string]string{
 		runtimecontract.InstallFile: install, runtimecontract.PrepareFile: prepare, runtimecontract.StartFile: start, "main.py": main,
