@@ -19,7 +19,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -137,7 +136,7 @@ func (s *supervisor) reload(w http.ResponseWriter, r *http.Request) {
 func (s *supervisor) launch(ctx context.Context) (int, runtimecontract.ReloadReply) {
 	var output tail
 	if err := s.prepare(ctx, &output); err != nil {
-		return http.StatusInternalServerError, runtimecontract.ReloadReply{Error: "the install or build failed: " + err.Error(), Output: output.String()}
+		return http.StatusInternalServerError, runtimecontract.ReloadReply{Error: "the install or build failed: " + err.Error(), Output: string(output)}
 	}
 	c, err := s.start()
 	if err != nil {
@@ -155,7 +154,7 @@ func (s *supervisor) launch(ctx context.Context) (int, runtimecontract.ReloadRep
 			fmt.Fprintln(os.Stderr, "application exited:", c.command.ProcessState)
 		}
 	}()
-	return status, runtimecontract.ReloadReply{Output: output.String()}
+	return status, runtimecontract.ReloadReply{Output: string(output)}
 }
 
 // prepare runs PrepareFile in the source directory, writing what it prints to output instead of the app's log.
@@ -172,8 +171,6 @@ func (s *supervisor) stop() {
 	if c := s.app.Swap(nil); c != nil {
 		c.stop()
 	}
-	// Connections to a previous child are dead, and a request that reuses one cannot always be retried.
-	s.transport.CloseIdleConnections()
 }
 
 type child struct {
@@ -268,26 +265,15 @@ func writeReply(w http.ResponseWriter, status int, reply runtimecontract.ReloadR
 const tailBytes = 4 << 10
 
 // tail keeps the end of what was written to it: at most tailBytes, from a line's start once it has dropped any.
-type tail struct {
-	mu   sync.Mutex
-	data []byte
-}
+type tail []byte
 
 func (t *tail) Write(p []byte) (int, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.data = append(t.data, p...)
-	if extra := len(t.data) - tailBytes; extra > 0 {
-		t.data = t.data[extra:]
-		if _, rest, found := bytes.Cut(t.data, []byte("\n")); found {
-			t.data = rest
+	*t = append(*t, p...)
+	if extra := len(*t) - tailBytes; extra > 0 {
+		*t = (*t)[extra:]
+		if _, rest, found := bytes.Cut(*t, []byte("\n")); found {
+			*t = rest
 		}
 	}
 	return len(p), nil
-}
-
-func (t *tail) String() string {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return string(t.data)
 }
