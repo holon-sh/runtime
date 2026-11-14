@@ -2,5 +2,7 @@ github.com/holon-sh/protocol v0.0.1-dev.15 h1:GrEi0MnbBo327J2CLJAiEeYypWeM+BAW77
 github.com/holon-sh/protocol v0.0.1-dev.15/go.mod h1:evk5shdLw43mGrC3s5hg1HLXc1CbieOYRccFy5NgRVI=
 github.com/holon-sh/protocol v0.0.1-dev.16.0.20261114064246-321fbfba801c h1:XKT93REE0IsysdKQPVAQw36vH5wgp2rnJhcbTS6BUqs=
 github.com/holon-sh/protocol v0.0.1-dev.16.0.20261114064246-321fbfba801c/go.mod h1:evk5shdLw43mGrC3s5hg1HLXc1CbieOYRccFy5NgRVI=
+github.com/holon-sh/protocol v0.0.1-dev.16.0.20261114143822-51baa07fcef1 h1:uTmHm8S9EwdKCWIFlovEfZdf9a9mKUD0Avo1wstpakU=
+github.com/holon-sh/protocol v0.0.1-dev.16.0.20261114143822-51baa07fcef1/go.mod h1:evk5shdLw43mGrC3s5hg1HLXc1CbieOYRccFy5NgRVI=
 github.com/klauspost/compress v1.19.2 h1:hMRETovs/pu/dVWN7zIT1PGG8t509MwT6bO7XSi26R8=
 github.com/klauspost/compress v1.19.2/go.mod h1:cwPg85FWrGar70rWktvGQj8/hthj3wpl0PGDogxkrSQ=

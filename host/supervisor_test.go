@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -216,36 +217,35 @@ func TestReloadStopsEverythingTheCommandStarted(t *testing.T) {
 }
 
 func TestBootStartsTheRecordedOverlay(t *testing.T) {
-	blob := overlay(t, source("", "exec python3 main.py", app("recorded")))
-	sum := sha256.Sum256(blob)
-	digest := "sha256:" + hex.EncodeToString(sum[:])
-	tampered := "sha256:" + strings.Repeat("0", 64)
-	tagged := func(layer string) string {
-		return `{"layers":[{"mediaType":"` + runtimecontract.OverlayMediaType + `","digest":"` + layer + `"}]}`
+	blobs := map[string][]byte{}
+	tags := map[string]string{"tampered": "sha256:" + strings.Repeat("0", 64), "malformed": "sha256:../../other"}
+	for session, message := range map[string]string{"recorded": "recorded", "other": "another session's"} {
+		blob := overlay(t, source("", "exec python3 main.py", app(message)))
+		sum := sha256.Sum256(blob)
+		tags[session] = "sha256:" + hex.EncodeToString(sum[:])
+		blobs[tags[session]] = blob
 	}
+	blobs[tags["tampered"]] = blobs[tags["recorded"]]
 	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Bearer pull" {
+		kind, reference := path.Split(strings.TrimPrefix(r.URL.Path, "/v2/holon/app/"))
+		switch {
+		case r.Header.Get("Authorization") != "Bearer pull":
 			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-		switch r.URL.Path {
-		case "/v2/holon/app/manifests/" + runtimecontract.OverlayTag:
-			_, _ = io.WriteString(w, tagged(digest))
-		case "/v2/holon/tampered/manifests/" + runtimecontract.OverlayTag:
-			_, _ = io.WriteString(w, tagged(tampered))
-		case "/v2/holon/app/blobs/" + digest, "/v2/holon/tampered/blobs/" + tampered:
-			_, _ = w.Write(blob)
+		case kind == "manifests/" && tags[reference] != "":
+			_, _ = io.WriteString(w, `{"layers":[{"mediaType":"`+runtimecontract.OverlayMediaType+`","digest":"`+tags[reference]+`"}]}`)
+		case kind == "blobs/" && blobs[reference] != nil:
+			_, _ = w.Write(blobs[reference])
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	t.Cleanup(registry.Close)
-	record := func(repository string) *runtimecontract.OverlayRecord {
-		return &runtimecontract.OverlayRecord{Registry: registry.URL, Repository: repository, Token: "pull"}
+	record := func(session string) *runtimecontract.OverlayRecord {
+		return &runtimecontract.OverlayRecord{Registry: registry.URL, Repository: "holon/app", Tag: session, Token: "pull"}
 	}
 
-	t.Run("recorded", func(t *testing.T) {
-		r := run(t, record("holon/app"))
+	t.Run("its session's tag, not another session's", func(t *testing.T) {
+		r := run(t, record("recorded"))
 		for status, body := r.get(); !strings.Contains(body, "recorded"); status, body = r.get() {
 			if status != http.StatusServiceUnavailable {
 				t.Fatalf("recorded source: %d %s", status, body)
@@ -253,21 +253,23 @@ func TestBootStartsTheRecordedOverlay(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 		}
 	})
-	t.Run("not in the registry yet", func(t *testing.T) {
-		r := run(t, record("holon/unsaved"))
+	t.Run("a session the registry holds no overlay for yet", func(t *testing.T) {
+		r := run(t, record("unsaved"))
 		if status, _ := r.get(); status != http.StatusServiceUnavailable {
 			t.Fatalf("without source: %d", status)
 		}
-		if status, body := r.reload(blob); status != http.StatusOK {
+		if status, body := r.reload(blobs[tags["recorded"]]); status != http.StatusOK {
 			t.Fatalf("reload: %d %s", status, body)
 		}
 	})
-	t.Run("digest mismatch", func(t *testing.T) {
-		setup(t, "0", filepath.Join(t.TempDir(), "source"), record("holon/tampered"))
-		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-		defer cancel()
-		if err := Run(ctx); err == nil || !strings.Contains(err.Error(), "digest mismatch") {
-			t.Fatalf("Run = %v", err)
-		}
-	})
+	for session, want := range map[string]string{"tampered": "digest mismatch", "malformed": "the tag names no overlay"} {
+		t.Run(session, func(t *testing.T) {
+			setup(t, "0", filepath.Join(t.TempDir(), "source"), record(session))
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			if err := Run(ctx); err == nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("Run = %v", err)
+			}
+		})
+	}
 }

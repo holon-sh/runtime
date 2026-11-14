@@ -19,19 +19,19 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
-// fetch unpacks the overlay that OverlayTag names in the recorded repository, and reports false while the registry
-// holds none yet. Nothing runs from the source until its digest has matched.
+// fetch unpacks the overlay that the record's tag names, and reports false while the registry holds none yet. Nothing
+// runs from the source until its digest has matched.
 func (s *supervisor) fetch(ctx context.Context, record runtimecontract.OverlayRecord) (bool, error) {
 	var manifest struct {
 		Layers []struct{ Digest string } `json:"layers"`
 	}
-	tagged, err := s.get(ctx, record, "manifests", runtimecontract.OverlayTag)
+	tagged, err := s.get(ctx, record, "manifests", record.Tag)
 	if tagged == nil {
 		return false, err
 	}
 	err = json.NewDecoder(tagged.Body).Decode(&manifest)
 	_ = tagged.Body.Close()
-	if err != nil || len(manifest.Layers) == 0 {
+	if err != nil || len(manifest.Layers) == 0 || !protocol.ValidDigest(manifest.Layers[0].Digest) {
 		return false, errors.New("the tag names no overlay")
 	}
 	blob, err := s.get(ctx, record, "blobs", manifest.Layers[0].Digest)
