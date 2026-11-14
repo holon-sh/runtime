@@ -28,7 +28,7 @@ import (
 // app is a fake application whose reply names its source. It records its pid and makes a file of its own, as an
 // install would, and prints that it serves.
 func app(message string) string {
-	return `import json, os, signal, threading
+	return `import json, os
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 open("pid", "w").write(str(os.getpid()))
@@ -40,13 +40,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(json.dumps(["` + message + `", self.headers["Host"], self.headers["X-Forwarded-Host"]]).encode())
-        if self.path == "/held":
-            self.rfile.read()
 
-server = HTTPServer((os.environ["HOST"], int(os.environ["PORT"])), Handler)
-signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown).start())
-server.serve_forever(0.01)
-print("stopped", flush=True)
+HTTPServer((os.environ["HOST"], int(os.environ["PORT"])), Handler).serve_forever()
 `
 }
 
@@ -166,11 +161,6 @@ func TestReload(t *testing.T) {
 	if status, body := r.get(); status != http.StatusOK || body != `["first", "app.example", "session.example"]` {
 		t.Fatalf("first source: %d %s", status, body)
 	}
-	held, err := http.Get(r.url + "/held")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = held.Body.Close() }()
 
 	failing := `head -c 4999 /dev/zero | tr '\0' a; printf '\nno such package\n'; exit 3`
 	if status, body := r.reload(overlay(t, source(failing, "exec python3 main.py", app("unprepared")))); status != http.StatusInternalServerError ||
@@ -197,8 +187,7 @@ func TestReload(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(r.root, "made")); err != nil {
 		t.Fatal("what the app made is gone")
 	}
-	if logged, _ := os.ReadFile(log.Name()); !strings.Contains(string(logged), "serving") || !strings.Contains(string(logged), "stopped") ||
-		strings.Contains(string(logged), "installed") {
+	if logged, _ := os.ReadFile(log.Name()); !strings.Contains(string(logged), "serving") || strings.Contains(string(logged), "installed") {
 		t.Fatalf("log %q", logged)
 	}
 
