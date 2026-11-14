@@ -45,9 +45,11 @@ HTTPServer((os.environ["HOST"], int(os.environ["PORT"])), Handler).serve_forever
 `
 }
 
-// source is an app's files with the scripts that prepare and start it.
-func source(prepare, start, main string) map[string]string {
-	return map[string]string{runtimecontract.PrepareFile: prepare, runtimecontract.StartFile: start, "main.py": main}
+// source is an app's files with the scripts that install, prepare and start it.
+func source(install, prepare, start, main string) map[string]string {
+	return map[string]string{
+		runtimecontract.InstallFile: install, runtimecontract.PrepareFile: prepare, runtimecontract.StartFile: start, "main.py": main,
+	}
 }
 
 func overlay(t *testing.T, files map[string]string) []byte {
@@ -153,32 +155,43 @@ func TestReload(t *testing.T) {
 		return reply
 	}
 	r := run(t, nil)
+	installs := func() string {
+		data, _ := os.ReadFile(filepath.Join(r.root, "installs"))
+		return string(data)
+	}
 	if status, _ := r.get(); status != http.StatusServiceUnavailable {
 		t.Fatalf("before any source: %d", status)
 	}
-	first := source("echo installed", "exec python3 main.py", app("first"))
+	install := "echo once >>installs; echo installed"
+	first := source(install, "echo prepared", "exec python3 main.py", app("first"))
 	first["old.py"] = ""
-	if status, body := r.reload(overlay(t, first)); status != http.StatusOK || reply(body).Output != "installed\n" {
+	if status, body := r.reload(overlay(t, first)); status != http.StatusOK || reply(body).Output != "installed\nprepared\n" {
 		t.Fatalf("reload: %d %s", status, body)
 	}
 	if status, body := r.get(); status != http.StatusOK || body != `["first", "app.example", "session.example"]` {
 		t.Fatalf("first source: %d %s", status, body)
 	}
-
-	failing := `head -c 4999 /dev/zero | tr '\0' a; printf '\nno such package\n'; exit 3`
-	if status, body := r.reload(overlay(t, source(failing, "exec python3 main.py", app("unprepared")))); status != http.StatusInternalServerError ||
-		!strings.Contains(reply(body).Error, "exit status 3") || reply(body).Output != "no such package\n" {
-		t.Fatalf("failing install: %d %s", status, body)
+	if status, body := r.reload(overlay(t, source(install, "echo prepared", "exec python3 main.py", app("first")))); status != http.StatusOK ||
+		reply(body).Output != "prepared\n" {
+		t.Fatalf("unchanged install: %d %s", status, body)
 	}
-	if status, body := r.reload(overlay(t, source("echo installed", "exec python3 main.py", "raise SystemExit(4)"))); status != http.StatusInternalServerError ||
-		!strings.Contains(reply(body).Error, "exit status 4") || reply(body).Output != "" {
-		t.Fatalf("failing start: %d %s", status, body)
+
+	failing := `echo failed >>installs; head -c 4999 /dev/zero | tr '\0' a; printf '\nno such package\n'; exit 3`
+	for range 2 {
+		if status, body := r.reload(overlay(t, source(failing, "", "exec python3 main.py", app("uninstalled")))); status != http.StatusInternalServerError ||
+			!strings.Contains(reply(body).Error, "exit status 3") || reply(body).Output != "no such package\n" {
+			t.Fatalf("failing install: %d %s", status, body)
+		}
+	}
+	if status, body := r.reload(overlay(t, source(install, "", "exec python3 main.py", "raise SystemExit(4)"))); status != http.StatusInternalServerError ||
+		!strings.Contains(reply(body).Error, "exit status 4") || reply(body).Output != "" || installs() != "once\nfailed\nfailed\nonce\n" {
+		t.Fatalf("failing start after a failing install: %d %s, installs %q", status, body, installs())
 	}
 	if status, _ := r.get(); status != http.StatusServiceUnavailable {
 		t.Fatalf("after a failing reload: %d", status)
 	}
 
-	if status, body := r.reload(overlay(t, source("", "exec python3 main.py", app("second")))); status != http.StatusOK {
+	if status, body := r.reload(overlay(t, source("", "", "exec python3 main.py", app("second")))); status != http.StatusOK {
 		t.Fatalf("reload: %d %s", status, body)
 	}
 	if _, body := r.get(); !strings.Contains(body, "second") {
@@ -204,10 +217,10 @@ func TestReload(t *testing.T) {
 
 func TestReloadStopsEverythingTheCommandStarted(t *testing.T) {
 	r := run(t, nil)
-	r.reload(overlay(t, source("", "python3 main.py; true", app("first"))))
+	r.reload(overlay(t, source("", "", "python3 main.py; true", app("first"))))
 	data, _ := os.ReadFile(filepath.Join(r.root, "pid"))
 	pid, _ := strconv.Atoi(string(data))
-	if status, _ := r.reload(overlay(t, source("", "python3 main.py; true", app("second")))); status != http.StatusOK {
+	if status, _ := r.reload(overlay(t, source("", "", "python3 main.py; true", app("second")))); status != http.StatusOK {
 		t.Fatalf("reload: %d", status)
 	}
 	if syscall.Kill(pid, 0) == nil {
@@ -216,7 +229,7 @@ func TestReloadStopsEverythingTheCommandStarted(t *testing.T) {
 }
 
 func TestBootStartsTheRecordedOverlay(t *testing.T) {
-	blob := overlay(t, source("", "exec python3 main.py", app("recorded")))
+	blob := overlay(t, source("", "", "exec python3 main.py", app("recorded")))
 	sum := sha256.Sum256(blob)
 	digest := "sha256:" + hex.EncodeToString(sum[:])
 	tampered := "sha256:" + strings.Repeat("0", 64)

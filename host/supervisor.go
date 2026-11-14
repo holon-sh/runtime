@@ -1,6 +1,6 @@
 // Package host supervises a development app: it holds the app's port and restarts the app from the source holon-api
-// posts to it, so a save reaches the app without a new pod. Each source carries the protocol's PrepareFile and
-// StartFile, which the supervisor runs in turn.
+// posts to it, so a save reaches the app without a new pod. Each source carries the protocol's InstallFile, PrepareFile
+// and StartFile, which the supervisor runs in turn.
 package host
 
 import (
@@ -37,6 +37,7 @@ type supervisor struct {
 	turn      chan struct{}
 	app       atomic.Pointer[child]
 	written   []string
+	installed []byte
 }
 
 // Run serves PORT and proxies it to the app, which it starts in the source directory with a loopback HOST and PORT of
@@ -132,11 +133,22 @@ func (s *supervisor) reload(w http.ResponseWriter, r *http.Request) {
 	writeReply(w, status, reply)
 }
 
-// launch prepares the app, starts it and waits, for as long as ctx lasts, until it accepts connections. It answers with
-// the status a reload replies with and, unless the app itself fails, the end of what preparing it printed.
+// launch installs what the app depends on unless the last InstallFile it ran had the same bytes and succeeded, prepares
+// the app, starts it and waits, for as long as ctx lasts, until it accepts connections. It answers with the status a reload replies
+// with and, unless the app itself fails, the end of what installing and preparing it printed.
 func (s *supervisor) launch(ctx context.Context) (int, runtimecontract.ReloadReply) {
 	var output tail
-	if err := s.prepare(ctx, &output); err != nil {
+	install, err := os.ReadFile(filepath.Join(s.root, runtimecontract.InstallFile))
+	if err == nil && !bytes.Equal(install, s.installed) {
+		s.installed = nil
+		if err = s.run(ctx, runtimecontract.InstallFile, &output); err == nil {
+			s.installed = install
+		}
+	}
+	if err == nil {
+		err = s.run(ctx, runtimecontract.PrepareFile, &output)
+	}
+	if err != nil {
 		return http.StatusInternalServerError, runtimecontract.ReloadReply{Error: "the install or build failed: " + err.Error(), Output: output.String()}
 	}
 	c, err := s.start()
@@ -158,9 +170,9 @@ func (s *supervisor) launch(ctx context.Context) (int, runtimecontract.ReloadRep
 	return status, runtimecontract.ReloadReply{Output: output.String()}
 }
 
-// prepare runs PrepareFile in the source directory, writing what it prints to output instead of the app's log.
-func (s *supervisor) prepare(ctx context.Context, output io.Writer) error {
-	command := exec.CommandContext(ctx, "sh", runtimecontract.PrepareFile)
+// run runs the script name in the source directory, writing what it prints to output instead of the app's log.
+func (s *supervisor) run(ctx context.Context, name string, output io.Writer) error {
+	command := exec.CommandContext(ctx, "sh", name)
 	command.Dir, command.Env = s.root, append(os.Environ(), "PWD="+s.root)
 	command.Stdout, command.Stderr = output, output
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -264,7 +276,7 @@ func writeReply(w http.ResponseWriter, status int, reply runtimecontract.ReloadR
 	_ = json.NewEncoder(w).Encode(reply)
 }
 
-// tailBytes bounds what a reload's reply carries of what preparing the app printed.
+// tailBytes bounds what a reload's reply carries of what installing and preparing the app printed.
 const tailBytes = 4 << 10
 
 // tail keeps the end of what was written to it: at most tailBytes, from a line's start once it has dropped any.
