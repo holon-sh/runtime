@@ -19,8 +19,6 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
-// fetch unpacks the overlay that the record's tag names, and reports false while the registry holds none yet. Nothing
-// runs from the source until its digest has matched.
 func (s *supervisor) fetch(ctx context.Context, record runtimecontract.OverlayRecord) (bool, error) {
 	var manifest struct {
 		Layers []struct{ Digest string } `json:"layers"`
@@ -46,7 +44,6 @@ func (s *supervisor) fetch(ctx context.Context, record runtimecontract.OverlayRe
 	return err == nil, err
 }
 
-// get reads a manifest or blob of the recorded repository. It answers nil for one the registry does not hold.
 func (s *supervisor) get(ctx context.Context, record runtimecontract.OverlayRecord, kind, reference string) (*http.Response, error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, record.Location().JoinPath(kind, reference).String(), nil)
 	if err != nil {
