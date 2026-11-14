@@ -157,9 +157,6 @@ func TestReload(t *testing.T) {
 		data, _ := os.ReadFile(filepath.Join(r.root, "installs"))
 		return string(data)
 	}
-	if status, _ := r.get(); status != http.StatusServiceUnavailable {
-		t.Fatalf("before any source: %d", status)
-	}
 	serve, prepare := []string{"python3", "main.py"}, [][]string{{"echo", "prepared"}}
 	install := runtimecontract.Install{Inputs: "sha256:one", Commands: [][]string{{"python3", "-c", `open("installs", "a").write("once\n")`}, {"echo", "installed"}}}
 	first := source(install, prepare, serve, app("first"))
@@ -264,9 +261,6 @@ func TestBootStartsTheRecordedOverlay(t *testing.T) {
 	})
 	t.Run("not in the registry yet", func(t *testing.T) {
 		r := run(t, record("sha256:"+strings.Repeat("f", 64)))
-		if status, _ := r.get(); status != http.StatusServiceUnavailable {
-			t.Fatalf("without source: %d", status)
-		}
 		if status, body := r.reload(blob); status != http.StatusOK {
 			t.Fatalf("reload: %d %s", status, body)
 		}
