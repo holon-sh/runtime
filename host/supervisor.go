@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -34,6 +35,7 @@ type supervisor struct {
 	turn      chan struct{}
 	app       atomic.Pointer[child]
 	written   []string
+	unpacked  string
 	installed runtimecontract.Install
 }
 
@@ -121,8 +123,17 @@ func (s *supervisor) reload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { <-s.turn }()
+	overlay, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeReply(w, http.StatusBadRequest, runtimecontract.ReloadReply{Error: "read source: " + err.Error()})
+		return
+	}
+	if s.app.Load() != nil && s.unpacked == fmt.Sprintf("sha256:%x", sha256.Sum256(overlay)) {
+		writeReply(w, http.StatusOK, runtimecontract.ReloadReply{})
+		return
+	}
 	s.stop()
-	if _, err := s.unpack(r.Body); err != nil {
+	if _, err := s.unpack(bytes.NewReader(overlay)); err != nil {
 		writeReply(w, http.StatusBadRequest, runtimecontract.ReloadReply{Error: err.Error()})
 		return
 	}

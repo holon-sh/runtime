@@ -85,7 +85,8 @@ func (s *supervisor) unpack(overlay io.Reader) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("unpack source: %w", err)
 	}
-	return "sha256:" + hex.EncodeToString(hash.Sum(nil)), nil
+	s.unpacked = "sha256:" + hex.EncodeToString(hash.Sum(nil))
+	return s.unpacked, nil
 }
 
 // extract writes a zstd tar's entries under root, replacing what the app made at the same path, and returns their
