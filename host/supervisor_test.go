@@ -387,7 +387,7 @@ os.symlink("lib/tool", "tool")`}
 	}
 	<-pushed
 	<-pushed
-	if dependencies, sources := entries(first.Frozen.Layers[0]), entries(first.Frozen.Layers[1]); !slices.Equal(dependencies, []string{"/lib/", "/lib/tool"}) ||
+	if dependencies, sources := entries(first.Frozen.Layers[0]), entries(first.Frozen.Layers[1]); !slices.Equal(dependencies, []string{"/.wh..wh..opq", "/lib/", "/lib/tool"}) ||
 		!slices.Equal(sources, []string{"/", "/main.py", "/tool"}) {
 		t.Fatalf("layer entries %q and %q", dependencies, sources)
 	}

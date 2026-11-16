@@ -143,6 +143,12 @@ func extract(blob io.Reader, root *os.Root) ([]string, error) {
 
 const appUser = 10001
 
+// opaque marks the app directory in the lowest frozen layer as an [opaque whiteout], so nothing of the base image shows
+// through there.
+//
+// [opaque whiteout]: https://github.com/opencontainers/image-spec/blob/main/layer.md#opaque-whiteout
+const opaque = ".wh..wh..opq"
+
 func (s *supervisor) freeze(ctx context.Context, token string, freeze runtimecontract.Freeze) (*runtimecontract.Frozen, error) {
 	root, err := os.OpenRoot(s.root)
 	if err != nil {
@@ -168,8 +174,9 @@ func (s *supervisor) freeze(ctx context.Context, token string, freeze runtimecon
 		if len(selected.starts) == 0 {
 			continue
 		}
+		lowest := len(frozen.Layers) == 0
 		layer, err := s.push(ctx, token, func(w io.Writer) (runtimecontract.Layer, error) {
-			return s.layer(w, root.FS(), selected.starts, selected.excluded)
+			return s.layer(w, root.FS(), selected.starts, selected.excluded, lowest)
 		})
 		if err != nil {
 			return nil, err
@@ -236,7 +243,7 @@ func (s *supervisor) push(ctx context.Context, token string, write func(io.Write
 	return layer, err
 }
 
-func (s *supervisor) layer(w io.Writer, fsys fs.FS, starts []string, excluded map[string]bool) (runtimecontract.Layer, error) {
+func (s *supervisor) layer(w io.Writer, fsys fs.FS, starts []string, excluded map[string]bool, lowest bool) (runtimecontract.Layer, error) {
 	compressed, uncompressed := sha256.New(), sha256.New()
 	var size counter
 	encoder, err := zstd.NewWriter(io.MultiWriter(w, compressed, &size), zstd.WithEncoderLevel(zstd.SpeedDefault), zstd.WithEncoderConcurrency(1))
@@ -288,9 +295,14 @@ func (s *supervisor) layer(w io.Writer, fsys fs.FS, starts []string, excluded ma
 		_, err = io.CopyBuffer(archive, io.LimitReader(file, header.Size), buffer)
 		return err
 	}
+	if lowest {
+		err = archive.WriteHeader(&tar.Header{
+			Name: path.Join(prefix, opaque), Typeflag: tar.TypeReg, Uid: appUser, Gid: appUser, ModTime: time.Unix(0, 0),
+		})
+	}
 	for _, start := range starts {
-		if err = fs.WalkDir(fsys, start, walk); err != nil {
-			break
+		if err == nil {
+			err = fs.WalkDir(fsys, start, walk)
 		}
 	}
 	err = errors.Join(err, archive.Close(), encoder.Close())
