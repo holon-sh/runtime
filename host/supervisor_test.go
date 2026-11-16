@@ -395,6 +395,11 @@ os.symlink("lib/tool", "tool")`}
 	if status != http.StatusOK || second.Frozen.Layers[0] != first.Frozen.Layers[0] || len(pushed) != 1 || <-pushed != second.Frozen.Layers[1].Digest {
 		t.Fatalf("build with changed source: %d %+v", status, second)
 	}
+	status, alone := r.build(frozen(runtimecontract.Build{Freeze: &runtimecontract.Freeze{}}, app("built")))
+	if status != http.StatusOK || len(alone.Frozen.Layers) != 1 || !slices.Equal(entries(alone.Frozen.Layers[0]), []string{"/.wh..wh..opq", "/", "/main.py"}) {
+		t.Fatalf("build without dependencies: %d %+v", status, alone)
+	}
+	<-pushed
 
 	failing := []string{"python3", "-c", `print("no such package"); raise SystemExit(3)`}
 	if status, reply := r.build(frozen(freeze, app("built"), failing)); status != http.StatusInternalServerError ||
