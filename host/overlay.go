@@ -10,9 +10,11 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -141,8 +143,44 @@ func extract(blob io.Reader, root *os.Root) ([]string, error) {
 
 const appUser = 10001
 
-func (s *supervisor) push(ctx context.Context, token string) (runtimecontract.Layer, error) {
-	send := func(method string, target *url.URL, body io.Reader, status int) (*url.URL, error) {
+func (s *supervisor) freeze(ctx context.Context, token string, freeze runtimecontract.Freeze) (*runtimecontract.Frozen, error) {
+	root, err := os.OpenRoot(s.root)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = root.Close() }()
+	omitted := map[string]bool{}
+	for _, name := range freeze.Omit {
+		omitted[path.Clean(name)] = true
+	}
+	source := maps.Clone(omitted)
+	source[path.Dir(runtimecontract.PlanFile)] = true
+	dependencies := make([]string, len(freeze.Dependencies))
+	for i, name := range freeze.Dependencies {
+		dependencies[i] = path.Clean(name)
+		source[dependencies[i]] = true
+	}
+	frozen := &runtimecontract.Frozen{Architecture: runtime.GOARCH}
+	for _, selected := range []struct {
+		starts   []string
+		excluded map[string]bool
+	}{{dependencies, omitted}, {[]string{"."}, source}} {
+		if len(selected.starts) == 0 {
+			continue
+		}
+		layer, err := s.push(ctx, token, func(w io.Writer) (runtimecontract.Layer, error) {
+			return s.layer(w, root.FS(), selected.starts, selected.excluded)
+		})
+		if err != nil {
+			return nil, err
+		}
+		frozen.Layers = append(frozen.Layers, layer)
+	}
+	return frozen, nil
+}
+
+func (s *supervisor) push(ctx context.Context, token string, write func(io.Writer) (runtimecontract.Layer, error)) (runtimecontract.Layer, error) {
+	send := func(method string, target *url.URL, body io.Reader, statuses ...int) (*http.Response, error) {
 		request, err := http.NewRequestWithContext(ctx, method, target.String(), body)
 		if err != nil {
 			return nil, err
@@ -153,62 +191,84 @@ func (s *supervisor) push(ctx context.Context, token string) (runtimecontract.La
 			return nil, err
 		}
 		_ = response.Body.Close()
-		if response.StatusCode != status {
+		if !slices.Contains(statuses, response.StatusCode) {
 			return nil, fmt.Errorf("registry answered %d", response.StatusCode)
 		}
-		return response.Location()
+		return response, nil
 	}
-	started, err := send(http.MethodPost, s.record.Location().JoinPath("blobs", "uploads/"), nil, http.StatusAccepted)
+	layer, err := write(io.Discard)
+	if err != nil {
+		return runtimecontract.Layer{}, err
+	}
+	blobs := s.record.Location().JoinPath("blobs")
+	held, err := send(http.MethodHead, blobs.JoinPath(layer.Digest), nil, http.StatusOK, http.StatusNotFound)
+	if err != nil || held.StatusCode == http.StatusOK {
+		return layer, err
+	}
+	started, err := send(http.MethodPost, blobs.JoinPath("uploads/"), nil, http.StatusAccepted)
+	if err != nil {
+		return runtimecontract.Layer{}, err
+	}
+	location, err := started.Location()
 	if err != nil {
 		return runtimecontract.Layer{}, err
 	}
 	reader, writer := io.Pipe()
 	layers := make(chan runtimecontract.Layer, 1)
 	go func() {
-		layer, err := s.layer(writer)
+		layer, err := write(writer)
 		_ = writer.CloseWithError(err)
 		layers <- layer
 	}()
-	patched, err := send(http.MethodPatch, started, reader, http.StatusAccepted)
+	patched, err := send(http.MethodPatch, location, reader, http.StatusAccepted)
 	_ = reader.Close()
-	layer := <-layers
+	layer = <-layers
+	if err == nil {
+		location, err = patched.Location()
+	}
 	if err != nil {
 		return runtimecontract.Layer{}, err
 	}
-	query := patched.Query()
+	query := location.Query()
 	query.Set("digest", layer.Digest)
-	patched.RawQuery = query.Encode()
-	_, err = send(http.MethodPut, patched, nil, http.StatusCreated)
+	location.RawQuery = query.Encode()
+	_, err = send(http.MethodPut, location, nil, http.StatusCreated)
 	return layer, err
 }
 
-func (s *supervisor) layer(w io.Writer) (runtimecontract.Layer, error) {
+func (s *supervisor) layer(w io.Writer, fsys fs.FS, starts []string, excluded map[string]bool) (runtimecontract.Layer, error) {
 	compressed, uncompressed := sha256.New(), sha256.New()
 	var size counter
-	encoder, err := zstd.NewWriter(io.MultiWriter(w, compressed, &size), zstd.WithEncoderConcurrency(1))
+	encoder, err := zstd.NewWriter(io.MultiWriter(w, compressed, &size), zstd.WithEncoderLevel(zstd.SpeedDefault), zstd.WithEncoderConcurrency(1))
 	if err != nil {
 		return runtimecontract.Layer{}, err
 	}
 	archive := tar.NewWriter(io.MultiWriter(encoder, uncompressed))
-	metadata := filepath.Join(s.root, filepath.Dir(runtimecontract.PlanFile))
+	prefix := strings.TrimPrefix(s.root, "/")
 	buffer := make([]byte, 32<<10)
-	err = filepath.Walk(s.root, func(name string, info fs.FileInfo, err error) error {
+	walk := func(name string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if name == metadata {
-			return filepath.SkipDir
+		if excluded[name] && entry.IsDir() {
+			return fs.SkipDir
+		}
+		if excluded[name] {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
 		}
 		header := &tar.Header{
-			Name: strings.TrimPrefix(name, "/"), Mode: int64(info.Mode().Perm()), Uid: appUser, Gid: appUser,
-			ModTime: time.Unix(0, 0),
+			Name: path.Join(prefix, name), Mode: int64(info.Mode().Perm()), Uid: appUser, Gid: appUser, ModTime: time.Unix(0, 0),
 		}
 		switch info.Mode().Type() {
 		case fs.ModeDir:
 			header.Typeflag, header.Name = tar.TypeDir, header.Name+"/"
 		case fs.ModeSymlink:
 			header.Typeflag = tar.TypeSymlink
-			header.Linkname, err = os.Readlink(name)
+			header.Linkname, err = fs.ReadLink(fsys, name)
 		case 0:
 			header.Typeflag, header.Size = tar.TypeReg, info.Size()
 		default:
@@ -220,18 +280,22 @@ func (s *supervisor) layer(w io.Writer) (runtimecontract.Layer, error) {
 		if err != nil || header.Typeflag != tar.TypeReg {
 			return err
 		}
-		file, err := os.Open(name)
+		file, err := fsys.Open(name)
 		if err != nil {
 			return err
 		}
 		defer func() { _ = file.Close() }()
 		_, err = io.CopyBuffer(archive, io.LimitReader(file, header.Size), buffer)
 		return err
-	})
+	}
+	for _, start := range starts {
+		if err = fs.WalkDir(fsys, start, walk); err != nil {
+			break
+		}
+	}
 	err = errors.Join(err, archive.Close(), encoder.Close())
 	return runtimecontract.Layer{
-		Digest: "sha256:" + hex.EncodeToString(compressed.Sum(nil)), DiffID: "sha256:" + hex.EncodeToString(uncompressed.Sum(nil)),
-		Size: int64(size), Architecture: runtime.GOARCH,
+		Digest: "sha256:" + hex.EncodeToString(compressed.Sum(nil)), DiffID: "sha256:" + hex.EncodeToString(uncompressed.Sum(nil)), Size: int64(size),
 	}, err
 }
 

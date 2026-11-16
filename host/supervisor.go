@@ -198,7 +198,7 @@ func (s *supervisor) build(r *http.Request) (int, runtimecontract.BuildReply) {
 	if err == nil {
 		err = errors.Join(s.decode(runtimecontract.PlanFile, &plan), s.decode(runtimecontract.BuildFile, &build))
 	}
-	if err == nil && build.Layer && s.record == nil {
+	if err == nil && build.Freeze != nil && s.record == nil {
 		err = errors.New("no repository is recorded for this app")
 	}
 	if err != nil {
@@ -209,12 +209,12 @@ func (s *supervisor) build(r *http.Request) (int, runtimecontract.BuildReply) {
 		return http.StatusInternalServerError, runtimecontract.BuildReply{Error: "the install or build failed: " + err.Error(), Output: string(output)}
 	}
 	var reply runtimecontract.BuildReply
-	if build.Layer {
-		layer, err := s.push(r.Context(), r.Header.Get(runtimecontract.BuildTokenHeader))
+	if build.Freeze != nil {
+		frozen, err := s.freeze(r.Context(), r.Header.Get(runtimecontract.BuildTokenHeader), *build.Freeze)
 		if err != nil {
-			return http.StatusInternalServerError, runtimecontract.BuildReply{Error: "push the layer: " + err.Error()}
+			return http.StatusInternalServerError, runtimecontract.BuildReply{Error: "freeze the app: " + err.Error()}
 		}
-		reply.Layer = &layer
+		reply.Frozen = frozen
 	}
 	if len(build.Run) != 0 {
 		command, _ := s.command(r.Context(), build.Run, buildEnvironment...)

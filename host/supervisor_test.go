@@ -19,6 +19,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -305,11 +306,16 @@ func TestBootStartsTheRecordedOverlay(t *testing.T) {
 }
 
 func TestBuild(t *testing.T) {
-	patched, pushed := make(chan []byte, 1), make(chan []byte, 4)
+	var held sync.Map
+	patched, pushed := make(chan []byte, 1), make(chan string, 4)
 	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, found := held.Load(path.Base(r.URL.Path))
 		switch {
 		case r.Header.Get("Authorization") != "Bearer push":
 			http.NotFound(w, r)
+		case r.Method == http.MethodHead && !found:
+			w.WriteHeader(http.StatusNotFound)
+		case r.Method == http.MethodHead:
 		case r.Method == http.MethodPost && r.URL.Path == "/v2/holon/app/blobs/uploads/":
 			w.Header().Set("Location", "/upload?_state=started")
 			w.WriteHeader(http.StatusAccepted)
@@ -319,13 +325,14 @@ func TestBuild(t *testing.T) {
 			w.Header().Set("Location", "/upload?_state=patched")
 			w.WriteHeader(http.StatusAccepted)
 		case r.Method == http.MethodPut && r.URL.Query().Get("_state") == "patched":
-			data := <-patched
-			if sum := sha256.Sum256(data); r.URL.Query().Get("digest") != "sha256:"+hex.EncodeToString(sum[:]) {
+			data, digest := <-patched, r.URL.Query().Get("digest")
+			if sum := sha256.Sum256(data); digest != "sha256:"+hex.EncodeToString(sum[:]) {
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
-			pushed <- data
-			w.Header().Set("Location", "/v2/holon/app/blobs/"+r.URL.Query().Get("digest"))
+			held.Store(digest, data)
+			pushed <- digest
+			w.Header().Set("Location", "/v2/holon/app/blobs/"+digest)
 			w.WriteHeader(http.StatusCreated)
 		default:
 			w.WriteHeader(http.StatusBadRequest)
@@ -335,65 +342,66 @@ func TestBuild(t *testing.T) {
 	r := run(t, &runtimecontract.OverlayRecord{Registry: registry.URL, Repository: "holon/app", Tag: "session", Token: "pull"})
 	serve := []string{"python3", "main.py"}
 	install := runtimecontract.Install{Inputs: "sha256:one", Commands: [][]string{{"echo", "installing"}}}
-	frozen := func(build runtimecontract.Build, commands ...[]string) []byte {
-		files := source(runtimecontract.Install{Inputs: "sha256:build", Commands: commands}, nil, serve, app("built"))
+	frozen := func(build runtimecontract.Build, main string, commands ...[]string) []byte {
+		files := source(runtimecontract.Install{Inputs: "sha256:build", Commands: commands}, nil, serve, main)
 		data, _ := json.Marshal(build)
 		files[runtimecontract.BuildFile] = string(data)
 		return overlay(t, files)
 	}
+	freeze := runtimecontract.Build{Freeze: &runtimecontract.Freeze{Dependencies: []string{"lib"}, Omit: []string{"lib/skip", "omitted"}}}
 	tools := []string{"python3", "-c", `import os
 assert os.environ["SOURCE_DATE_EPOCH"] == "0" and os.environ["UV_PYTHON_DOWNLOADS"] == "never"
 os.mkdir("lib")
-open("lib/tool", "w").write("tool")
+for name in "lib/tool", "lib/skip", "omitted":
+    open(name, "w").write(name)
 os.chmod("lib/tool", 0o755)
 os.symlink("lib/tool", "tool")`}
+	prefix := strings.TrimPrefix(r.root, "/")
+	entries := func(layer runtimecontract.Layer) []string {
+		blob, _ := held.Load(layer.Digest)
+		decoder, _ := zstd.NewReader(bytes.NewReader(blob.([]byte)))
+		uncompressed, _ := io.ReadAll(decoder)
+		if diffID := sha256.Sum256(uncompressed); layer.DiffID != "sha256:"+hex.EncodeToString(diffID[:]) || layer.Size != int64(len(blob.([]byte))) {
+			t.Fatalf("layer %+v", layer)
+		}
+		var names []string
+		archive := tar.NewReader(bytes.NewReader(uncompressed))
+		for header, err := archive.Next(); err != io.EOF; header, err = archive.Next() {
+			name := strings.TrimPrefix(header.Name, prefix)
+			if err != nil || header.Uid != 10001 || header.Gid != 10001 || header.ModTime.Unix() != 0 ||
+				name == "/lib/tool" && header.Mode != 0o755 || name == "/tool" && header.Linkname != "lib/tool" {
+				t.Fatalf("header %+v: %v", header, err)
+			}
+			names = append(names, name)
+		}
+		return names
+	}
 
 	developed := overlay(t, source(install, nil, serve, app("developed")))
 	if status, body := r.reload(developed); status != http.StatusOK {
 		t.Fatalf("reload: %d %s", status, body)
 	}
-	var layers []runtimecontract.Layer
-	for range 2 {
-		status, reply := r.build(frozen(runtimecontract.Build{Layer: true}, tools))
-		if status != http.StatusOK || reply.Layer == nil {
-			t.Fatalf("build: %d %+v", status, reply)
-		}
-		layers = append(layers, *reply.Layer)
+	status, first := r.build(frozen(freeze, app("built"), tools))
+	if status != http.StatusOK || first.Frozen == nil || first.Frozen.Architecture != runtime.GOARCH || len(first.Frozen.Layers) != 2 || len(pushed) != 2 {
+		t.Fatalf("build: %d %+v", status, first)
 	}
-	if layers[0] != layers[1] {
-		t.Fatalf("two builds of one source: %+v", layers)
-	}
-	blob := <-pushed
 	<-pushed
-	decoder, _ := zstd.NewReader(bytes.NewReader(blob))
-	uncompressed, _ := io.ReadAll(decoder)
-	diffID := sha256.Sum256(uncompressed)
-	if layers[0].DiffID != "sha256:"+hex.EncodeToString(diffID[:]) || layers[0].Size != int64(len(blob)) || layers[0].Architecture != runtime.GOARCH {
-		t.Fatalf("layer %+v", layers[0])
+	<-pushed
+	if dependencies, sources := entries(first.Frozen.Layers[0]), entries(first.Frozen.Layers[1]); !slices.Equal(dependencies, []string{"/lib/", "/lib/tool"}) ||
+		!slices.Equal(sources, []string{"/", "/main.py", "/tool"}) {
+		t.Fatalf("layer entries %q and %q", dependencies, sources)
 	}
-	prefix := strings.TrimPrefix(r.root, "/")
-	var names []string
-	archive := tar.NewReader(bytes.NewReader(uncompressed))
-	for header, err := archive.Next(); err != io.EOF; header, err = archive.Next() {
-		if err != nil || header.Uid != 10001 || header.Gid != 10001 || header.ModTime.Unix() != 0 {
-			t.Fatalf("header %+v: %v", header, err)
-		}
-		name := strings.TrimPrefix(header.Name, prefix)
-		if name == "/lib/tool" && header.Mode != 0o755 || name == "/tool" && header.Linkname != "lib/tool" {
-			t.Fatalf("header %+v", header)
-		}
-		names = append(names, name)
-	}
-	if want := []string{"/", "/lib/", "/lib/tool", "/main.py", "/tool"}; !slices.Equal(names, want) {
-		t.Fatalf("layer entries %q, want %q", names, want)
+	status, second := r.build(frozen(freeze, app("changed"), tools))
+	if status != http.StatusOK || second.Frozen.Layers[0] != first.Frozen.Layers[0] || len(pushed) != 1 || <-pushed != second.Frozen.Layers[1].Digest {
+		t.Fatalf("build with changed source: %d %+v", status, second)
 	}
 
 	failing := []string{"python3", "-c", `print("no such package"); raise SystemExit(3)`}
-	if status, reply := r.build(frozen(runtimecontract.Build{Layer: true}, failing)); status != http.StatusInternalServerError ||
+	if status, reply := r.build(frozen(freeze, app("built"), failing)); status != http.StatusInternalServerError ||
 		!strings.Contains(reply.Error, "exit status 3") || reply.Output != "no such package\n" || len(pushed) != 0 {
 		t.Fatalf("failing install: %d %+v", status, reply)
 	}
-	if status, reply := r.build(frozen(runtimecontract.Build{Run: []string{"python3", "-c", `print("a" * 9999)`}})); status != http.StatusOK ||
+	if status, reply := r.build(frozen(runtimecontract.Build{Run: []string{"python3", "-c", `print("a" * 9999)`}}, app("built"))); status != http.StatusOK ||
 		reply.Stdout != strings.Repeat("a", 9999)+"\n" {
 		t.Fatalf("run: %d %+v", status, reply)
 	}
