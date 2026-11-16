@@ -2,15 +2,13 @@ package host
 
 import (
 	"archive/tar"
+	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
-	"maps"
 	"net/http"
 	"net/url"
 	"os"
@@ -24,57 +22,38 @@ import (
 	"github.com/holon-sh/protocol"
 	"github.com/holon-sh/protocol/runtimecontract"
 	"github.com/klauspost/compress/zstd"
+	"github.com/opencontainers/go-digest"
+	"github.com/opencontainers/image-spec/specs-go"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 func (s *supervisor) fetch(ctx context.Context) (bool, error) {
-	var manifest struct {
-		Layers []struct{ Digest string } `json:"layers"`
-	}
-	tagged, err := s.get(ctx, "manifests", s.record.Tag)
+	var manifest ocispec.Manifest
+	source := s.registry(s.record.Token)
+	tagged, err := source.get(ctx, "manifests", s.record.Tag)
 	if tagged == nil {
 		return false, err
 	}
 	err = json.NewDecoder(tagged.Body).Decode(&manifest)
 	_ = tagged.Body.Close()
-	if err != nil || len(manifest.Layers) == 0 || !protocol.ValidDigest(manifest.Layers[0].Digest) {
+	if err != nil || len(manifest.Layers) == 0 || !protocol.ValidDigest(manifest.Layers[0].Digest.String()) {
 		return false, errors.New("the tag names no overlay")
 	}
-	blob, err := s.get(ctx, "blobs", manifest.Layers[0].Digest)
+	blob, err := source.get(ctx, "blobs", manifest.Layers[0].Digest.String())
 	if blob == nil {
 		return false, err
 	}
 	defer func() { _ = blob.Body.Close() }()
-	digest, err := s.unpack(blob.Body)
-	if err == nil && digest != manifest.Layers[0].Digest {
+	unpacked, err := s.unpack(blob.Body)
+	if err == nil && unpacked != manifest.Layers[0].Digest {
 		err = errors.New("digest mismatch")
 	}
 	return err == nil, err
 }
 
-func (s *supervisor) get(ctx context.Context, kind, reference string) (*http.Response, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, s.record.Location().JoinPath(kind, reference).String(), nil)
-	if err != nil {
-		return nil, err
-	}
-	request.Header.Set(protocol.HeaderAuthorization, protocol.BearerPrefix+s.record.Token)
-	request.Header.Set("Accept", "application/vnd.oci.image.manifest.v1+json")
-	response, err := (&http.Client{Transport: s.transport}).Do(request)
-	if err != nil {
-		return nil, errors.New("registry unavailable")
-	}
-	if response.StatusCode == http.StatusOK {
-		return response, nil
-	}
-	_ = response.Body.Close()
-	if response.StatusCode == http.StatusNotFound {
-		return nil, nil
-	}
-	return nil, fmt.Errorf("registry answered %d", response.StatusCode)
-}
-
 // unpack removes what the previous overlay wrote, keeping what the app made beside it, such as its installed
 // dependencies, and writes overlay into the source directory. It returns the overlay's digest.
-func (s *supervisor) unpack(overlay io.Reader) (string, error) {
+func (s *supervisor) unpack(overlay io.Reader) (digest.Digest, error) {
 	root, err := os.OpenRoot(s.root)
 	if err != nil {
 		return "", err
@@ -84,15 +63,15 @@ func (s *supervisor) unpack(overlay io.Reader) (string, error) {
 	for _, name := range slices.Backward(s.written) {
 		_ = root.Remove(name)
 	}
-	hash := sha256.New()
-	stream := io.TeeReader(overlay, hash)
+	digester := digest.SHA256.Digester()
+	stream := io.TeeReader(overlay, digester.Hash())
 	if s.written, err = extract(stream, root); err == nil {
 		_, err = io.Copy(io.Discard, stream)
 	}
 	if err != nil {
 		return "", fmt.Errorf("unpack source: %w", err)
 	}
-	s.unpacked = "sha256:" + hex.EncodeToString(hash.Sum(nil))
+	s.unpacked = digester.Digest()
 	return s.unpacked, nil
 }
 
@@ -143,119 +122,157 @@ func extract(blob io.Reader, root *os.Root) ([]string, error) {
 
 const appUser = 10001
 
-// layerMediaType names a [zstd layer].
-//
-// [zstd layer]: https://github.com/opencontainers/image-spec/blob/main/layer.md#zstd-media-types
-const layerMediaType = "application/vnd.oci.image.layer.v1.tar+zstd"
-
 // opaque marks the app directory in the lowest frozen layer as an [opaque whiteout], so nothing of the base image shows
 // through there.
 //
 // [opaque whiteout]: https://github.com/opencontainers/image-spec/blob/main/layer.md#opaque-whiteout
 const opaque = ".wh..wh..opq"
 
-func (s *supervisor) freeze(ctx context.Context, token string, freeze runtimecontract.Freeze) (*runtimecontract.Frozen, error) {
+func (s *supervisor) freeze(ctx context.Context, token string, dependencies []string) (digest.Digest, error) {
 	root, err := os.OpenRoot(s.root)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	defer func() { _ = root.Close() }()
-	omitted := map[string]bool{}
-	for _, name := range freeze.Omit {
-		omitted[path.Clean(name)] = true
+	source := map[string]bool{path.Dir(runtimecontract.PlanFile): true}
+	for _, name := range dependencies {
+		source[name] = true
 	}
-	source := maps.Clone(omitted)
-	source[path.Dir(runtimecontract.PlanFile)] = true
-	dependencies := make([]string, len(freeze.Dependencies))
-	for i, name := range freeze.Dependencies {
-		dependencies[i] = path.Clean(name)
-		source[dependencies[i]] = true
+	upload := s.registry(token)
+	image := ocispec.Image{
+		Platform: ocispec.Platform{Architecture: runtime.GOARCH, OS: runtime.GOOS},
+		Config:   ocispec.ImageConfig{WorkingDir: s.root},
+		RootFS:   ocispec.RootFS{Type: "layers"},
 	}
-	frozen := &runtimecontract.Frozen{Architecture: runtime.GOARCH, Directory: s.root}
+	manifest := ocispec.Manifest{Versioned: specs.Versioned{SchemaVersion: 2}, MediaType: ocispec.MediaTypeImageManifest}
 	for _, selected := range []struct {
 		starts   []string
 		excluded map[string]bool
-	}{{dependencies, omitted}, {[]string{"."}, source}} {
+	}{{dependencies, nil}, {[]string{"."}, source}} {
 		if len(selected.starts) == 0 {
 			continue
 		}
-		lowest := len(frozen.Layers) == 0
-		layer, err := s.push(ctx, token, func(w io.Writer) (runtimecontract.Layer, error) {
+		lowest := len(manifest.Layers) == 0
+		write := func(w io.Writer) (ocispec.Descriptor, digest.Digest, error) {
 			return s.layer(w, root.FS(), selected.starts, selected.excluded, lowest)
-		})
-		if err != nil {
-			return nil, err
 		}
-		frozen.Layers = append(frozen.Layers, layer)
+		layer, diffID, err := write(io.Discard)
+		if err == nil {
+			err = upload.push(ctx, layer, func(w io.Writer) error {
+				_, _, err := write(w)
+				return err
+			})
+		}
+		if err != nil {
+			return "", err
+		}
+		manifest.Layers = append(manifest.Layers, layer)
+		image.RootFS.DiffIDs = append(image.RootFS.DiffIDs, diffID)
 	}
-	return frozen, nil
+	config, _ := json.Marshal(image)
+	manifest.Config = ocispec.Descriptor{MediaType: ocispec.MediaTypeImageConfig, Digest: digest.FromBytes(config), Size: int64(len(config))}
+	err = upload.push(ctx, manifest.Config, func(w io.Writer) error {
+		_, err := w.Write(config)
+		return err
+	})
+	if err != nil {
+		return "", err
+	}
+	document, _ := json.Marshal(manifest)
+	reference := digest.FromBytes(document)
+	request := upload.request(ctx, http.MethodPut, upload.repository.JoinPath("manifests", reference.String()), bytes.NewReader(document))
+	request.Header.Set(protocol.HeaderContentType, ocispec.MediaTypeImageManifest)
+	_, err = upload.send(request, http.StatusCreated)
+	return reference, err
 }
 
-func (s *supervisor) push(ctx context.Context, token string, write func(io.Writer) (runtimecontract.Layer, error)) (runtimecontract.Layer, error) {
-	send := func(method string, target *url.URL, body io.Reader, statuses ...int) (*http.Response, error) {
-		request, err := http.NewRequestWithContext(ctx, method, target.String(), body)
-		if err != nil {
-			return nil, err
-		}
-		request.Header.Set(protocol.HeaderAuthorization, protocol.BearerPrefix+token)
-		response, err := (&http.Client{Transport: s.transport}).Do(request)
-		if err != nil {
-			return nil, err
-		}
-		_ = response.Body.Close()
-		if !slices.Contains(statuses, response.StatusCode) {
-			return nil, fmt.Errorf("registry answered %d", response.StatusCode)
-		}
+type registry struct {
+	client     *http.Client
+	repository *url.URL
+	token      string
+}
+
+func (s *supervisor) registry(token string) registry {
+	return registry{client: &http.Client{Transport: s.transport}, repository: s.record.Location(), token: token}
+}
+
+func (r registry) get(ctx context.Context, kind, reference string) (*http.Response, error) {
+	request := r.request(ctx, http.MethodGet, r.repository.JoinPath(kind, reference), nil)
+	request.Header.Set("Accept", ocispec.MediaTypeImageManifest)
+	response, err := r.client.Do(request)
+	if err != nil {
+		return nil, errors.New("registry unavailable")
+	}
+	if response.StatusCode == http.StatusOK {
 		return response, nil
 	}
-	layer, err := write(io.Discard)
-	if err != nil {
-		return runtimecontract.Layer{}, err
+	_ = response.Body.Close()
+	if response.StatusCode == http.StatusNotFound {
+		return nil, nil
 	}
-	blobs := s.record.Location().JoinPath("blobs")
-	held, err := send(http.MethodHead, blobs.JoinPath(layer.Digest), nil, http.StatusOK, http.StatusNotFound)
-	if err != nil || held.StatusCode == http.StatusOK {
-		return layer, err
-	}
-	started, err := send(http.MethodPost, blobs.JoinPath("uploads/"), nil, http.StatusAccepted)
-	if err != nil {
-		return runtimecontract.Layer{}, err
-	}
-	location, err := started.Location()
-	if err != nil {
-		return runtimecontract.Layer{}, err
-	}
-	reader, writer := io.Pipe()
-	layers := make(chan runtimecontract.Layer, 1)
-	go func() {
-		layer, err := write(writer)
-		_ = writer.CloseWithError(err)
-		layers <- layer
-	}()
-	patched, err := send(http.MethodPatch, location, reader, http.StatusAccepted)
-	_ = reader.Close()
-	layer = <-layers
-	if err == nil {
-		location, err = patched.Location()
-	}
-	if err != nil {
-		return runtimecontract.Layer{}, err
-	}
-	query := location.Query()
-	query.Set("digest", layer.Digest)
-	location.RawQuery = query.Encode()
-	_, err = send(http.MethodPut, location, nil, http.StatusCreated)
-	return layer, err
+	return nil, fmt.Errorf("registry answered %d", response.StatusCode)
 }
 
-func (s *supervisor) layer(w io.Writer, fsys fs.FS, starts []string, excluded map[string]bool, lowest bool) (runtimecontract.Layer, error) {
-	compressed, uncompressed := sha256.New(), sha256.New()
-	var size counter
-	encoder, err := zstd.NewWriter(io.MultiWriter(w, compressed, &size), zstd.WithEncoderLevel(zstd.SpeedDefault), zstd.WithEncoderConcurrency(1))
-	if err != nil {
-		return runtimecontract.Layer{}, err
+func (r registry) push(ctx context.Context, blob ocispec.Descriptor, write func(io.Writer) error) error {
+	blobs := r.repository.JoinPath("blobs")
+	held, err := r.send(r.request(ctx, http.MethodHead, blobs.JoinPath(blob.Digest.String()), nil), http.StatusOK, http.StatusNotFound)
+	if err != nil || held.StatusCode == http.StatusOK {
+		return err
 	}
-	archive := tar.NewWriter(io.MultiWriter(encoder, uncompressed))
+	started, err := r.send(r.request(ctx, http.MethodPost, blobs.JoinPath("uploads/"), nil), http.StatusAccepted)
+	var location *url.URL
+	if err == nil {
+		location, err = started.Location()
+	}
+	if err != nil {
+		return err
+	}
+	query := location.Query()
+	query.Set("digest", blob.Digest.String())
+	location.RawQuery = query.Encode()
+	reader, writer := io.Pipe()
+	written := make(chan struct{})
+	go func() {
+		_ = writer.CloseWithError(write(writer))
+		close(written)
+	}()
+	upload := r.request(ctx, http.MethodPut, location, reader)
+	upload.ContentLength = blob.Size
+	upload.Header.Set(protocol.HeaderContentType, "application/octet-stream")
+	_, err = r.send(upload, http.StatusCreated)
+	_ = reader.Close()
+	<-written
+	return err
+}
+
+func (r registry) request(ctx context.Context, method string, target *url.URL, body io.Reader) *http.Request {
+	request, _ := http.NewRequestWithContext(ctx, method, target.String(), body)
+	request.Header.Set(protocol.HeaderAuthorization, protocol.BearerPrefix+r.token)
+	return request
+}
+
+func (r registry) send(request *http.Request, statuses ...int) (*http.Response, error) {
+	response, err := r.client.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	_ = response.Body.Close()
+	if !slices.Contains(statuses, response.StatusCode) {
+		return nil, fmt.Errorf("registry answered %d", response.StatusCode)
+	}
+	return response, nil
+}
+
+func (s *supervisor) layer(
+	w io.Writer, fsys fs.FS, starts []string, excluded map[string]bool, lowest bool,
+) (ocispec.Descriptor, digest.Digest, error) {
+	compressed, uncompressed := digest.SHA256.Digester(), digest.SHA256.Digester()
+	var size counter
+	encoder, err := zstd.NewWriter(io.MultiWriter(w, compressed.Hash(), &size), zstd.WithEncoderLevel(zstd.SpeedDefault), zstd.WithEncoderConcurrency(1))
+	if err != nil {
+		return ocispec.Descriptor{}, "", err
+	}
+	archive := tar.NewWriter(io.MultiWriter(encoder, uncompressed.Hash()))
 	prefix := strings.TrimPrefix(s.root, "/")
 	buffer := make([]byte, 32<<10)
 	walk := func(name string, entry fs.DirEntry, err error) error {
@@ -311,10 +328,7 @@ func (s *supervisor) layer(w io.Writer, fsys fs.FS, starts []string, excluded ma
 		}
 	}
 	err = errors.Join(err, archive.Close(), encoder.Close())
-	return runtimecontract.Layer{
-		MediaType: layerMediaType, Digest: "sha256:" + hex.EncodeToString(compressed.Sum(nil)),
-		DiffID: "sha256:" + hex.EncodeToString(uncompressed.Sum(nil)), Size: int64(size),
-	}, err
+	return ocispec.Descriptor{MediaType: ocispec.MediaTypeImageLayerZstd, Digest: compressed.Digest(), Size: int64(size)}, uncompressed.Digest(), err
 }
 
 type counter int64

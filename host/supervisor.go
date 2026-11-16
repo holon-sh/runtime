@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"cmp"
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,6 +24,7 @@ import (
 
 	"github.com/holon-sh/protocol"
 	"github.com/holon-sh/protocol/runtimecontract"
+	"github.com/opencontainers/go-digest"
 )
 
 // reloadDirEnv names the directory the development image unpacks the app's source into.
@@ -37,7 +37,7 @@ type supervisor struct {
 	app       atomic.Pointer[child]
 	record    *runtimecontract.OverlayRecord
 	written   []string
-	unpacked  string
+	unpacked  digest.Digest
 	installed runtimecontract.Install
 }
 
@@ -137,7 +137,7 @@ func (s *supervisor) reload(w http.ResponseWriter, r *http.Request) {
 		writeReply(w, http.StatusBadRequest, runtimecontract.ReloadReply{Error: "read source: " + err.Error()})
 		return
 	}
-	if s.app.Load() != nil && s.unpacked == fmt.Sprintf("sha256:%x", sha256.Sum256(overlay)) {
+	if s.app.Load() != nil && s.unpacked == digest.FromBytes(overlay) {
 		writeReply(w, http.StatusOK, runtimecontract.ReloadReply{})
 		return
 	}
@@ -188,9 +188,12 @@ func (s *supervisor) launch(ctx context.Context) (int, runtimecontract.ReloadRep
 var buildEnvironment = []string{"SOURCE_DATE_EPOCH=0", "UV_PYTHON_DOWNLOADS=never"}
 
 func (s *supervisor) build(r *http.Request) (int, runtimecontract.BuildReply) {
+	fail := func(status int, message string) (int, runtimecontract.BuildReply) {
+		return status, runtimecontract.BuildReply{ReloadReply: runtimecontract.ReloadReply{Error: message}}
+	}
 	s.stop()
 	if err := s.empty(); err != nil {
-		return http.StatusInternalServerError, runtimecontract.BuildReply{Error: err.Error()}
+		return fail(http.StatusInternalServerError, err.Error())
 	}
 	var plan runtimecontract.Plan
 	var build runtimecontract.Build
@@ -202,19 +205,19 @@ func (s *supervisor) build(r *http.Request) (int, runtimecontract.BuildReply) {
 		err = errors.New("no repository is recorded for this app")
 	}
 	if err != nil {
-		return http.StatusBadRequest, runtimecontract.BuildReply{Error: err.Error()}
+		return fail(http.StatusBadRequest, err.Error())
 	}
 	var output tail
 	if err := s.run(r.Context(), slices.Concat(plan.Install.Commands, plan.Prepare), &output, buildEnvironment...); err != nil {
-		return http.StatusInternalServerError, runtimecontract.BuildReply{Error: "the install or build failed: " + err.Error(), Output: string(output)}
+		return http.StatusInternalServerError, runtimecontract.BuildReply{ReloadReply: runtimecontract.ReloadReply{Error: "the install or build failed: " + err.Error(), Output: string(output)}}
 	}
 	var reply runtimecontract.BuildReply
 	if build.Freeze != nil {
-		frozen, err := s.freeze(r.Context(), r.Header.Get(runtimecontract.BuildTokenHeader), *build.Freeze)
+		image, err := s.freeze(r.Context(), r.Header.Get(runtimecontract.BuildTokenHeader), build.Freeze.Dependencies)
 		if err != nil {
-			return http.StatusInternalServerError, runtimecontract.BuildReply{Error: "freeze the app: " + err.Error()}
+			return fail(http.StatusInternalServerError, "freeze the app: "+err.Error())
 		}
-		reply.Frozen = frozen
+		reply.Image = image.String()
 	}
 	if len(build.Run) != 0 {
 		command, _ := s.command(r.Context(), build.Run, buildEnvironment...)
@@ -222,7 +225,7 @@ func (s *supervisor) build(r *http.Request) (int, runtimecontract.BuildReply) {
 		command.Stderr = &stderr
 		stdout, err := command.Output()
 		if command.ProcessState == nil {
-			return http.StatusInternalServerError, runtimecontract.BuildReply{Error: "start the run command: " + err.Error()}
+			return fail(http.StatusInternalServerError, "start the run command: "+err.Error())
 		}
 		reply.Ran = &runtimecontract.Ran{ExitCode: command.ProcessState.ExitCode(), Stdout: string(stdout), Stderr: string(stderr)}
 	}
