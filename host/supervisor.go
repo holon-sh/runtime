@@ -221,10 +221,10 @@ func (s *supervisor) build(r *http.Request) (int, runtimecontract.BuildReply) {
 		var stderr tail
 		command.Stderr = &stderr
 		stdout, err := command.Output()
-		reply.Stdout = string(stdout)
-		if err != nil {
-			return http.StatusInternalServerError, runtimecontract.BuildReply{Error: err.Error(), Output: string(stderr), Stdout: reply.Stdout}
+		if command.ProcessState == nil {
+			return http.StatusInternalServerError, runtimecontract.BuildReply{Error: "start the run command: " + err.Error()}
 		}
+		reply.Ran = &runtimecontract.Ran{ExitCode: command.ProcessState.ExitCode(), Stdout: string(stdout), Stderr: string(stderr)}
 	}
 	return http.StatusOK, reply
 }

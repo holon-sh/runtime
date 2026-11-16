@@ -382,7 +382,8 @@ os.symlink("lib/tool", "tool")`}
 		t.Fatalf("reload: %d %s", status, body)
 	}
 	status, first := r.build(frozen(freeze, app("built"), tools))
-	if status != http.StatusOK || first.Frozen == nil || first.Frozen.Architecture != runtime.GOARCH || len(first.Frozen.Layers) != 2 || len(pushed) != 2 {
+	if status != http.StatusOK || first.Frozen == nil || first.Frozen.Architecture != runtime.GOARCH || first.Frozen.Directory != r.root ||
+		len(first.Frozen.Layers) != 2 || first.Frozen.Layers[0].MediaType != "application/vnd.oci.image.layer.v1.tar+zstd" || len(pushed) != 2 {
 		t.Fatalf("build: %d %+v", status, first)
 	}
 	<-pushed
@@ -395,23 +396,23 @@ os.symlink("lib/tool", "tool")`}
 	if status != http.StatusOK || second.Frozen.Layers[0] != first.Frozen.Layers[0] || len(pushed) != 1 || <-pushed != second.Frozen.Layers[1].Digest {
 		t.Fatalf("build with changed source: %d %+v", status, second)
 	}
-	status, alone := r.build(frozen(runtimecontract.Build{Freeze: &runtimecontract.Freeze{}}, app("built")))
+	check := []string{"python3", "-c", `import sys; print("a" * 9999); print("finding", file=sys.stderr); raise SystemExit(2)`}
+	status, alone := r.build(frozen(runtimecontract.Build{Freeze: &runtimecontract.Freeze{}, Run: check}, app("built")))
 	if status != http.StatusOK || len(alone.Frozen.Layers) != 1 || !slices.Equal(entries(alone.Frozen.Layers[0]), []string{"/.wh..wh..opq", "/", "/main.py"}) {
 		t.Fatalf("build without dependencies: %d %+v", status, alone)
 	}
+	if alone.Ran == nil || *alone.Ran != (runtimecontract.Ran{ExitCode: 2, Stdout: strings.Repeat("a", 9999) + "\n", Stderr: "finding\n"}) {
+		t.Fatalf("failing run: %+v", alone.Ran)
+	}
 	<-pushed
+	if status, _ := r.get(); status != http.StatusServiceUnavailable {
+		t.Fatalf("after a build: %d", status)
+	}
 
 	failing := []string{"python3", "-c", `print("no such package"); raise SystemExit(3)`}
 	if status, reply := r.build(frozen(freeze, app("built"), failing)); status != http.StatusInternalServerError ||
 		!strings.Contains(reply.Error, "exit status 3") || reply.Output != "no such package\n" || len(pushed) != 0 {
 		t.Fatalf("failing install: %d %+v", status, reply)
-	}
-	if status, reply := r.build(frozen(runtimecontract.Build{Run: []string{"python3", "-c", `print("a" * 9999)`}}, app("built"))); status != http.StatusOK ||
-		reply.Stdout != strings.Repeat("a", 9999)+"\n" {
-		t.Fatalf("run: %d %+v", status, reply)
-	}
-	if status, _ := r.get(); status != http.StatusServiceUnavailable {
-		t.Fatalf("after a build: %d", status)
 	}
 
 	if status, body := r.reload(developed); status != http.StatusOK || !strings.Contains(body, "installing") {

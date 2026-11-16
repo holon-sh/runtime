@@ -143,6 +143,11 @@ func extract(blob io.Reader, root *os.Root) ([]string, error) {
 
 const appUser = 10001
 
+// layerMediaType names a [zstd layer].
+//
+// [zstd layer]: https://github.com/opencontainers/image-spec/blob/main/layer.md#zstd-media-types
+const layerMediaType = "application/vnd.oci.image.layer.v1.tar+zstd"
+
 // opaque marks the app directory in the lowest frozen layer as an [opaque whiteout], so nothing of the base image shows
 // through there.
 //
@@ -166,7 +171,7 @@ func (s *supervisor) freeze(ctx context.Context, token string, freeze runtimecon
 		dependencies[i] = path.Clean(name)
 		source[dependencies[i]] = true
 	}
-	frozen := &runtimecontract.Frozen{Architecture: runtime.GOARCH}
+	frozen := &runtimecontract.Frozen{Architecture: runtime.GOARCH, Directory: s.root}
 	for _, selected := range []struct {
 		starts   []string
 		excluded map[string]bool
@@ -307,7 +312,8 @@ func (s *supervisor) layer(w io.Writer, fsys fs.FS, starts []string, excluded ma
 	}
 	err = errors.Join(err, archive.Close(), encoder.Close())
 	return runtimecontract.Layer{
-		Digest: "sha256:" + hex.EncodeToString(compressed.Sum(nil)), DiffID: "sha256:" + hex.EncodeToString(uncompressed.Sum(nil)), Size: int64(size),
+		MediaType: layerMediaType, Digest: "sha256:" + hex.EncodeToString(compressed.Sum(nil)),
+		DiffID: "sha256:" + hex.EncodeToString(uncompressed.Sum(nil)), Size: int64(size),
 	}, err
 }
 
