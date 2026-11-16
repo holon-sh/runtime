@@ -15,6 +15,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -22,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/holon-sh/protocol"
 	"github.com/holon-sh/protocol/runtimecontract"
 	"github.com/klauspost/compress/zstd"
 )
@@ -118,7 +120,25 @@ func setup(t *testing.T, port, root string, record *runtimecontract.OverlayRecor
 
 func (r *running) reload(body []byte) (int, string) {
 	r.t.Helper()
-	response, err := http.Post(r.url+runtimecontract.ReloadPath, runtimecontract.OverlayMediaType, bytes.NewReader(body))
+	return r.post(runtimecontract.ReloadPath, body)
+}
+
+func (r *running) build(body []byte) (int, runtimecontract.BuildReply) {
+	r.t.Helper()
+	status, data := r.post(runtimecontract.BuildPath, body)
+	var reply runtimecontract.BuildReply
+	if err := json.Unmarshal([]byte(data), &reply); err != nil {
+		r.t.Fatal(err)
+	}
+	return status, reply
+}
+
+func (r *running) post(path string, body []byte) (int, string) {
+	r.t.Helper()
+	request, _ := http.NewRequest(http.MethodPost, r.url+path, bytes.NewReader(body))
+	request.Header.Set(protocol.HeaderContentType, runtimecontract.OverlayMediaType)
+	request.Header.Set(runtimecontract.BuildTokenHeader, "push")
+	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		r.t.Fatal(err)
 	}
@@ -281,5 +301,107 @@ func TestBootStartsTheRecordedOverlay(t *testing.T) {
 				t.Fatalf("Run = %v", err)
 			}
 		})
+	}
+}
+
+func TestBuild(t *testing.T) {
+	patched, pushed := make(chan []byte, 1), make(chan []byte, 4)
+	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Header.Get("Authorization") != "Bearer push":
+			http.NotFound(w, r)
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/holon/app/blobs/uploads/":
+			w.Header().Set("Location", "/upload?_state=started")
+			w.WriteHeader(http.StatusAccepted)
+		case r.Method == http.MethodPatch && r.URL.Query().Get("_state") == "started":
+			data, _ := io.ReadAll(r.Body)
+			patched <- data
+			w.Header().Set("Location", "/upload?_state=patched")
+			w.WriteHeader(http.StatusAccepted)
+		case r.Method == http.MethodPut && r.URL.Query().Get("_state") == "patched":
+			data := <-patched
+			if sum := sha256.Sum256(data); r.URL.Query().Get("digest") != "sha256:"+hex.EncodeToString(sum[:]) {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			pushed <- data
+			w.Header().Set("Location", "/v2/holon/app/blobs/"+r.URL.Query().Get("digest"))
+			w.WriteHeader(http.StatusCreated)
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	t.Cleanup(registry.Close)
+	r := run(t, &runtimecontract.OverlayRecord{Registry: registry.URL, Repository: "holon/app", Tag: "session", Token: "pull"})
+	serve := []string{"python3", "main.py"}
+	install := runtimecontract.Install{Inputs: "sha256:one", Commands: [][]string{{"echo", "installing"}}}
+	frozen := func(build runtimecontract.Build, commands ...[]string) []byte {
+		files := source(runtimecontract.Install{Inputs: "sha256:build", Commands: commands}, nil, serve, app("built"))
+		data, _ := json.Marshal(build)
+		files[runtimecontract.BuildFile] = string(data)
+		return overlay(t, files)
+	}
+	tools := []string{"python3", "-c", `import os
+assert os.environ["SOURCE_DATE_EPOCH"] == "0" and os.environ["UV_PYTHON_DOWNLOADS"] == "never"
+os.mkdir("lib")
+open("lib/tool", "w").write("tool")
+os.chmod("lib/tool", 0o755)
+os.symlink("lib/tool", "tool")`}
+
+	developed := overlay(t, source(install, nil, serve, app("developed")))
+	if status, body := r.reload(developed); status != http.StatusOK {
+		t.Fatalf("reload: %d %s", status, body)
+	}
+	var layers []runtimecontract.Layer
+	for range 2 {
+		status, reply := r.build(frozen(runtimecontract.Build{Layer: true}, tools))
+		if status != http.StatusOK || reply.Layer == nil {
+			t.Fatalf("build: %d %+v", status, reply)
+		}
+		layers = append(layers, *reply.Layer)
+	}
+	if layers[0] != layers[1] {
+		t.Fatalf("two builds of one source: %+v", layers)
+	}
+	blob := <-pushed
+	<-pushed
+	decoder, _ := zstd.NewReader(bytes.NewReader(blob))
+	uncompressed, _ := io.ReadAll(decoder)
+	diffID := sha256.Sum256(uncompressed)
+	if layers[0].DiffID != "sha256:"+hex.EncodeToString(diffID[:]) || layers[0].Size != int64(len(blob)) || layers[0].Architecture != runtime.GOARCH {
+		t.Fatalf("layer %+v", layers[0])
+	}
+	prefix := strings.TrimPrefix(r.root, "/")
+	var names []string
+	archive := tar.NewReader(bytes.NewReader(uncompressed))
+	for header, err := archive.Next(); err != io.EOF; header, err = archive.Next() {
+		if err != nil || header.Uid != 10001 || header.Gid != 10001 || header.ModTime.Unix() != 0 {
+			t.Fatalf("header %+v: %v", header, err)
+		}
+		name := strings.TrimPrefix(header.Name, prefix)
+		if name == "/lib/tool" && header.Mode != 0o755 || name == "/tool" && header.Linkname != "lib/tool" {
+			t.Fatalf("header %+v", header)
+		}
+		names = append(names, name)
+	}
+	if want := []string{"/", "/lib/", "/lib/tool", "/main.py", "/tool"}; !slices.Equal(names, want) {
+		t.Fatalf("layer entries %q, want %q", names, want)
+	}
+
+	failing := []string{"python3", "-c", `print("no such package"); raise SystemExit(3)`}
+	if status, reply := r.build(frozen(runtimecontract.Build{Layer: true}, failing)); status != http.StatusInternalServerError ||
+		!strings.Contains(reply.Error, "exit status 3") || reply.Output != "no such package\n" || len(pushed) != 0 {
+		t.Fatalf("failing install: %d %+v", status, reply)
+	}
+	if status, reply := r.build(frozen(runtimecontract.Build{Run: []string{"python3", "-c", `print("a" * 9999)`}})); status != http.StatusOK ||
+		reply.Stdout != strings.Repeat("a", 9999)+"\n" {
+		t.Fatalf("run: %d %+v", status, reply)
+	}
+	if status, _ := r.get(); status != http.StatusServiceUnavailable {
+		t.Fatalf("after a build: %d", status)
+	}
+
+	if status, body := r.reload(developed); status != http.StatusOK || !strings.Contains(body, "installing") {
+		t.Fatalf("reload after a build: %d %s", status, body)
 	}
 }

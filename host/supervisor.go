@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -34,6 +35,7 @@ type supervisor struct {
 	transport *http.Transport
 	turn      chan struct{}
 	app       atomic.Pointer[child]
+	record    *runtimecontract.OverlayRecord
 	written   []string
 	unpacked  string
 	installed runtimecontract.Install
@@ -42,17 +44,24 @@ type supervisor struct {
 // Run serves PORT and proxies it to the app, which it starts in the source directory with a loopback HOST and PORT of
 // the app's own. The app starts from the overlay the platform recorded, or else from the first reload.
 func Run(ctx context.Context) error {
-	root := os.Getenv(reloadDirEnv)
+	root := filepath.Clean(os.Getenv(reloadDirEnv))
 	if !filepath.IsAbs(root) {
 		return errors.New(reloadDirEnv + " must name the source directory")
-	}
-	// A writable volume outlives the container, and overlays from before this boot are of no use.
-	if err := errors.Join(os.RemoveAll(root), os.MkdirAll(root, 0o700)); err != nil {
-		return err
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
 	s := &supervisor{root: root, transport: transport, turn: make(chan struct{}, 1)}
+	// A writable volume outlives the container, and overlays from before this boot are of no use.
+	if err := s.empty(); err != nil {
+		return err
+	}
+	recorded, _ := os.ReadFile(os.Getenv(runtimecontract.OverlayFileEnv))
+	if len(recorded) != 0 {
+		s.record = new(runtimecontract.OverlayRecord)
+		if protocol.DecodeJSONNonNull(recorded, s.record) != nil || s.record.Location() == nil {
+			return errors.New("invalid " + runtimecontract.OverlayFileEnv)
+		}
+	}
 	listener, err := new(net.ListenConfig).Listen(ctx, "tcp", ":"+cmp.Or(os.Getenv("PORT"), "3000"))
 	if err != nil {
 		return err
@@ -77,7 +86,18 @@ func Run(ctx context.Context) error {
 }
 
 func (s *supervisor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodPost && r.URL.Path == runtimecontract.ReloadPath {
+	if r.Method == http.MethodPost && (r.URL.Path == runtimecontract.ReloadPath || r.URL.Path == runtimecontract.BuildPath) {
+		select {
+		case s.turn <- struct{}{}:
+		case <-r.Context().Done():
+			return
+		}
+		defer func() { <-s.turn }()
+		if r.URL.Path == runtimecontract.BuildPath {
+			status, reply := s.build(r)
+			writeReply(w, status, reply)
+			return
+		}
 		s.reload(w, r)
 		return
 	}
@@ -93,17 +113,12 @@ func (s *supervisor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // boot starts the app from the overlay the platform recorded. Without one, or while the registry does not hold it
 // yet, the app waits for the first reload.
 func (s *supervisor) boot(ctx context.Context) error {
-	recorded, _ := os.ReadFile(os.Getenv(runtimecontract.OverlayFileEnv))
-	if len(recorded) == 0 {
+	if s.record == nil {
 		return nil
-	}
-	var record runtimecontract.OverlayRecord
-	if protocol.DecodeJSONNonNull(recorded, &record) != nil || record.Location() == nil {
-		return errors.New("invalid " + runtimecontract.OverlayFileEnv)
 	}
 	s.turn <- struct{}{}
 	defer func() { <-s.turn }()
-	found, err := s.fetch(ctx, record)
+	found, err := s.fetch(ctx)
 	if err != nil || !found {
 		return err
 	}
@@ -117,12 +132,6 @@ func (s *supervisor) boot(ctx context.Context) error {
 // reload replaces the app with one running from the posted overlay, and answers once it accepts connections. An app
 // that does not start stays down until the next reload.
 func (s *supervisor) reload(w http.ResponseWriter, r *http.Request) {
-	select {
-	case s.turn <- struct{}{}:
-	case <-r.Context().Done():
-		return
-	}
-	defer func() { <-s.turn }()
 	overlay, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeReply(w, http.StatusBadRequest, runtimecontract.ReloadReply{Error: "read source: " + err.Error()})
@@ -144,10 +153,7 @@ func (s *supervisor) reload(w http.ResponseWriter, r *http.Request) {
 func (s *supervisor) launch(ctx context.Context) (int, runtimecontract.ReloadReply) {
 	var output tail
 	var plan runtimecontract.Plan
-	data, err := os.ReadFile(filepath.Join(s.root, runtimecontract.PlanFile))
-	if err == nil {
-		err = protocol.DecodeJSONStrict(data, &plan)
-	}
+	err := s.decode(runtimecontract.PlanFile, &plan)
 	if err == nil && !reflect.DeepEqual(plan.Install, s.installed) {
 		s.installed = runtimecontract.Install{}
 		if err = s.run(ctx, plan.Install.Commands, &output); err == nil {
@@ -179,9 +185,66 @@ func (s *supervisor) launch(ctx context.Context) (int, runtimecontract.ReloadRep
 	return status, runtimecontract.ReloadReply{Output: string(output)}
 }
 
-func (s *supervisor) run(ctx context.Context, commands [][]string, output io.Writer) error {
+var buildEnvironment = []string{"SOURCE_DATE_EPOCH=0", "UV_PYTHON_DOWNLOADS=never"}
+
+func (s *supervisor) build(r *http.Request) (int, runtimecontract.BuildReply) {
+	s.stop()
+	if err := s.empty(); err != nil {
+		return http.StatusInternalServerError, runtimecontract.BuildReply{Error: err.Error()}
+	}
+	var plan runtimecontract.Plan
+	var build runtimecontract.Build
+	_, err := s.unpack(r.Body)
+	if err == nil {
+		err = errors.Join(s.decode(runtimecontract.PlanFile, &plan), s.decode(runtimecontract.BuildFile, &build))
+	}
+	if err == nil && build.Layer && s.record == nil {
+		err = errors.New("no repository is recorded for this app")
+	}
+	if err != nil {
+		return http.StatusBadRequest, runtimecontract.BuildReply{Error: err.Error()}
+	}
+	var output tail
+	if err := s.run(r.Context(), slices.Concat(plan.Install.Commands, plan.Prepare), &output, buildEnvironment...); err != nil {
+		return http.StatusInternalServerError, runtimecontract.BuildReply{Error: "the install or build failed: " + err.Error(), Output: string(output)}
+	}
+	var reply runtimecontract.BuildReply
+	if build.Layer {
+		layer, err := s.push(r.Context(), r.Header.Get(runtimecontract.BuildTokenHeader))
+		if err != nil {
+			return http.StatusInternalServerError, runtimecontract.BuildReply{Error: "push the layer: " + err.Error()}
+		}
+		reply.Layer = &layer
+	}
+	if len(build.Run) != 0 {
+		command, _ := s.command(r.Context(), build.Run, buildEnvironment...)
+		var stderr tail
+		command.Stderr = &stderr
+		stdout, err := command.Output()
+		reply.Stdout = string(stdout)
+		if err != nil {
+			return http.StatusInternalServerError, runtimecontract.BuildReply{Error: err.Error(), Output: string(stderr), Stdout: reply.Stdout}
+		}
+	}
+	return http.StatusOK, reply
+}
+
+func (s *supervisor) empty() error {
+	s.written, s.unpacked, s.installed = nil, "", runtimecontract.Install{}
+	return errors.Join(os.RemoveAll(s.root), os.MkdirAll(s.root, 0o700))
+}
+
+func (s *supervisor) decode(name string, value any) error {
+	data, err := os.ReadFile(filepath.Join(s.root, name))
+	if err != nil {
+		return err
+	}
+	return protocol.DecodeJSONStrict(data, value)
+}
+
+func (s *supervisor) run(ctx context.Context, commands [][]string, output io.Writer, env ...string) error {
 	for _, argv := range commands {
-		command, err := s.command(ctx, argv)
+		command, err := s.command(ctx, argv, env...)
 		if err != nil {
 			return err
 		}
@@ -292,7 +355,7 @@ func loopbackAddress() (string, error) {
 	return listener.Addr().String(), nil
 }
 
-func writeReply(w http.ResponseWriter, status int, reply runtimecontract.ReloadReply) {
+func writeReply(w http.ResponseWriter, status int, reply any) {
 	w.Header().Set(protocol.HeaderContentType, protocol.MIMEApplicationJSON)
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(reply)
