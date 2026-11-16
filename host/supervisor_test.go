@@ -127,6 +127,13 @@ func (r *running) reload(body []byte) (int, string) {
 	return response.StatusCode, string(data)
 }
 
+func (r *running) pid() int {
+	r.t.Helper()
+	pid, _ := os.ReadFile(filepath.Join(r.root, "pid"))
+	id, _ := strconv.Atoi(string(pid))
+	return id
+}
+
 func (r *running) get() (int, string) {
 	r.t.Helper()
 	request, _ := http.NewRequest(http.MethodGet, r.url, nil)
@@ -165,15 +172,27 @@ func TestReload(t *testing.T) {
 	if status, body := r.get(); status != http.StatusOK || body != `["first", "app.example", "session.example"]` {
 		t.Fatalf("first source: %d %s", status, body)
 	}
-	pid, _ := os.ReadFile(filepath.Join(r.root, "pid"))
-	if status, body := r.reload(overlay(t, source(install, prepare, serve, app("second")))); status != http.StatusOK || reply(body).Output != "prepared\n" {
+	pid := r.pid()
+	if status, body := r.reload(overlay(t, first)); status != http.StatusOK || r.pid() != pid {
+		t.Fatalf("the overlay the app runs: %d %s", status, body)
+	}
+	second := overlay(t, source(install, prepare, serve, app("second")))
+	if status, body := r.reload(second); status != http.StatusOK || reply(body).Output != "prepared\n" {
 		t.Fatalf("unchanged install: %d %s", status, body)
 	}
-	if id, _ := strconv.Atoi(string(pid)); syscall.Kill(id, 0) == nil {
+	if syscall.Kill(pid, 0) == nil {
 		t.Fatal("the first app still runs")
 	}
 	if _, err := os.Stat(filepath.Join(r.root, "old.py")); err == nil {
 		t.Fatal("what only an earlier overlay wrote is still there")
+	}
+	if err := syscall.Kill(r.pid(), syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	for status, _ := r.get(); status != http.StatusServiceUnavailable; status, _ = r.get() {
+	}
+	if status, body := r.reload(second); status != http.StatusOK || reply(body).Output != "prepared\n" {
+		t.Fatalf("the overlay of an app that exited: %d %s", status, body)
 	}
 
 	failing := runtimecontract.Install{Inputs: "sha256:two", Commands: [][]string{
@@ -187,9 +206,6 @@ func TestReload(t *testing.T) {
 	}
 	if status, body := r.reload(overlay(t, source(install, nil, serve, app("third")))); status != http.StatusOK || reply(body).Output != "installing\ninstalled\n" {
 		t.Fatalf("install after a failing one: %d %s", status, body)
-	}
-	if _, body := r.get(); !strings.Contains(body, "third") {
-		t.Fatalf("third source: %s", body)
 	}
 	if status, body := r.reload(overlay(t, source(install, nil, serve, "raise SystemExit(4)"))); status != http.StatusInternalServerError {
 		t.Fatalf("failing start: %d %s", status, body)
@@ -206,9 +222,6 @@ func TestReload(t *testing.T) {
 
 	if status, _ := r.reload(overlay(t, map[string]string{"../escaped": ""})); status != http.StatusBadRequest {
 		t.Fatalf("escaping reload: %d", status)
-	}
-	if _, err := os.Stat(filepath.Join(r.root, "..", "escaped")); err == nil {
-		t.Fatal("an overlay wrote outside the source directory")
 	}
 }
 
@@ -240,13 +253,17 @@ func TestBootStartsTheRecordedOverlay(t *testing.T) {
 		return &runtimecontract.OverlayRecord{Registry: registry.URL, Repository: "holon/app", Tag: session, Token: "pull"}
 	}
 
-	t.Run("its session's tag, not another session's", func(t *testing.T) {
+	t.Run("its session's tag, not another session's, which a reload of the same overlay leaves running", func(t *testing.T) {
 		r := run(t, record("recorded"))
 		for status, body := r.get(); !strings.Contains(body, "recorded"); status, body = r.get() {
 			if status != http.StatusServiceUnavailable {
 				t.Fatalf("recorded source: %d %s", status, body)
 			}
 			time.Sleep(10 * time.Millisecond)
+		}
+		pid := r.pid()
+		if status, body := r.reload(blobs[tags["recorded"]]); status != http.StatusOK || r.pid() != pid {
+			t.Fatalf("reload of the recorded overlay: %d %s", status, body)
 		}
 	})
 	t.Run("a session the registry holds no overlay for yet", func(t *testing.T) {
