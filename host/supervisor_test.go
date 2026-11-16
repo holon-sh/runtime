@@ -343,7 +343,11 @@ func TestBuild(t *testing.T) {
 		}
 	}))
 	t.Cleanup(registry.Close)
-	r := run(t, &runtimecontract.OverlayRecord{Registry: registry.URL, Repository: "holon/app", Tag: "session", Token: "pull"})
+	record := &runtimecontract.OverlayRecord{Registry: registry.URL, Repository: "holon/app", Tag: "session", Token: "pull"}
+	base := digest.FromString("base")
+	t.Setenv(runtimecontract.BaseImageEnv, "registry.example/holon/development@"+base.String())
+	r := run(t, record)
+	annotations := map[string]string{ocispec.AnnotationBaseImageName: "registry.example/holon/development@" + base.String(), ocispec.AnnotationBaseImageDigest: base.String()}
 	serve := []string{"python3", "main.py"}
 	install := runtimecontract.Install{Inputs: "sha256:one", Commands: [][]string{{"echo", "installing"}}}
 	frozen := func(build runtimecontract.Build, commands ...[]string) []byte {
@@ -369,7 +373,8 @@ os.symlink("lib/tool", "tool")`}
 		}
 		data, _ := held.Load(manifest.Config.Digest.String())
 		if json.Unmarshal(data.([]byte), &config) != nil || manifest.Config.MediaType != ocispec.MediaTypeImageConfig || config.Architecture != runtime.GOARCH ||
-			config.OS != runtime.GOOS || config.Config.WorkingDir != r.root || len(config.RootFS.DiffIDs) != len(manifest.Layers) {
+			config.OS != runtime.GOOS || config.Config.WorkingDir != r.root || len(config.RootFS.DiffIDs) != len(manifest.Layers) ||
+			!maps.Equal(manifest.Annotations, annotations) {
 			t.Fatalf("image %+v %+v", manifest, config)
 		}
 		var layers [][]string
@@ -430,5 +435,11 @@ os.symlink("lib/tool", "tool")`}
 
 	if status, body := r.reload(developed); status != http.StatusOK || !strings.Contains(body, "installing") {
 		t.Fatalf("reload after a build: %d %s", status, body)
+	}
+
+	t.Setenv(runtimecontract.BaseImageEnv, "registry.example/holon/development:latest")
+	if status, reply := run(t, record).build(frozen(freeze, tools)); status != http.StatusBadRequest ||
+		!strings.Contains(reply.Error, runtimecontract.BaseImageEnv) || uploads.Load() != 0 {
+		t.Fatalf("freeze on a base without a digest: %d %+v", status, reply)
 	}
 }

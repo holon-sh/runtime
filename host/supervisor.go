@@ -36,6 +36,7 @@ type supervisor struct {
 	turn      chan struct{}
 	app       atomic.Pointer[child]
 	record    *runtimecontract.OverlayRecord
+	base      string
 	written   []string
 	unpacked  digest.Digest
 	installed runtimecontract.Install
@@ -61,6 +62,9 @@ func Run(ctx context.Context) error {
 		if protocol.DecodeJSONNonNull(recorded, s.record) != nil || s.record.Location() == nil {
 			return errors.New("invalid " + runtimecontract.OverlayFileEnv)
 		}
+	}
+	if base := os.Getenv(runtimecontract.BaseImageEnv); protocol.IsValidDigestImage(base) {
+		s.base = base
 	}
 	listener, err := new(net.ListenConfig).Listen(ctx, "tcp", ":"+cmp.Or(os.Getenv("PORT"), "3000"))
 	if err != nil {
@@ -201,8 +205,12 @@ func (s *supervisor) build(r *http.Request) (int, runtimecontract.BuildReply) {
 	if err == nil {
 		err = errors.Join(s.decode(runtimecontract.PlanFile, &plan), s.decode(runtimecontract.BuildFile, &build))
 	}
-	if err == nil && build.Freeze != nil && s.record == nil {
+	switch {
+	case err != nil || build.Freeze == nil:
+	case s.record == nil:
 		err = errors.New("no repository is recorded for this app")
+	case s.base == "":
+		err = errors.New(runtimecontract.BaseImageEnv + " must name the image this pod runs by digest")
 	}
 	if err != nil {
 		return fail(http.StatusBadRequest, err.Error())

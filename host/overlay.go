@@ -144,7 +144,12 @@ func (s *supervisor) freeze(ctx context.Context, token string, dependencies []st
 		Config:   ocispec.ImageConfig{WorkingDir: s.root},
 		RootFS:   ocispec.RootFS{Type: "layers"},
 	}
-	manifest := ocispec.Manifest{Versioned: specs.Versioned{SchemaVersion: 2}, MediaType: ocispec.MediaTypeImageManifest}
+	_, base, _ := strings.Cut(s.base, "@")
+	manifest := ocispec.Manifest{
+		Versioned:   specs.Versioned{SchemaVersion: 2},
+		MediaType:   ocispec.MediaTypeImageManifest,
+		Annotations: map[string]string{ocispec.AnnotationBaseImageName: s.base, ocispec.AnnotationBaseImageDigest: base},
+	}
 	for _, selected := range []struct {
 		starts   []string
 		excluded map[string]bool
