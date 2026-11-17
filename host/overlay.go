@@ -29,8 +29,7 @@ import (
 
 func (s *supervisor) fetch(ctx context.Context) (bool, error) {
 	var manifest ocispec.Manifest
-	source := s.registry(s.record.Token)
-	tagged, err := source.get(ctx, "manifests", s.record.Tag)
+	tagged, err := s.get(ctx, "manifests", s.record.Tag)
 	if tagged == nil {
 		return false, err
 	}
@@ -39,7 +38,7 @@ func (s *supervisor) fetch(ctx context.Context) (bool, error) {
 	if err != nil || len(manifest.Layers) == 0 || !protocol.ValidDigest(manifest.Layers[0].Digest.String()) {
 		return false, errors.New("the tag names no overlay")
 	}
-	blob, err := source.get(ctx, "blobs", manifest.Layers[0].Digest.String())
+	blob, err := s.get(ctx, "blobs", manifest.Layers[0].Digest.String())
 	if blob == nil {
 		return false, err
 	}
@@ -138,17 +137,16 @@ func (s *supervisor) freeze(ctx context.Context, token string, dependencies []st
 	for _, name := range dependencies {
 		source[name] = true
 	}
-	upload := s.registry(token)
 	image := ocispec.Image{
 		Platform: ocispec.Platform{Architecture: runtime.GOARCH, OS: runtime.GOOS},
 		Config:   ocispec.ImageConfig{WorkingDir: s.root},
 		RootFS:   ocispec.RootFS{Type: "layers"},
 	}
-	_, base, _ := strings.Cut(s.base, "@")
+	_, base, _ := strings.Cut(os.Getenv(runtimecontract.BaseImageEnv), "@")
 	manifest := ocispec.Manifest{
 		Versioned:   specs.Versioned{SchemaVersion: 2},
 		MediaType:   ocispec.MediaTypeImageManifest,
-		Annotations: map[string]string{ocispec.AnnotationBaseImageName: s.base, ocispec.AnnotationBaseImageDigest: base},
+		Annotations: map[string]string{ocispec.AnnotationBaseImageDigest: base},
 	}
 	for _, selected := range []struct {
 		starts   []string
@@ -157,17 +155,11 @@ func (s *supervisor) freeze(ctx context.Context, token string, dependencies []st
 		if len(selected.starts) == 0 {
 			continue
 		}
-		lowest := len(manifest.Layers) == 0
-		write := func(w io.Writer) (ocispec.Descriptor, digest.Digest, error) {
-			return s.layer(w, root.FS(), selected.starts, selected.excluded, lowest)
-		}
-		layer, diffID, err := write(io.Discard)
-		if err == nil {
-			err = upload.push(ctx, layer, func(w io.Writer) error {
-				_, _, err := write(w)
-				return err
-			})
-		}
+		var diffID digest.Digest
+		layer, err := s.push(ctx, token, ocispec.MediaTypeImageLayerZstd, func(w io.Writer) (err error) {
+			diffID, err = s.layer(w, root.FS(), selected.starts, selected.excluded, len(manifest.Layers) == 0)
+			return err
+		})
 		if err != nil {
 			return "", err
 		}
@@ -175,8 +167,7 @@ func (s *supervisor) freeze(ctx context.Context, token string, dependencies []st
 		image.RootFS.DiffIDs = append(image.RootFS.DiffIDs, diffID)
 	}
 	config, _ := json.Marshal(image)
-	manifest.Config = ocispec.Descriptor{MediaType: ocispec.MediaTypeImageConfig, Digest: digest.FromBytes(config), Size: int64(len(config))}
-	err = upload.push(ctx, manifest.Config, func(w io.Writer) error {
+	manifest.Config, err = s.push(ctx, token, ocispec.MediaTypeImageConfig, func(w io.Writer) error {
 		_, err := w.Write(config)
 		return err
 	})
@@ -185,26 +176,16 @@ func (s *supervisor) freeze(ctx context.Context, token string, dependencies []st
 	}
 	document, _ := json.Marshal(manifest)
 	reference := digest.FromBytes(document)
-	request := upload.request(ctx, http.MethodPut, upload.repository.JoinPath("manifests", reference.String()), bytes.NewReader(document))
+	request := s.request(ctx, token, http.MethodPut, s.record.Location().JoinPath("manifests", reference.String()), bytes.NewReader(document))
 	request.Header.Set(protocol.HeaderContentType, ocispec.MediaTypeImageManifest)
-	_, err = upload.send(request, http.StatusCreated)
+	_, err = s.send(request, http.StatusCreated)
 	return reference, err
 }
 
-type registry struct {
-	client     *http.Client
-	repository *url.URL
-	token      string
-}
-
-func (s *supervisor) registry(token string) registry {
-	return registry{client: &http.Client{Transport: s.transport}, repository: s.record.Location(), token: token}
-}
-
-func (r registry) get(ctx context.Context, kind, reference string) (*http.Response, error) {
-	request := r.request(ctx, http.MethodGet, r.repository.JoinPath(kind, reference), nil)
+func (s *supervisor) get(ctx context.Context, kind, reference string) (*http.Response, error) {
+	request := s.request(ctx, s.record.Token, http.MethodGet, s.record.Location().JoinPath(kind, reference), nil)
 	request.Header.Set("Accept", ocispec.MediaTypeImageManifest)
-	response, err := r.client.Do(request)
+	response, err := (&http.Client{Transport: s.transport}).Do(request)
 	if err != nil {
 		return nil, errors.New("registry unavailable")
 	}
@@ -218,19 +199,25 @@ func (r registry) get(ctx context.Context, kind, reference string) (*http.Respon
 	return nil, fmt.Errorf("registry answered %d", response.StatusCode)
 }
 
-func (r registry) push(ctx context.Context, blob ocispec.Descriptor, write func(io.Writer) error) error {
-	blobs := r.repository.JoinPath("blobs")
-	held, err := r.send(r.request(ctx, http.MethodHead, blobs.JoinPath(blob.Digest.String()), nil), http.StatusOK, http.StatusNotFound)
-	if err != nil || held.StatusCode == http.StatusOK {
-		return err
+func (s *supervisor) push(ctx context.Context, token, mediaType string, write func(io.Writer) error) (ocispec.Descriptor, error) {
+	digester := digest.SHA256.Digester()
+	var size counter
+	if err := write(io.MultiWriter(digester.Hash(), &size)); err != nil {
+		return ocispec.Descriptor{}, err
 	}
-	started, err := r.send(r.request(ctx, http.MethodPost, blobs.JoinPath("uploads/"), nil), http.StatusAccepted)
+	blob := ocispec.Descriptor{MediaType: mediaType, Digest: digester.Digest(), Size: int64(size)}
+	blobs := s.record.Location().JoinPath("blobs")
+	held, err := s.send(s.request(ctx, token, http.MethodHead, blobs.JoinPath(blob.Digest.String()), nil), http.StatusOK, http.StatusNotFound)
+	if err != nil || held.StatusCode == http.StatusOK {
+		return blob, err
+	}
+	started, err := s.send(s.request(ctx, token, http.MethodPost, blobs.JoinPath("uploads/"), nil), http.StatusAccepted)
 	var location *url.URL
 	if err == nil {
 		location, err = started.Location()
 	}
 	if err != nil {
-		return err
+		return blob, err
 	}
 	query := location.Query()
 	query.Set("digest", blob.Digest.String())
@@ -241,23 +228,23 @@ func (r registry) push(ctx context.Context, blob ocispec.Descriptor, write func(
 		_ = writer.CloseWithError(write(writer))
 		close(written)
 	}()
-	upload := r.request(ctx, http.MethodPut, location, reader)
+	upload := s.request(ctx, token, http.MethodPut, location, reader)
 	upload.ContentLength = blob.Size
 	upload.Header.Set(protocol.HeaderContentType, "application/octet-stream")
-	_, err = r.send(upload, http.StatusCreated)
+	_, err = s.send(upload, http.StatusCreated)
 	_ = reader.Close()
 	<-written
-	return err
+	return blob, err
 }
 
-func (r registry) request(ctx context.Context, method string, target *url.URL, body io.Reader) *http.Request {
+func (s *supervisor) request(ctx context.Context, token, method string, target *url.URL, body io.Reader) *http.Request {
 	request, _ := http.NewRequestWithContext(ctx, method, target.String(), body)
-	request.Header.Set(protocol.HeaderAuthorization, protocol.BearerPrefix+r.token)
+	request.Header.Set(protocol.HeaderAuthorization, protocol.BearerPrefix+token)
 	return request
 }
 
-func (r registry) send(request *http.Request, statuses ...int) (*http.Response, error) {
-	response, err := r.client.Do(request)
+func (s *supervisor) send(request *http.Request, statuses ...int) (*http.Response, error) {
+	response, err := (&http.Client{Transport: s.transport}).Do(request)
 	if err != nil {
 		return nil, err
 	}
@@ -268,14 +255,11 @@ func (r registry) send(request *http.Request, statuses ...int) (*http.Response, 
 	return response, nil
 }
 
-func (s *supervisor) layer(
-	w io.Writer, fsys fs.FS, starts []string, excluded map[string]bool, lowest bool,
-) (ocispec.Descriptor, digest.Digest, error) {
-	compressed, uncompressed := digest.SHA256.Digester(), digest.SHA256.Digester()
-	var size counter
-	encoder, err := zstd.NewWriter(io.MultiWriter(w, compressed.Hash(), &size), zstd.WithEncoderLevel(zstd.SpeedDefault), zstd.WithEncoderConcurrency(1))
+func (s *supervisor) layer(w io.Writer, fsys fs.FS, starts []string, excluded map[string]bool, lowest bool) (digest.Digest, error) {
+	uncompressed := digest.SHA256.Digester()
+	encoder, err := zstd.NewWriter(w, zstd.WithEncoderLevel(zstd.SpeedDefault), zstd.WithEncoderConcurrency(1))
 	if err != nil {
-		return ocispec.Descriptor{}, "", err
+		return "", err
 	}
 	archive := tar.NewWriter(io.MultiWriter(encoder, uncompressed.Hash()))
 	prefix := strings.TrimPrefix(s.root, "/")
@@ -333,7 +317,7 @@ func (s *supervisor) layer(
 		}
 	}
 	err = errors.Join(err, archive.Close(), encoder.Close())
-	return ocispec.Descriptor{MediaType: ocispec.MediaTypeImageLayerZstd, Digest: compressed.Digest(), Size: int64(size)}, uncompressed.Digest(), err
+	return uncompressed.Digest(), err
 }
 
 type counter int64

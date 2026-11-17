@@ -36,7 +36,6 @@ type supervisor struct {
 	turn      chan struct{}
 	app       atomic.Pointer[child]
 	record    *runtimecontract.OverlayRecord
-	base      string
 	written   []string
 	unpacked  digest.Digest
 	installed runtimecontract.Install
@@ -45,7 +44,7 @@ type supervisor struct {
 // Run serves PORT and proxies it to the app, which it starts in the source directory with a loopback HOST and PORT of
 // the app's own. The app starts from the overlay the platform recorded, or else from the first reload.
 func Run(ctx context.Context) error {
-	root := filepath.Clean(os.Getenv(reloadDirEnv))
+	root := os.Getenv(reloadDirEnv)
 	if !filepath.IsAbs(root) {
 		return errors.New(reloadDirEnv + " must name the source directory")
 	}
@@ -62,9 +61,6 @@ func Run(ctx context.Context) error {
 		if protocol.DecodeJSONNonNull(recorded, s.record) != nil || s.record.Location() == nil {
 			return errors.New("invalid " + runtimecontract.OverlayFileEnv)
 		}
-	}
-	if base := os.Getenv(runtimecontract.BaseImageEnv); protocol.IsValidDigestImage(base) {
-		s.base = base
 	}
 	listener, err := new(net.ListenConfig).Listen(ctx, "tcp", ":"+cmp.Or(os.Getenv("PORT"), "3000"))
 	if err != nil {
@@ -97,12 +93,14 @@ func (s *supervisor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer func() { <-s.turn }()
+		var status int
+		var reply any
 		if r.URL.Path == runtimecontract.BuildPath {
-			status, reply := s.build(r)
-			writeReply(w, status, reply)
-			return
+			status, reply = s.build(r)
+		} else {
+			status, reply = s.reload(r)
 		}
-		s.reload(w, r)
+		writeReply(w, status, reply)
 		return
 	}
 	app := s.app.Load()
@@ -135,23 +133,19 @@ func (s *supervisor) boot(ctx context.Context) error {
 
 // reload replaces the app with one running from the posted overlay, and answers once it accepts connections. An app
 // that does not start stays down until the next reload.
-func (s *supervisor) reload(w http.ResponseWriter, r *http.Request) {
+func (s *supervisor) reload(r *http.Request) (int, runtimecontract.ReloadReply) {
 	overlay, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeReply(w, http.StatusBadRequest, runtimecontract.ReloadReply{Error: "read source: " + err.Error()})
-		return
+		return http.StatusBadRequest, runtimecontract.ReloadReply{Error: "read source: " + err.Error()}
 	}
 	if s.app.Load() != nil && s.unpacked == digest.FromBytes(overlay) {
-		writeReply(w, http.StatusOK, runtimecontract.ReloadReply{})
-		return
+		return http.StatusOK, runtimecontract.ReloadReply{}
 	}
 	s.stop()
 	if _, err := s.unpack(bytes.NewReader(overlay)); err != nil {
-		writeReply(w, http.StatusBadRequest, runtimecontract.ReloadReply{Error: err.Error()})
-		return
+		return http.StatusBadRequest, runtimecontract.ReloadReply{Error: err.Error()}
 	}
-	status, reply := s.launch(r.Context())
-	writeReply(w, status, reply)
+	return s.launch(r.Context())
 }
 
 func (s *supervisor) launch(ctx context.Context) (int, runtimecontract.ReloadReply) {
@@ -209,7 +203,7 @@ func (s *supervisor) build(r *http.Request) (int, runtimecontract.BuildReply) {
 	case err != nil || build.Freeze == nil:
 	case s.record == nil:
 		err = errors.New("no repository is recorded for this app")
-	case s.base == "":
+	case !protocol.IsValidDigestImage(os.Getenv(runtimecontract.BaseImageEnv)):
 		err = errors.New(runtimecontract.BaseImageEnv + " must name the image this pod runs by digest")
 	}
 	if err != nil {
