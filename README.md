@@ -2,7 +2,7 @@
 
 ## Building
 
-Run `go test ./...` to test the supervisor. To build the release image for Linux amd64 and arm64, install Docker Buildx, ORAS, Python and zstd and run the following command.
+Run `go test ./...` to test the supervisor. To build the release image for Linux amd64 and arm64, install Docker Buildx, ORAS, and Python. Run the command from the repository root.
 
 ```sh
 python3 development/package.py out/development

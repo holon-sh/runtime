@@ -5,7 +5,6 @@ import subprocess
 import urllib.request
 from pathlib import Path
 
-from check_bytecode import check_bytecode
 
 supported = ["linux/amd64", "linux/arm64"]
 parser = argparse.ArgumentParser(description=__doc__)
@@ -48,19 +47,11 @@ def copy_layout(name):
     desc, = json.loads((layout / "index.json").read_bytes())["manifests"]
     target = str(out / "release") + ":" + name
     oras("cp", "--from-oci-layout", "--to-oci-layout", str(layout) + "@" + desc["digest"], target)
-    if name.startswith("python-"):
-        index = json.loads(oras("manifest", "fetch", "--oci-layout", target))
-        for native in index["manifests"]:
-            if native["platform"]["os"] != "linux":
-                continue
-            ref = str(out / "release") + "@" + native["digest"]
-            manifest = json.loads(oras("manifest", "fetch", "--oci-layout", ref))
-            check_bytecode(out / "release", manifest["layers"][-1])
     return json.loads(oras("manifest", "fetch", "--descriptor", "--oci-layout", target))
 
 
 def image(name):
-    options = "type=oci,tar=false,oci-mediatypes=true,compression=zstd,compression-level=15"
+    options = "type=oci,tar=false,oci-mediatypes=true,compression=zstd,compression-level=19,force-compression=true"
     return {"target": name, "attest": ["type=provenance,mode=min"], "output": [options + ",dest=" + str(out / name)]}
 
 
@@ -92,7 +83,20 @@ for path, data in native.items():
 
 dockerfile += "\nFROM core AS release-worker\n" + "".join(map(copy_role, [*roles, "worker"]))
 dockerfile += 'ARG TARGETARCH\nCOPY --from=catalog /linux_${TARGETARCH}/catalog.json /etc/holon-runtime.json\nENTRYPOINT ["/holon-mcp-runtime"]\n'
-bake({"release-worker": {**image("release-worker"), "contexts": {"catalog": str(discovery)}}})
+# Re-open the exported native filesystems for a real import using each packaged interpreter.
+dockerfile += """
+FROM packed-python AS check-bytecode
+COPY development/check_bytecode.py /check_bytecode.py
+RUN set -- /usr/local/bin/python3.*; "$1" -IS /check_bytecode.py
+"""
+checks = {}
+for name in roles:
+    if name.startswith("python-"):
+        ref = "oci-layout://" + str(out / name) + "@" + siblings[name]["digest"]
+        checks["check-" + name.replace(".", "-")] = {
+            "target": "check-bytecode", "contexts": {"packed-python": ref}, "output": ["type=cacheonly"],
+        }
+bake(checks | {"release-worker": {**image("release-worker"), "contexts": {"catalog": str(discovery)}}})
 worker = copy_layout("release-worker")
 release = str(out / "release")
 root = json.loads(oras("manifest", "fetch", "--oci-layout", release + "@" + worker["digest"]))
