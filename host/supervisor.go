@@ -148,10 +148,13 @@ func (s *supervisor) reload(r *http.Request) (int, runtimecontract.ReloadReply) 
 	return s.launch(r.Context())
 }
 
+var selectNode = [][]string{{"fnm", "use", "--install-if-missing"}}
+
 func (s *supervisor) launch(ctx context.Context) (int, runtimecontract.ReloadReply) {
 	var output tail
 	var plan runtimecontract.Plan
 	err := s.decode(runtimecontract.PlanFile, &plan)
+	plan.Install.Commands = slices.Concat(selectNode, plan.Install.Commands)
 	if err == nil && !reflect.DeepEqual(plan.Install, s.installed) {
 		s.installed = runtimecontract.Install{}
 		if err = s.run(ctx, plan.Install.Commands, &output); err == nil {
@@ -210,7 +213,7 @@ func (s *supervisor) build(r *http.Request) (int, runtimecontract.BuildReply) {
 		return fail(http.StatusBadRequest, err.Error())
 	}
 	var output tail
-	if err := s.run(r.Context(), slices.Concat(plan.Install.Commands, plan.Prepare), &output, buildEnvironment...); err != nil {
+	if err := s.run(r.Context(), slices.Concat(selectNode, plan.Install.Commands, plan.Prepare), &output, buildEnvironment...); err != nil {
 		return http.StatusInternalServerError, runtimecontract.BuildReply{ReloadReply: runtimecontract.ReloadReply{Error: "the install or build failed: " + err.Error(), Output: string(output)}}
 	}
 	var reply runtimecontract.BuildReply
@@ -236,7 +239,7 @@ func (s *supervisor) build(r *http.Request) (int, runtimecontract.BuildReply) {
 
 func (s *supervisor) empty() error {
 	s.written, s.unpacked, s.installed = nil, "", runtimecontract.Install{}
-	return errors.Join(os.RemoveAll(s.root), os.MkdirAll(s.root, 0o700))
+	return errors.Join(os.RemoveAll(s.root), os.MkdirAll(s.root, 0o700), os.CopyFS(s.root, os.DirFS(os.Getenv("HOLON_SOURCE_SEED"))))
 }
 
 func (s *supervisor) decode(name string, value any) error {

@@ -109,6 +109,12 @@ func run(t *testing.T, record *runtimecontract.OverlayRecord) *running {
 }
 
 func setup(t *testing.T, port, root string, record *runtimecontract.OverlayRecord) {
+	seed, bin := t.TempDir(), t.TempDir()
+	if err := os.Symlink("/usr/bin/true", filepath.Join(bin, "fnm")); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("HOLON_SOURCE_SEED", seed)
 	t.Setenv("PORT", port)
 	t.Setenv(reloadDirEnv, root)
 	t.Setenv(runtimecontract.OverlayFileEnv, "")
