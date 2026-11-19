@@ -133,6 +133,8 @@ func (s *supervisor) freeze(ctx context.Context, token string, dependencies []st
 		return "", err
 	}
 	defer func() { _ = root.Close() }()
+	toolchain, _ := fs.Glob(root.FS(), ".toolchain")
+	dependencies = append(dependencies, toolchain...)
 	source := map[string]bool{path.Dir(runtimecontract.PlanFile): true}
 	for _, name := range dependencies {
 		source[name] = true

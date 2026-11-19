@@ -364,6 +364,7 @@ func TestBuild(t *testing.T) {
 	freeze := runtimecontract.Build{Freeze: &runtimecontract.Freeze{Dependencies: []string{"lib"}}}
 	tools := []string{".holon/node", "python3", "-c", `import os
 assert os.environ["SOURCE_DATE_EPOCH"] == "0" and os.environ.get("UV_PYTHON_DOWNLOADS") != "never"
+os.makedirs(".toolchain/node")
 os.mkdir("lib")
 open("lib/tool", "w").write("tool")
 os.chmod("lib/tool", 0o755)
@@ -412,7 +413,7 @@ os.symlink("lib/tool", "tool")`}
 	if status != http.StatusOK || uploads.Swap(0) != 3 {
 		t.Fatalf("build: %d %+v", status, first)
 	}
-	if layers := image(first.Image); !slices.Equal(layers[0], []string{"/.wh..wh..opq", "/lib/", "/lib/tool"}) || !slices.Equal(layers[1], []string{"/", "/main.py", "/tool"}) {
+	if layers := image(first.Image); !slices.Equal(layers[0], []string{"/.wh..wh..opq", "/lib/", "/lib/tool", "/.toolchain/", "/.toolchain/node/"}) || !slices.Equal(layers[1], []string{"/", "/main.py", "/tool"}) {
 		t.Fatalf("layer entries %q", layers)
 	}
 	if status, second := r.build(frozen(freeze, tools)); status != http.StatusOK || second.Image != first.Image || uploads.Swap(0) != 0 {
