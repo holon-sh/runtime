@@ -21,6 +21,11 @@ jobs:
           ref: 755f19bb78a017fd6dff35da741129ed719a811c # v0.0.1-dev.60
           path: .cli
           persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: 9be2c315ff4d6dc5fb860b41c0083bc118f502b0 # v0.0.1-dev.20
+          path: .baseline
+          persist-credentials: false
       - uses: actions/setup-go@v7
         with:
           go-version-file: .cli/go.mod
@@ -35,4 +40,4 @@ jobs:
           curl -fsSLo "$RUNNER_TEMP/checksums.txt" "https://github.com/k3d-io/k3d/releases/download/v5.9.0/checksums.txt"
           (cd "$RUNNER_TEMP" && sed -n "s@_dist/\(k3d-linux-$arch\)\$@\1@p" checksums.txt | sha256sum -c -)
           sudo install "$RUNNER_TEMP/k3d-linux-$arch" /usr/local/bin/k3d
-      - run: python3 development/check/cluster.py .cli
+      - run: python3 development/check/cluster.py .cli .baseline

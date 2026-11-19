@@ -18,7 +18,7 @@ from urllib.request import Request, urlopen
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 ARCH = {"x86_64": "amd64", "aarch64": "arm64", "arm64": "arm64"}[platform.machine()]
-PUBLISHED_BASE = "ghcr.io/holon-sh/development@sha256:799756844538e51f867b2ecb0f82bd311a2090a8bf476c11141778509742975a"
+BASELINE = "source-image:dev20"
 REGISTRY = "registry:3@sha256:82f6ff4a7f982960c8aa51617fea3aabc485df6e55cce80d22deb1de36f1bc3c"
 SQUID = "ubuntu/squid:6.10-24.10_beta@sha256:c9f5212b147a766529c7b026e2bebed37b998d33d0066b658596af5eba7cc65c"
 
@@ -86,7 +86,7 @@ def policy(mode, allowed):
            "spec": {"podSelector": {"matchLabels": {"mode": mode}}, "policyTypes": ["Egress"], "egress": rules}})
 
 
-def proof(cli, work, stack):
+def proof(cli, baseline, work, stack):
     name = "source-" + work.name[-8:].lower().replace("_", "x")
     node = f"k3d-{name}-server-0"
     archive = work / "base.tar"
@@ -208,14 +208,16 @@ def proof(cli, work, stack):
             run("uv", "lock", "--directory", project, "--default-index", "https://pypi.org/simple")
 
         if app == "python":
-            run("docker", "exec", node, "ctr", "-n", "k8s.io", "images", "pull", "--platform", "linux/"+ARCH, PUBLISHED_BASE)
+            # Rebuild the chart pin's public source without granting this pull request registry credentials.
+            run("docker", "buildx", "build", "--load", "-t", BASELINE, "-f", baseline/"development/Dockerfile", baseline)
+            run("k3d", "image", "import", BASELINE, "-c", name)
             control = work/"published"
             shutil.copytree(project, control)
-            build_pod("python-published", app, PUBLISHED_BASE)
+            build_pod("python-published", app, BASELINE)
             with port_forward("python-published") as url:
-                submit(url, control, entry, "published Python cold")
+                submit(url, control, entry, "dev.20 rebuild Python cold")
                 version = check_response(url, first+".", "first")
-                source_edits(url, control, entry, "published Python source-only", version)
+                source_edits(url, control, entry, "dev.20 rebuild Python source-only", version)
             run("kubectl", "delete", "pod", "python-published", "--wait=false")
 
         pod = app+"-dev"
@@ -308,4 +310,4 @@ def proof(cli, work, stack):
 
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory(prefix="source-image-") as tmp, contextlib.ExitStack() as resources:
-        proof(Path(sys.argv[1]).resolve(), Path(tmp), resources)
+        proof(Path(sys.argv[1]).resolve(), Path(sys.argv[2]).resolve(), Path(tmp), resources)
