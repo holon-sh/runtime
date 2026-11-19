@@ -30,13 +30,14 @@ COPY --from=runtime /holon-mcp-runtime /holon-mcp-runtime
 FROM ghcr.io/holon-sh/development@sha256:799756844538e51f867b2ecb0f82bd311a2090a8bf476c11141778509742975a AS seed
 USER 0
 COPY --from=worker / /worker/
-COPY development/package.py /package.py
-RUN FNM_DIR=/tmp/latest /worker/usr/local/bin/fnm install --lts --progress never \
+COPY development/seed.py /seed.py
+ARG NODE_LTS
+RUN FNM_DIR=/tmp/latest /worker/usr/local/bin/fnm install "$NODE_LTS" --progress never \
  && set -- /opt/uv/python/cpython-*/bin/python3 \
- && "$1" /package.py seed /out
+ && "$1" /seed.py
 
-FROM scratch AS layers
-COPY --from=seed /out/ /
+FROM scratch AS discovery
+COPY --from=seed /discovery/ /
 
 FROM core AS development
 COPY --from=worker / /
