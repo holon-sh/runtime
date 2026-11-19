@@ -17,3 +17,32 @@ jobs:
           go-version-file: go.mod
       - run: go vet ./...
       - run: go test -race ./...
+  node-lts:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: docker build -f development/Dockerfile -t development .
+      - name: Serve a project with no Node version declaration
+        working-directory: ${{ runner.temp }}
+        shell: bash
+        run: |
+          mkdir -p app/.holon && cd app
+          echo '{}' > package.json
+          echo '{"install":{"commands":[["npm","install"]]},"start":["node","server.cjs"]}' > .holon/plan.json
+          echo "require('node:http').createServer((req, res) => res.end(process.getuid() + ' ' + process.version)).listen(+process.env.PORT, process.env.HOST)" > server.cjs
+          tar --zstd -cf ../source.tar.zst .holon package.json server.cjs
+          container=$(docker run -d --read-only --cap-drop ALL --tmpfs /app:exec,uid=10001,gid=10001,size=2g \
+            --tmpfs /tmp:uid=10001,gid=10001,size=64m -p 127.0.0.1::3000 development)
+          trap 'docker rm -f "$container" >/dev/null' EXIT
+          url=http://$(docker port "$container" 3000/tcp)
+          curl --fail-with-body -sS --retry 2 --retry-connrefused --max-time 180 \
+            -H 'Content-Type: application/vnd.holon.source-overlay.v0.tar+zstd' --data-binary @../source.tar.zst "$url/.holon/reload"
+          lts=$(curl -fsS --max-time 30 https://nodejs.org/dist/index.json | jq -er 'first(.[] | select(.lts)).version')
+          curl -fsS "$url" | grep -Fx "10001 $lts"
