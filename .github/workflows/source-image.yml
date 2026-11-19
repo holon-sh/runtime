@@ -50,7 +50,7 @@ jobs:
           sudo install "$RUNNER_TEMP/k3d-linux-$arch" /usr/local/bin/k3d
       - name: Build the native deliverable
         env:
-          DEST: ${{ runner.temp }}/roles
+          DEST: out/development
         run: |
           arch=$(go env GOARCH)
           docker buildx bake -f development/release.hcl --set "*.platform=linux/$arch"
