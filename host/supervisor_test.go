@@ -109,6 +109,18 @@ func run(t *testing.T, record *runtimecontract.OverlayRecord) *running {
 }
 
 func setup(t *testing.T, port, root string, record *runtimecontract.OverlayRecord) {
+	seed, bin := t.TempDir(), t.TempDir()
+	if err := os.Mkdir(filepath.Join(seed, ".holon"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/usr/bin/env", filepath.Join(seed, ".holon", "cached-node")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bin, "fnm"), []byte("#!/bin/sh\nln -sf cached-node .holon/node\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("HOLON_SOURCE_SEED", seed)
 	t.Setenv("PORT", port)
 	t.Setenv(reloadDirEnv, root)
 	t.Setenv(runtimecontract.OverlayFileEnv, "")
@@ -179,7 +191,7 @@ func TestReload(t *testing.T) {
 	r := run(t, nil)
 	serve := []string{"python3", "-c", "import subprocess; raise SystemExit(subprocess.run(['python3', 'main.py']).returncode)"}
 	prepare := [][]string{{"echo", "prepared"}}
-	install := runtimecontract.Install{Inputs: "sha256:one", Commands: [][]string{{"echo", "installing"}, {"echo", "installed"}}}
+	install := runtimecontract.Install{Inputs: "sha256:one", Commands: [][]string{{".holon/node", "echo", "installing"}, {"echo", "installed"}}}
 	first := source(install, prepare, serve, app("first"))
 	first["old.py"] = ""
 	if status, reply := r.reload(overlay(t, first)); status != http.StatusOK || reply.Output != "installing\ninstalled\nprepared\n" {
@@ -350,7 +362,7 @@ func TestBuild(t *testing.T) {
 		return overlay(t, files)
 	}
 	freeze := runtimecontract.Build{Freeze: &runtimecontract.Freeze{Dependencies: []string{"lib"}}}
-	tools := []string{"python3", "-c", `import os
+	tools := []string{".holon/node", "python3", "-c", `import os
 assert os.environ["SOURCE_DATE_EPOCH"] == "0" and os.environ.get("UV_PYTHON_DOWNLOADS") != "never"
 os.mkdir("lib")
 open("lib/tool", "w").write("tool")
