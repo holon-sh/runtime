@@ -377,6 +377,14 @@ def proof(cli, baseline, work, stack):
                     measurements.update(deploy_cli_and_freeze=total, build_freeze_post=post)
                 _, measurements["cli_assemble"] = timed(released, FROZEN=reply["image"], APP=sample, ENTRY=entry,
                                                          BASE_REPOSITORY=base_repository)
+                media = {"Accept": "application/vnd.oci.image.manifest.v1+json"}
+                manifests = f"http://{host}/v2/{sample}/manifests/"
+                assembled = request(manifests+"production", headers=media)
+                layers = request(manifests+reply["image"], headers=media)["layers"]
+                sizes = {"base": sum(l["size"] for l in assembled["layers"][:-len(layers)]),
+                         "frozen": [l["size"] for l in layers], "total": sum(l["size"] for l in assembled["layers"])}
+                assert assembled["layers"][-len(layers):] == layers, "assembled image did not append the frozen layers"
+                print("BYTES", ARCH, app, side, rep+1, json.dumps(sizes), flush=True)
                 frozen, measurements["pull_assembled"] = timed(cache_image, sample+":production")
                 began = time.monotonic()
                 start_pod(production, frozen, {"HOST":"0.0.0.0"}, production=True)
