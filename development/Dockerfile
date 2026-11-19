@@ -13,19 +13,17 @@ ADD --checksum=sha256:7807664f39d39fc518da1c35ba0181e4b3267603c4b1dedeb4b5fc6ae4
 ARG TARGETARCH
 RUN unzip -q /fnm-$TARGETARCH.zip -d /out && chmod 0755 /out/fnm
 
-# Keep one warm Node and the donor's oldest installed Python as optional resolver caches.
+# Seed optional resolver caches from the donor's installed toolchains.
 FROM ghcr.io/holon-sh/development@sha256:799756844538e51f867b2ecb0f82bd311a2090a8bf476c11141778509742975a AS cache
-USER 0
-RUN set -eu; cd /; set -- /opt/uv/python/cpython-*/bin/python3; python=$(realpath "$1"); \
-    node=/warm/opt/holon/node/versions/$(node --version); mkdir -p "$node"; ln -s /usr/local "$node/installation"; \
-    cp -a --parents "$(dirname "$(dirname "$python")")" \
-      /usr/local/bin/node /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/pnpm /usr/local/bin/pnpx \
-      /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/pnpm /usr/local/bin/uv /usr/local/bin/uvx /warm; \
-    ln -s "$python" "/warm/usr/local/bin/${python##*/}"
 
 FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libatomic1 netbase tzdata && rm -rf /var/lib/apt/lists/*
-COPY --from=cache /warm/ /
+RUN --mount=from=cache,target=/donor set -eu; cd /donor; \
+    cp -a --parents opt/uv/python usr/local/bin/python3.* \
+      usr/local/bin/node usr/local/bin/npm usr/local/bin/npx usr/local/bin/pnpm usr/local/bin/pnpx \
+      usr/local/lib/node_modules/npm usr/local/lib/node_modules/pnpm usr/local/bin/uv usr/local/bin/uvx /; \
+    node=/opt/holon/node/versions/$(node --version); mkdir -p "$node"; ln -s /usr/local "$node/installation"; \
+    hardlink /opt/uv/python /usr/local
 COPY --from=fnm /out/fnm /usr/local/bin/fnm
 COPY --from=runtime /holon-mcp-runtime /holon-mcp-runtime
 COPY development/resolve.cjs /usr/local/lib/holon/resolve.cjs
