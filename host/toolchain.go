@@ -64,7 +64,7 @@ func (s *supervisor) prepare(ctx context.Context, plan runtimecontract.Plan, out
 		}
 		// uv sync compiles packages but skips the downloaded standard library.
 		// Cache only the installed interpreter for dev restarts. Source stays live.
-		if len(env) == 0 && len(plan.Start) != 0 && plan.Start[0] == ".venv/bin/python" {
+		if len(env) == 0 && len(plan.Start) != 0 && plan.Start[0] == ".venv/bin/python" && s.executableBase(filepath.Join(s.root, plan.Start[0])) == "" {
 			cache := []string{plan.Start[0], "-IS", "-c", `import compileall, sysconfig
 compileall.compile_dir(sysconfig.get_path("stdlib"), quiet=2)`}
 			if err := s.run(ctx, [][]string{cache}, output); err != nil {
@@ -159,8 +159,11 @@ func (s *supervisor) resolveNode(ctx context.Context, node nodeProject, output i
 	if err := os.MkdirAll(managerDir, 0o755); err != nil {
 		return err
 	}
-	if err := s.installNode(ctx, node, managerDir, output); err != nil {
+	if err := s.selectNode(ctx, node, managerDir, output); err != nil {
 		return err
+	}
+	if bin := cache.Managers[node.manager+"@"+node.pin]; node.pin != "" && bin != "" {
+		return os.Symlink(bin, filepath.Join(managerDir, "bin"))
 	}
 	if node.manager == "npm" && node.pin == "" {
 		return nil
@@ -190,10 +193,52 @@ func (s *supervisor) resolveNode(ctx context.Context, node nodeProject, output i
 	return npm("install", "--global", "--prefix", managerDir, "--ignore-scripts", spec)
 }
 
-func (s *supervisor) installNode(ctx context.Context, node nodeProject, scratch string, output io.Writer) error {
+// Only an exact project declaration can use an installed interpreter without
+// consulting fnm. Ranges and the LTS default must see the current upstream index.
+func (s *supervisor) selectNode(ctx context.Context, node nodeProject, scratch string, output io.Writer) error {
+	selected := filepath.Join(s.root, toolchainDir, "node")
+	for _, version := range node.versions {
+		if version != "" {
+			cached := nodeVersions + "/v" + strings.TrimPrefix(version, "v") + "/installation"
+			if cache.Bases[cached] != "" {
+				return link(cached, selected)
+			}
+			break
+		}
+	}
+	tree, err := os.MkdirTemp(filepath.Dir(s.root), ".fnm-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tree)
+	for installed := range cache.Bases {
+		if strings.HasPrefix(installed, nodeVersions+"/") {
+			version := filepath.Dir(installed)
+			if err := link(version, filepath.Join(tree, "node-versions", filepath.Base(version))); err != nil {
+				return err
+			}
+		}
+	}
+	if err := s.installNode(ctx, node, scratch, output, "FNM_DIR="+tree); err != nil {
+		return err
+	}
+	installed, err := filepath.EvalSymlinks(filepath.Join(tree, "aliases/default"))
+	if err != nil {
+		return err
+	}
+	if cache.Bases[installed] != "" {
+		return link(installed, selected)
+	}
+	if err := os.MkdirAll(filepath.Dir(selected), 0o755); err != nil {
+		return err
+	}
+	return os.Rename(installed, selected)
+}
+
+func (s *supervisor) installNode(ctx context.Context, node nodeProject, scratch string, output io.Writer, env string) error {
 	install := []string{"fnm", "install", "--progress", "never"}
 	if node.versions != [3]string{} {
-		return s.run(ctx, [][]string{install}, output)
+		return s.run(ctx, [][]string{install}, output, env)
 	}
 	// fnm parses npm ranges from engines.node, including ranges its positional
 	// argument cannot express. Keep the project's manifest untouched.
@@ -202,14 +247,14 @@ func (s *supervisor) installNode(ctx context.Context, node nodeProject, scratch 
 		if err := os.WriteFile(filepath.Join(scratch, "package.json"), manifest, 0o600); err != nil {
 			return err
 		}
-		cmd := s.command(ctx, install)
+		cmd := s.command(ctx, install, env)
 		var message tail
 		cmd.Dir, cmd.Stdout, cmd.Stderr = scratch, output, io.MultiWriter(output, &message)
 		if err := cmd.Run(); err == nil || !unmatchedNodeRange.Match(message) {
 			return err
 		}
 	}
-	return s.run(ctx, [][]string{append(install, "--lts")}, output)
+	return s.run(ctx, [][]string{append(install, "--lts")}, output, env)
 }
 
 // fnm 1.39 reports an unparseable range, an unsatisfied range and a transport
