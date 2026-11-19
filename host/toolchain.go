@@ -52,13 +52,6 @@ func (s *supervisor) prepare(ctx context.Context, plan runtimecontract.Plan, out
 		if err := os.RemoveAll(filepath.Join(s.root, toolchainDir)); err != nil {
 			return err
 		}
-		for _, argv := range plan.Install.Commands {
-			if len(argv) != 0 && argv[0] == "uv" {
-				if err := os.RemoveAll(filepath.Join(s.root, ".venv")); err != nil {
-					return err
-				}
-			}
-		}
 		if node.manager != "" {
 			if err := s.resolveNode(ctx, node, output); err != nil {
 				return err
