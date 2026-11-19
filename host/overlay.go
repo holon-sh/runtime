@@ -281,10 +281,10 @@ func (s *supervisor) layer(w io.Writer, fsys fs.FS, starts []string, excluded ma
 		if err != nil {
 			return err
 		}
-		if excluded[name] && entry.IsDir() {
-			return fs.SkipDir
-		}
 		if excluded[name] {
+			if entry.IsDir() {
+				return fs.SkipDir
+			}
 			return nil
 		}
 		info, err := entry.Info()

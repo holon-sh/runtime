@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -164,10 +165,7 @@ func (s *supervisor) execute(ctx context.Context, build *runtimecontract.Build, 
 	}
 	var output tail
 	if err == nil {
-		err = s.install(ctx, plan.Install, &output, env...)
-	}
-	if err == nil {
-		err = s.run(ctx, plan.Prepare, &output, env...)
+		err = s.prepare(ctx, plan, &output, env...)
 	}
 	if err != nil {
 		return http.StatusInternalServerError, runtimecontract.BuildReply{ReloadReply: runtimecontract.ReloadReply{Error: "the install or build failed: " + err.Error(), Output: string(output)}}
@@ -215,16 +213,27 @@ func (s *supervisor) decode(name string, value any) error {
 }
 
 // Install and prepare use the same commands in a live reload and a clean build.
-func (s *supervisor) install(ctx context.Context, next runtimecontract.Install, output io.Writer, env ...string) error {
-	if reflect.DeepEqual(s.installed, &next) {
-		return nil
+func (s *supervisor) prepare(ctx context.Context, plan runtimecontract.Plan, output io.Writer, env ...string) error {
+	if !reflect.DeepEqual(s.installed, &plan.Install) {
+		s.installed = nil
+		commands := plan.Install.Commands
+		interpreter, _ := os.Readlink(filepath.Join(s.root, ".venv/bin/python"))
+		relative, _ := filepath.Rel(s.root, interpreter)
+		managed, _ := filepath.Match(".toolchain/python/*/bin/python*", relative)
+		if managed {
+			selected, _ := s.command(ctx, []string{"uv", "python", "find", "--no-python-downloads"}, env...).Output()
+			target, _ := filepath.EvalSymlinks(strings.TrimSpace(string(selected)))
+			if target != interpreter {
+				version := filepath.Base(filepath.Dir(filepath.Dir(interpreter)))
+				commands = append([][]string{{"uv", "python", "uninstall", "--install-dir", ".toolchain/python", "--", version}}, commands...)
+			}
+		}
+		if err := s.run(ctx, commands, output, env...); err != nil {
+			return err
+		}
+		s.installed = &plan.Install
 	}
-	s.installed = nil
-	if err := s.run(ctx, next.Commands, output, env...); err != nil {
-		return err
-	}
-	s.installed = &next
-	return nil
+	return s.run(ctx, plan.Prepare, output, env...)
 }
 
 func (s *supervisor) run(ctx context.Context, commands [][]string, output io.Writer, env ...string) error {
