@@ -35,7 +35,7 @@ type supervisor struct {
 	transport *http.Transport
 	turn      chan struct{}
 	app       atomic.Pointer[child]
-	record    *runtimecontract.OverlayRecord
+	record    runtimecontract.OverlayRecord
 	written   []string
 	unpacked  digest.Digest
 	installed runtimecontract.Install
@@ -56,11 +56,8 @@ func Run(ctx context.Context) error {
 		return err
 	}
 	recorded, _ := os.ReadFile(os.Getenv(runtimecontract.OverlayFileEnv))
-	if len(recorded) != 0 {
-		s.record = new(runtimecontract.OverlayRecord)
-		if protocol.DecodeJSONNonNull(recorded, s.record) != nil || s.record.Location() == nil {
-			return errors.New("invalid " + runtimecontract.OverlayFileEnv)
-		}
+	if protocol.DecodeJSONNonNull(recorded, &s.record) != nil || s.record.Location() == nil {
+		return errors.New("invalid " + runtimecontract.OverlayFileEnv)
 	}
 	listener, err := new(net.ListenConfig).Listen(ctx, "tcp", ":"+cmp.Or(os.Getenv("PORT"), "3000"))
 	if err != nil {
@@ -117,9 +114,6 @@ func (s *supervisor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // boot starts the app from the overlay the platform recorded. Without one, or while the registry does not hold it
 // yet, the app waits for the first reload.
 func (s *supervisor) boot(ctx context.Context) error {
-	if s.record == nil {
-		return nil
-	}
 	found, err := s.fetch(ctx)
 	if err != nil || !found {
 		return err
@@ -201,9 +195,6 @@ func (s *supervisor) build(r *http.Request) (int, runtimecontract.BuildReply) {
 	_, err := s.unpack(r.Body)
 	if err == nil {
 		err = errors.Join(s.decode(runtimecontract.PlanFile, &plan), s.decode(runtimecontract.BuildFile, &build))
-	}
-	if err == nil && build.Freeze != nil && s.record == nil {
-		err = errors.New("no repository is recorded for this app")
 	}
 	if err != nil {
 		return fail(http.StatusBadRequest, err.Error())
