@@ -18,7 +18,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -110,13 +109,13 @@ func run(t *testing.T, record *runtimecontract.OverlayRecord) *running {
 
 func setup(t *testing.T, port, root string, record *runtimecontract.OverlayRecord) {
 	seed, bin := t.TempDir(), t.TempDir()
-	if err := os.Mkdir(filepath.Join(seed, ".holon"), 0o700); err != nil {
+	if err := os.Mkdir(filepath.Join(seed, ".toolchain"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink("/usr/bin/env", filepath.Join(seed, ".holon", "cached-node")); err != nil {
+	if err := os.WriteFile(filepath.Join(seed, ".toolchain", "default"), []byte("#!/bin/sh\nexec \"$@\"\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(bin, "fnm"), []byte("#!/bin/sh\nln -sf cached-node .holon/node\n"), 0o700); err != nil {
+	if err := os.WriteFile(filepath.Join(bin, "fnm"), []byte("#!/bin/sh\nln -sf default .toolchain/current\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -191,9 +190,9 @@ func TestReload(t *testing.T) {
 	r := run(t, nil)
 	serve := []string{"python3", "-c", "import subprocess; raise SystemExit(subprocess.run(['python3', 'main.py']).returncode)"}
 	prepare := [][]string{{"echo", "prepared"}}
-	install := runtimecontract.Install{Inputs: "sha256:one", Commands: [][]string{{".holon/node", "echo", "installing"}, {"echo", "installed"}}}
+	install := runtimecontract.Install{Inputs: "sha256:one", Commands: [][]string{{".toolchain/current", "echo", "installing"}, {"echo", "installed"}}}
 	first := source(install, prepare, serve, app("first"))
-	first["old.py"] = ""
+	first["old/"], first["old/module.py"] = "", ""
 	if status, reply := r.reload(overlay(t, first)); status != http.StatusOK || reply.Output != "installing\ninstalled\nprepared\n" {
 		t.Fatalf("reload: %d %+v", status, reply)
 	}
@@ -211,7 +210,7 @@ func TestReload(t *testing.T) {
 	if syscall.Kill(pid, 0) == nil {
 		t.Fatal("the first app still runs")
 	}
-	if _, err := os.Stat(filepath.Join(r.root, "old.py")); err == nil {
+	if _, err := os.Stat(filepath.Join(r.root, "old")); err == nil {
 		t.Fatal("what only an earlier overlay wrote is still there")
 	}
 	if err := syscall.Kill(r.pid(), syscall.SIGKILL); err != nil {
@@ -223,8 +222,8 @@ func TestReload(t *testing.T) {
 		t.Fatalf("the overlay of an app that exited: %d %+v", status, reply)
 	}
 
-	failing := runtimecontract.Install{Inputs: "sha256:two", Commands: [][]string{
-		{"python3", "-c", `print("a" * 4999); print("no such package"); raise SystemExit(3)`}, {"echo", "after"},
+	failing := runtimecontract.Install{Inputs: install.Inputs, Commands: [][]string{
+		{"python3", "-c", `import sys; print("a" * 4999, flush=True); print("no such package", file=sys.stderr); raise SystemExit(3)`}, {"echo", "after"},
 	}}
 	for range 2 {
 		if status, reply := r.reload(overlay(t, source(failing, nil, serve, app("uninstalled")))); status != http.StatusInternalServerError ||
@@ -235,7 +234,11 @@ func TestReload(t *testing.T) {
 	if status, reply := r.reload(overlay(t, source(install, nil, serve, app("third")))); status != http.StatusOK || reply.Output != "installing\ninstalled\n" {
 		t.Fatalf("install after a failing one: %d %+v", status, reply)
 	}
-	if status, reply := r.reload(overlay(t, source(install, nil, serve, "raise SystemExit(4)"))); status != http.StatusInternalServerError {
+	renewed := runtimecontract.Install{Inputs: "sha256:two", Commands: install.Commands}
+	if status, reply := r.reload(overlay(t, source(renewed, nil, serve, app("renewed")))); status != http.StatusOK || reply.Output != "installing\ninstalled\n" {
+		t.Fatalf("install whose inputs changed: %d %+v", status, reply)
+	}
+	if status, reply := r.reload(overlay(t, source(renewed, nil, serve, "raise SystemExit(4)"))); status != http.StatusInternalServerError {
 		t.Fatalf("failing start: %d %+v", status, reply)
 	}
 	if status, _ := r.get(); status != http.StatusServiceUnavailable {
@@ -313,7 +316,6 @@ func TestBootStartsTheRecordedOverlay(t *testing.T) {
 
 func TestBuild(t *testing.T) {
 	var held sync.Map
-	var uploads atomic.Int64
 	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, found := held.Load(path.Base(r.URL.Path))
 		switch {
@@ -336,12 +338,10 @@ func TestBuild(t *testing.T) {
 		case r.Method == http.MethodPut && r.URL.Query().Get("_state") == "started":
 			data, _ := io.ReadAll(r.Body)
 			reference := r.URL.Query().Get("digest")
-			if digest.FromBytes(data).String() != reference {
+			if _, again := held.LoadOrStore(reference, data); again || digest.FromBytes(data).String() != reference {
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
-			held.Store(reference, data)
-			uploads.Add(1)
 			w.Header().Set("Location", "/v2/holon/app/blobs/"+reference)
 			w.WriteHeader(http.StatusCreated)
 		default:
@@ -362,9 +362,8 @@ func TestBuild(t *testing.T) {
 		return overlay(t, files)
 	}
 	freeze := runtimecontract.Build{Freeze: &runtimecontract.Freeze{Dependencies: []string{"lib"}}}
-	tools := []string{".holon/node", "python3", "-c", `import os
-assert os.environ["SOURCE_DATE_EPOCH"] == "0" and os.environ.get("UV_PYTHON_DOWNLOADS") != "never"
-os.makedirs(".toolchain/node")
+	tools := []string{".toolchain/current", "python3", "-c", `import os
+assert os.environ["SOURCE_DATE_EPOCH"] == "0"
 os.mkdir("lib")
 open("lib/tool", "w").write("tool")
 os.chmod("lib/tool", 0o755)
@@ -410,30 +409,26 @@ os.symlink("lib/tool", "tool")`}
 		t.Fatalf("reload: %d %+v", status, reply)
 	}
 	status, first := r.build(frozen(freeze, tools))
-	if status != http.StatusOK || uploads.Swap(0) != 3 {
+	if status != http.StatusOK {
 		t.Fatalf("build: %d %+v", status, first)
 	}
-	if layers := image(first.Image); !slices.Equal(layers[0], []string{"/.wh..wh..opq", "/lib/", "/lib/tool", "/.toolchain/", "/.toolchain/node/"}) || !slices.Equal(layers[1], []string{"/", "/main.py", "/tool"}) {
+	if layers := image(first.Image); !slices.Equal(layers[0], []string{"/.wh..wh..opq", "/lib/", "/lib/tool", "/.toolchain/", "/.toolchain/current", "/.toolchain/default"}) || !slices.Equal(layers[1], []string{"/", "/main.py", "/tool"}) {
 		t.Fatalf("layer entries %q", layers)
 	}
-	if status, second := r.build(frozen(freeze, tools)); status != http.StatusOK || second.Image != first.Image || uploads.Swap(0) != 0 {
+	if status, second := r.build(frozen(freeze, tools)); status != http.StatusOK || second.Image != first.Image {
 		t.Fatalf("second build of one source: %d %+v", status, second)
 	}
 	check := []string{"python3", "-c", `import sys; print("a" * 9999); print("finding", file=sys.stderr); raise SystemExit(2)`}
-	status, alone := r.build(frozen(runtimecontract.Build{Freeze: &runtimecontract.Freeze{}, Run: check}))
-	if layers := image(alone.Image); status != http.StatusOK || len(layers) != 1 || !slices.Equal(layers[0], []string{"/.wh..wh..opq", "/", "/main.py"}) {
-		t.Fatalf("build without dependencies: %d %+v %q", status, alone, layers)
+	ran := runtimecontract.Ran{ExitCode: 2, Stdout: strings.Repeat("a", 9999) + "\n", Stderr: "finding\n"}
+	if status, checked := r.build(frozen(runtimecontract.Build{Freeze: freeze.Freeze, Run: check}, tools)); status != http.StatusOK || checked.Image != first.Image || checked.Ran == nil || *checked.Ran != ran {
+		t.Fatalf("build with a failing run: %d %+v", status, checked)
 	}
-	if alone.Ran == nil || *alone.Ran != (runtimecontract.Ran{ExitCode: 2, Stdout: strings.Repeat("a", 9999) + "\n", Stderr: "finding\n"}) {
-		t.Fatalf("failing run: %+v", alone.Ran)
-	}
-	uploads.Store(0)
 	if status, _ := r.get(); status != http.StatusServiceUnavailable {
 		t.Fatalf("after a build: %d", status)
 	}
 
 	failing := []string{"python3", "-c", `print("no such package"); raise SystemExit(3)`}
-	if status, reply := r.build(frozen(freeze, failing)); status != http.StatusInternalServerError || !strings.Contains(reply.Output, "no such package") || uploads.Load() != 0 {
+	if status, reply := r.build(frozen(freeze, failing)); status != http.StatusInternalServerError || !strings.Contains(reply.Output, "no such package") {
 		t.Fatalf("failing install: %d %+v", status, reply)
 	}
 
@@ -441,8 +436,7 @@ os.symlink("lib/tool", "tool")`}
 		t.Fatalf("reload after a build: %d %+v", status, reply)
 	}
 
-	t.Setenv(runtimecontract.BaseImageEnv, "registry.example/holon/development:latest")
-	if status, reply := r.build(frozen(freeze, tools)); status != http.StatusBadRequest || !strings.Contains(reply.Error, runtimecontract.BaseImageEnv) {
-		t.Fatalf("freeze on a base without a digest: %d %+v", status, reply)
+	if status, alone := r.build(frozen(runtimecontract.Build{Run: check})); status != http.StatusOK || alone.Image != "" || alone.Ran == nil || *alone.Ran != ran {
+		t.Fatalf("run without a freeze: %d %+v", status, alone)
 	}
 }

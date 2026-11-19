@@ -133,8 +133,7 @@ func (s *supervisor) freeze(ctx context.Context, token string, dependencies []st
 		return "", err
 	}
 	defer func() { _ = root.Close() }()
-	toolchain, _ := fs.Glob(root.FS(), ".toolchain")
-	dependencies = append(dependencies, toolchain...)
+	dependencies = append(dependencies, ".toolchain")
 	source := map[string]bool{path.Dir(runtimecontract.PlanFile): true}
 	for _, name := range dependencies {
 		source[name] = true
@@ -154,9 +153,6 @@ func (s *supervisor) freeze(ctx context.Context, token string, dependencies []st
 		starts   []string
 		excluded map[string]bool
 	}{{dependencies, nil}, {[]string{"."}, source}} {
-		if len(selected.starts) == 0 {
-			continue
-		}
 		var diffID digest.Digest
 		layer, err := s.push(ctx, token, ocispec.MediaTypeImageLayerZstd, func(w io.Writer) (err error) {
 			diffID, err = s.layer(w, root.FS(), selected.starts, selected.excluded, len(manifest.Layers) == 0)
@@ -189,7 +185,7 @@ func (s *supervisor) get(ctx context.Context, kind, reference string) (*http.Res
 	request.Header.Set("Accept", ocispec.MediaTypeImageManifest)
 	response, err := (&http.Client{Transport: s.transport}).Do(request)
 	if err != nil {
-		return nil, errors.New("registry unavailable")
+		return nil, err
 	}
 	if response.StatusCode == http.StatusOK {
 		return response, nil
@@ -259,7 +255,7 @@ func (s *supervisor) send(request *http.Request, statuses ...int) (*http.Respons
 
 func (s *supervisor) layer(w io.Writer, fsys fs.FS, starts []string, excluded map[string]bool, lowest bool) (digest.Digest, error) {
 	uncompressed := digest.SHA256.Digester()
-	encoder, err := zstd.NewWriter(w, zstd.WithEncoderLevel(zstd.SpeedDefault), zstd.WithEncoderConcurrency(1))
+	encoder, err := zstd.NewWriter(w, zstd.WithEncoderConcurrency(1))
 	if err != nil {
 		return "", err
 	}
