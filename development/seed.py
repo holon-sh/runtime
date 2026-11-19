@@ -1,7 +1,9 @@
 """Arrange the donated language toolchains into independently copyable production roots."""
+import hashlib
 import json
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 out = Path("/out")
@@ -36,12 +38,20 @@ for prefix in [Path("/usr/local"), *sorted(Path("/tmp/latest/node-versions").glo
         if manager not in ("npm", "pnpm"):
             continue
         base = f"/opt/holon/managers/{manager}/{ver}"
-        managers[manager + "@" + ver] = base + "/bin"
-        lib = worker / base.strip("/") / "lib" / manager
-        if not lib.exists():
-            shutil.copytree(package.parent, lib, symlinks=True)
-            for cmd, script in pkg["bin"].items():
-                link(worker, base + "/bin/" + cmd, "../lib/" + manager + "/" + script)
+        spec = f"{manager}@{ver}"
+        if spec not in managers:
+            # npm pack verifies the registry's integrity. Install the identical archive used for the keys.
+            with tempfile.TemporaryDirectory() as scratch:
+                pack = ["npm", "pack", "--json", "--ignore-scripts", spec]
+                packed, = json.loads(subprocess.check_output(pack, cwd=scratch))
+                tarball = Path(scratch) / packed["filename"]
+                install = ["npm", "install", "--global", "--prefix", worker / base.strip("/")]
+                subprocess.run([*install, "--ignore-scripts", "--no-audit", "--no-fund", tarball], check=True)
+                data = tarball.read_bytes()
+            managers[spec] = base + "/bin"
+            for algorithm in ("sha224", "sha256", "sha384", "sha512"):
+                digest = hashlib.new(algorithm, data).hexdigest()
+                managers[f"{spec}+{algorithm}.{digest}"] = managers[spec]
         for cmd in pkg["bin"]:
             link(worker, path + "/bin/" + cmd, base + "/bin/" + cmd)
             if prefix == Path("/usr/local"):
