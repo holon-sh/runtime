@@ -26,7 +26,7 @@ type installation struct {
 type nodeProject struct {
 	manager, pin string
 	versions     [3]string
-	dev          nodeRanges
+	dev          nodeRange
 }
 
 func (s *supervisor) environment() []string {
@@ -92,7 +92,7 @@ func (s *supervisor) nodeProject(commands [][]string) (nodeProject, error) {
 	var manifest struct {
 		PackageManager string
 		Engines        struct{ Node string }
-		DevEngines     struct{ Runtime nodeRanges }
+		DevEngines     struct{ Runtime nodeRange }
 	}
 	data, err := os.ReadFile(filepath.Join(s.root, "package.json"))
 	if err == nil {
@@ -125,9 +125,9 @@ func (s *supervisor) nodeProject(commands [][]string) (nodeProject, error) {
 
 // npm accepts one runtime declaration or several alternatives and evaluates
 // onFail itself. Only ranges for Node affect its installation.
-type nodeRanges []string
+type nodeRange string
 
-func (ranges *nodeRanges) UnmarshalJSON(data []byte) error {
+func (result *nodeRange) UnmarshalJSON(data []byte) error {
 	var alternatives []struct{ Name, Version string }
 	if data[0] != '[' {
 		data = slices.Concat([]byte{'['}, data, []byte{']'})
@@ -135,15 +135,17 @@ func (ranges *nodeRanges) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &alternatives); err != nil {
 		return err
 	}
+	var ranges []string
 	for _, alternative := range alternatives {
 		if alternative.Name == "node" {
 			if alternative.Version == "" {
-				*ranges = nil
+				*result = ""
 				return nil
 			}
-			*ranges = append(*ranges, alternative.Version)
+			ranges = append(ranges, alternative.Version)
 		}
 	}
+	*result = nodeRange(strings.Join(ranges, " || "))
 	return nil
 }
 
@@ -195,16 +197,21 @@ func (s *supervisor) installNode(ctx context.Context, node nodeProject, scratch 
 	}
 	// fnm parses npm ranges from engines.node, including ranges its positional
 	// argument cannot express. Keep the project's manifest untouched.
-	for _, version := range node.dev {
-		manifest, _ := json.Marshal(map[string]any{"engines": map[string]string{"node": version}})
+	if node.dev != "" {
+		manifest, _ := json.Marshal(map[string]any{"engines": map[string]nodeRange{"node": node.dev}})
 		if err := os.WriteFile(filepath.Join(scratch, "package.json"), manifest, 0o600); err != nil {
 			return err
 		}
 		cmd := s.command(ctx, install)
-		cmd.Dir, cmd.Stdout, cmd.Stderr = scratch, output, output
-		if err := cmd.Run(); err == nil {
-			return nil
+		var message tail
+		cmd.Dir, cmd.Stdout, cmd.Stderr = scratch, output, io.MultiWriter(output, &message)
+		if err := cmd.Run(); err == nil || !unmatchedNodeRange.Match(message) {
+			return err
 		}
 	}
 	return s.run(ctx, [][]string{append(install, "--lts")}, output)
 }
+
+// fnm 1.39 reports an unparseable range, an unsatisfied range and a transport
+// failure with the same exit code. Only the first two leave npm to apply onFail.
+var unmatchedNodeRange = regexp.MustCompile(`(?m)^error: Can't find (version in dotfiles\.|a Node version that matches )`)
