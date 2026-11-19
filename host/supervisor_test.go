@@ -351,7 +351,11 @@ func TestBuild(t *testing.T) {
 	}
 	freeze := runtimecontract.Build{Freeze: &runtimecontract.Freeze{Dependencies: []string{"lib"}}}
 	tools := []string{"python3", "-c", `import os
-assert os.environ["SOURCE_DATE_EPOCH"] == "0" and os.environ["UV_PYTHON_DOWNLOADS"] == "never"
+assert os.environ["SOURCE_DATE_EPOCH"] == "0" and "UV_PYTHON_DOWNLOADS" not in os.environ
+for key in ("UV_PYTHON_INSTALL_DIR", "FNM_DIR"):
+    directory = os.environ[key]
+    assert os.path.realpath(os.path.dirname(directory)) == os.path.join(os.getcwd(), ".toolchain")
+    os.makedirs(directory)
 os.mkdir("lib")
 open("lib/tool", "w").write("tool")
 os.chmod("lib/tool", 0o755)
@@ -397,15 +401,23 @@ os.symlink("lib/tool", "tool")`}
 		t.Fatalf("reload: %d %+v", status, reply)
 	}
 	status, first := r.build(frozen(freeze, tools))
-	if status != http.StatusOK || uploads.Swap(0) != 3 {
+	if status != http.StatusOK || uploads.Swap(0) != 4 {
 		t.Fatalf("build: %d %+v", status, first)
 	}
-	if layers := image(first.Image); !slices.Equal(layers[0], []string{"/.wh..wh..opq", "/lib/", "/lib/tool"}) || !slices.Equal(layers[1], []string{"/", "/main.py", "/tool"}) {
+	if layers := image(first.Image); len(layers) != 3 ||
+		!slices.Equal(layers[0], []string{"/.wh..wh..opq", "/.toolchain/", "/.toolchain/node/", "/.toolchain/python/"}) ||
+		!slices.Equal(layers[1], []string{"/lib/", "/lib/tool"}) || !slices.Equal(layers[2], []string{"/", "/main.py", "/tool"}) {
 		t.Fatalf("layer entries %q", layers)
 	}
 	if status, second := r.build(frozen(freeze, tools)); status != http.StatusOK || second.Image != first.Image || uploads.Swap(0) != 0 {
 		t.Fatalf("second build of one source: %d %+v", status, second)
 	}
+	page := runtimecontract.Build{Freeze: &runtimecontract.Freeze{Dependencies: []string{".venv"}}}
+	status, mixed := r.build(frozen(page, tools, []string{"mkdir", ".venv"}))
+	if layers := image(mixed.Image); status != http.StatusOK || !slices.Equal(layers[0], []string{"/.wh..wh..opq", "/.toolchain/", "/.toolchain/python/"}) {
+		t.Fatalf("Python app with a Node-built page: %d, %q", status, layers)
+	}
+
 	check := []string{"python3", "-c", `import sys; print("a" * 9999); print("finding", file=sys.stderr); raise SystemExit(2)`}
 	status, alone := r.build(frozen(runtimecontract.Build{Freeze: &runtimecontract.Freeze{}, Run: check}))
 	if layers := image(alone.Image); status != http.StatusOK || len(layers) != 1 || !slices.Equal(layers[0], []string{"/.wh..wh..opq", "/", "/main.py"}) {

@@ -133,10 +133,13 @@ func (s *supervisor) freeze(ctx context.Context, token string, dependencies []st
 		return "", err
 	}
 	defer func() { _ = root.Close() }()
-	source := map[string]bool{path.Dir(runtimecontract.PlanFile): true}
-	for _, name := range dependencies {
-		source[name] = true
+	excluded := map[string]bool{path.Dir(runtimecontract.PlanFile): true}
+	// The CLI freezes only the virtual environment for Python apps, even when
+	// Node built their page. Build.Run can still use Node after the freeze.
+	if slices.Contains(dependencies, ".venv") && !slices.Contains(dependencies, "node_modules") {
+		excluded[path.Join(toolchainDir, "node")] = true
 	}
+	tools, _ := fs.Glob(root.FS(), toolchainDir)
 	image := ocispec.Image{
 		Platform: ocispec.Platform{Architecture: runtime.GOARCH, OS: runtime.GOOS},
 		Config:   ocispec.ImageConfig{WorkingDir: s.root},
@@ -148,16 +151,13 @@ func (s *supervisor) freeze(ctx context.Context, token string, dependencies []st
 		MediaType:   ocispec.MediaTypeImageManifest,
 		Annotations: map[string]string{ocispec.AnnotationBaseImageDigest: base},
 	}
-	for _, selected := range []struct {
-		starts   []string
-		excluded map[string]bool
-	}{{dependencies, nil}, {[]string{"."}, source}} {
-		if len(selected.starts) == 0 {
+	for _, starts := range [][]string{tools, dependencies, {"."}} {
+		if len(starts) == 0 {
 			continue
 		}
 		var diffID digest.Digest
 		layer, err := s.push(ctx, token, ocispec.MediaTypeImageLayerZstd, func(w io.Writer) (err error) {
-			diffID, err = s.layer(w, root.FS(), selected.starts, selected.excluded, len(manifest.Layers) == 0)
+			diffID, err = s.layer(w, root.FS(), starts, excluded, len(manifest.Layers) == 0)
 			return err
 		})
 		if err != nil {
@@ -165,6 +165,9 @@ func (s *supervisor) freeze(ctx context.Context, token string, dependencies []st
 		}
 		manifest.Layers = append(manifest.Layers, layer)
 		image.RootFS.DiffIDs = append(image.RootFS.DiffIDs, diffID)
+		for _, name := range starts {
+			excluded[name] = true
+		}
 	}
 	config, _ := json.Marshal(image)
 	manifest.Config, err = s.push(ctx, token, ocispec.MediaTypeImageConfig, func(w io.Writer) error {

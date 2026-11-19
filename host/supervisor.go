@@ -16,7 +16,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
 	"slices"
 	"sync/atomic"
 	"syscall"
@@ -38,7 +37,7 @@ type supervisor struct {
 	record    *runtimecontract.OverlayRecord
 	written   []string
 	unpacked  digest.Digest
-	installed runtimecontract.Install
+	installed *installation
 }
 
 // Run serves PORT and proxies it to the app, which it starts in the source directory with a loopback HOST and PORT of
@@ -152,14 +151,8 @@ func (s *supervisor) launch(ctx context.Context) (int, runtimecontract.ReloadRep
 	var output tail
 	var plan runtimecontract.Plan
 	err := s.decode(runtimecontract.PlanFile, &plan)
-	if err == nil && !reflect.DeepEqual(plan.Install, s.installed) {
-		s.installed = runtimecontract.Install{}
-		if err = s.run(ctx, plan.Install.Commands, &output); err == nil {
-			s.installed = plan.Install
-		}
-	}
 	if err == nil {
-		err = s.run(ctx, plan.Prepare, &output)
+		err = s.prepare(ctx, plan, &output)
 	}
 	if err != nil {
 		return http.StatusInternalServerError, runtimecontract.ReloadReply{Error: "the install or build failed: " + err.Error(), Output: string(output)}
@@ -183,7 +176,7 @@ func (s *supervisor) launch(ctx context.Context) (int, runtimecontract.ReloadRep
 	return status, runtimecontract.ReloadReply{Output: string(output)}
 }
 
-var buildEnvironment = []string{"SOURCE_DATE_EPOCH=0", "UV_PYTHON_DOWNLOADS=never"}
+const buildEnvironment = "SOURCE_DATE_EPOCH=0"
 
 func (s *supervisor) build(r *http.Request) (int, runtimecontract.BuildReply) {
 	fail := func(status int, message string) (int, runtimecontract.BuildReply) {
@@ -210,7 +203,8 @@ func (s *supervisor) build(r *http.Request) (int, runtimecontract.BuildReply) {
 		return fail(http.StatusBadRequest, err.Error())
 	}
 	var output tail
-	if err := s.run(r.Context(), slices.Concat(plan.Install.Commands, plan.Prepare), &output, buildEnvironment...); err != nil {
+	defer func() { s.installed = nil }()
+	if err := s.prepare(r.Context(), plan, &output, buildEnvironment); err != nil {
 		return http.StatusInternalServerError, runtimecontract.BuildReply{ReloadReply: runtimecontract.ReloadReply{Error: "the install or build failed: " + err.Error(), Output: string(output)}}
 	}
 	var reply runtimecontract.BuildReply
@@ -222,7 +216,7 @@ func (s *supervisor) build(r *http.Request) (int, runtimecontract.BuildReply) {
 		reply.Image = image.String()
 	}
 	if len(build.Run) != 0 {
-		command := s.command(r.Context(), build.Run, buildEnvironment...)
+		command := s.command(r.Context(), build.Run, buildEnvironment)
 		var stderr tail
 		command.Stderr = &stderr
 		stdout, err := command.Output()
@@ -235,7 +229,7 @@ func (s *supervisor) build(r *http.Request) (int, runtimecontract.BuildReply) {
 }
 
 func (s *supervisor) empty() error {
-	s.written, s.unpacked, s.installed = nil, "", runtimecontract.Install{}
+	s.written, s.unpacked, s.installed = nil, "", nil
 	return errors.Join(os.RemoveAll(s.root), os.MkdirAll(s.root, 0o700))
 }
 
@@ -263,7 +257,8 @@ func (s *supervisor) command(ctx context.Context, argv []string, env ...string) 
 		return &exec.Cmd{Err: errors.New("the plan has an empty command")}
 	}
 	command := exec.CommandContext(ctx, argv[0], argv[1:]...)
-	command.Dir, command.Env = s.root, append(append(os.Environ(), "PWD="+s.root), env...)
+	command.Dir = s.root
+	command.Env = slices.Concat(os.Environ(), s.environment(), env)
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	command.Cancel = func() error { return syscall.Kill(-command.Process.Pid, syscall.SIGKILL) }
 	return command
