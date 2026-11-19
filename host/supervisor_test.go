@@ -75,8 +75,8 @@ type running struct {
 	root string
 }
 
-// run starts the supervisor, from record when it is set, and returns once it listens.
-func run(t *testing.T, record *runtimecontract.OverlayRecord) *running {
+// run starts the supervisor from record and returns once it listens.
+func run(t *testing.T, record runtimecontract.OverlayRecord) *running {
 	t.Helper()
 	listener, _ := net.Listen("tcp", "127.0.0.1:0")
 	port := strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)
@@ -107,7 +107,7 @@ func run(t *testing.T, record *runtimecontract.OverlayRecord) *running {
 	}
 }
 
-func setup(t *testing.T, port, root string, record *runtimecontract.OverlayRecord) {
+func setup(t *testing.T, port, root string, record runtimecontract.OverlayRecord) {
 	seed, bin := t.TempDir(), t.TempDir()
 	if err := os.Mkdir(filepath.Join(seed, ".toolchain"), 0o755); err != nil {
 		t.Fatal(err)
@@ -122,13 +122,10 @@ func setup(t *testing.T, port, root string, record *runtimecontract.OverlayRecor
 	t.Setenv("HOLON_SOURCE_SEED", seed)
 	t.Setenv("PORT", port)
 	t.Setenv(reloadDirEnv, root)
-	t.Setenv(runtimecontract.OverlayFileEnv, "")
-	if record != nil {
-		file := filepath.Join(t.TempDir(), "overlay")
-		data, _ := json.Marshal(record)
-		_ = os.WriteFile(file, data, 0o600)
-		t.Setenv(runtimecontract.OverlayFileEnv, file)
-	}
+	file := filepath.Join(t.TempDir(), "overlay")
+	data, _ := json.Marshal(record)
+	_ = os.WriteFile(file, data, 0o600)
+	t.Setenv(runtimecontract.OverlayFileEnv, file)
 }
 
 func (r *running) reload(body []byte) (int, runtimecontract.BuildReply) {
@@ -187,7 +184,9 @@ func TestReload(t *testing.T) {
 	stdout, stderr := os.Stdout, os.Stderr
 	os.Stdout, os.Stderr = log, log
 	t.Cleanup(func() { os.Stdout, os.Stderr = stdout, stderr })
-	r := run(t, nil)
+	registry := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(registry.Close)
+	r := run(t, runtimecontract.OverlayRecord{Registry: registry.URL, Repository: "holon/app", Tag: "session", Token: "pull"})
 	serve := []string{"python3", "-c", "import subprocess; raise SystemExit(subprocess.run(['python3', 'main.py']).returncode)"}
 	prepare := [][]string{{"echo", "prepared"}}
 	install := runtimecontract.Install{Inputs: "sha256:one", Commands: [][]string{{".toolchain/current", "echo", "installing"}, {"echo", "installed"}}}
@@ -279,8 +278,8 @@ func TestBootStartsTheRecordedOverlay(t *testing.T) {
 		}
 	}))
 	t.Cleanup(registry.Close)
-	record := func(session string) *runtimecontract.OverlayRecord {
-		return &runtimecontract.OverlayRecord{Registry: registry.URL, Repository: "holon/app", Tag: session, Token: "pull"}
+	record := func(session string) runtimecontract.OverlayRecord {
+		return runtimecontract.OverlayRecord{Registry: registry.URL, Repository: "holon/app", Tag: session, Token: "pull"}
 	}
 
 	t.Run("its session's tag, not another session's, which a reload of the same overlay leaves running", func(t *testing.T) {
@@ -352,7 +351,7 @@ func TestBuild(t *testing.T) {
 	base := digest.FromString("base")
 	t.Setenv(runtimecontract.BaseImageEnv, "registry.example/holon/development@"+base.String())
 	annotations := map[string]string{ocispec.AnnotationBaseImageDigest: base.String()}
-	r := run(t, &runtimecontract.OverlayRecord{Registry: registry.URL, Repository: "holon/app", Tag: "session", Token: "pull"})
+	r := run(t, runtimecontract.OverlayRecord{Registry: registry.URL, Repository: "holon/app", Tag: "session", Token: "pull"})
 	serve := []string{"python3", "main.py"}
 	install := runtimecontract.Install{Inputs: "sha256:one", Commands: [][]string{{"echo", "installing"}}}
 	frozen := func(build runtimecontract.Build, commands ...[]string) []byte {
