@@ -19,42 +19,38 @@ function selectNode() {
   const declared = versionFile('.nvmrc') || versionFile('.node-version') || project.engines?.node;
   const engines = [project.devEngines?.runtime].flat().filter(entry => entry?.name === 'node');
   const range = engines.every(entry => entry.version) && engines.map(entry => entry.version).join(' || ');
-  const version = declared || range || '';
-  const selected = path.join(tools, 'node');
-  if (version.replace(/^v/, '') === process.versions.node) return fs.symlinkSync('/usr/local', selected);
-
-  const fnm = fs.mkdtempSync(path.join(process.env.HOME, '.fnm-'));
+  const fnm = process.env.FNM_DIR;
+  const cache = '/opt/holon/node/versions';
+  const versions = fs.readdirSync(cache);
+  const exact = 'v' + (declared || range || '').replace(/^v/, '');
+  fs.mkdirSync(path.join(fnm, 'aliases'), { recursive: true });
+  fs.symlinkSync('aliases/default/bin', path.join(fnm, 'bin'));
+  if (versions.includes(exact)) {
+    return fs.symlinkSync(path.join(cache, exact, 'installation'), path.join(fnm, 'aliases/default'));
+  }
+  const installed = path.join(fnm, 'node-versions');
+  fs.mkdirSync(installed);
+  for (const version of versions) fs.symlinkSync(path.join(cache, version), path.join(installed, version));
+  const install = ['install', '--progress', 'never'];
+  if (declared || !range) return run('fnm', declared ? install : [...install, '--lts']);
+  // fnm parses npm ranges from engines.node. npm applies devEngines.onFail.
+  fs.writeFileSync(path.join(managers, 'package.json'), JSON.stringify({ engines: { node: range } }));
   try {
-    const cached = path.join(fnm, 'node-versions', process.version);
-    fs.mkdirSync(path.dirname(cached));
-    fs.symlinkSync('/opt/holon/node/versions/' + process.version, cached);
-    const options = { env: { ...process.env, FNM_DIR: fnm } };
-    const install = ['install', '--progress', 'never'];
-    if (range && !declared) {
-      // fnm reads npm ranges from engines.node. npm applies devEngines.onFail.
-      fs.writeFileSync(path.join(fnm, 'package.json'), JSON.stringify({ engines: { node: range } }));
-      try {
-        execFileSync('fnm', install, { ...options, cwd: fnm, stdio: ['ignore', 'inherit', 'pipe'] });
-      } catch (error) {
-        if (!/^error: Can't find (version in dotfiles\.|a Node version that matches )/m.test(String(error.stderr))) throw error;
-        run('fnm', [...install, '--lts'], options);
-      }
-    } else {
-      run('fnm', declared ? install : [...install, '--lts'], options);
-    }
-    const resolved = fs.realpathSync(path.join(fnm, 'aliases/default'));
-    if (resolved === '/usr/local') fs.symlinkSync(resolved, selected);
-    else fs.renameSync(resolved, selected);
-  } finally {
-    fs.rmSync(fnm, { recursive: true, force: true });
+    execFileSync('fnm', install, { cwd: managers, stdio: ['ignore', 'inherit', 'pipe'] });
+  } catch (error) {
+    if (!/^error: Can't find (version in dotfiles\.|a Node version that matches )/m.test(String(error.stderr))) throw error;
+    run('fnm', [...install, '--lts']);
   }
 }
 
 function selectManager() {
   const spec = project.packageManager || manager;
-  const pin = /^(npm|pnpm)(?:@(\d+\.\d+\.\d+(?:-[\w.-]+)?)(?:\+(sha224|sha256|sha384|sha512)\.([\da-f]+))?)?$/.exec(spec);
+  const pin = /^(npm|pnpm)(?:@(\d+\.\d+\.\d+(?:-[\w.-]+)?)(?:\+(sha224|sha256|sha384|sha512)\.([\da-fA-F]+))?)?$/.exec(spec);
   if (!pin || pin[1] !== manager) throw new Error('invalid packageManager declaration: ' + spec);
-  if (manager === 'npm' && !pin[2]) return;
+  if (manager === 'npm' && !pin[3]) {
+    const bundled = path.join(tools, 'node/aliases/default/lib/node_modules/npm/package.json');
+    if (!pin[2] || JSON.parse(fs.readFileSync(bundled)).version === pin[2]) return;
+  }
   if (manager === 'pnpm') {
     const config = path.join(process.env.HOME, '.config/pnpm');
     fs.mkdirSync(config, { recursive: true });
@@ -81,6 +77,5 @@ function selectManager() {
 fs.rmSync(managers, { recursive: true, force: true });
 fs.rmSync('node_modules', { recursive: true, force: true });
 fs.mkdirSync(managers, { recursive: true });
-fs.mkdirSync(tools, { recursive: true });
 selectNode();
 selectManager();
