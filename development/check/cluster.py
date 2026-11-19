@@ -344,11 +344,9 @@ def proof(cli, baseline, work, stack):
             for filename in ["pyproject.toml", "uv.lock"]:
                 shutil.copyfile(work/"python"/filename, project/filename)
 
-        def observed(url, marker, *, production=False):
+        def observed(url, marker):
             answer = request(url+"/runtime.json")
             assert answer["version"] == expected and answer["marker"] == marker and answer["uid"] == 10001, answer
-            if app == "node":
-                assert answer["installer"] == (None if production else "pnpm@"+manager_version), answer
 
         for rep in range(3):
             variants = [("dev20", old_base, "oldbase"), ("candidate", base, "base")]
@@ -364,6 +362,9 @@ def proof(cli, baseline, work, stack):
                     ((_, post), total) = timed(submit, url, project, entry, sample+" cold dev")
                     measurements.update(dev_cold_cli_and_ready=total, dev_cold_post=post)
                     observed(url, "first")
+                    if app == "node":
+                        actual = run("kubectl", "exec", dev, "--", "sh", "-c", "cd /app/source && pnpm --version")
+                        assert actual == manager_version, (actual, manager_version)
                     started = time.monotonic()
                     (project/entry).write_text((project/entry).read_text().replace('"first"', '"saved"'))
                     _, post = submit(url, project, entry, sample+" save")
@@ -380,7 +381,7 @@ def proof(cli, baseline, work, stack):
                 began = time.monotonic()
                 start_pod(production, frozen, {"HOST":"0.0.0.0"}, production=True)
                 with port_forward(production) as url:
-                    observed(url, "saved", production=True)
+                    observed(url, "saved")
                 measurements["production_ready_and_observed"] = time.monotonic()-began
                 measurements["deploy_total"] = sum(measurements[k] for k in
                     ["build_pod_ready","deploy_cli_and_freeze","cli_assemble","pull_assembled","production_ready_and_observed"])
