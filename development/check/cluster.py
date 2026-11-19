@@ -22,8 +22,8 @@ REGISTRY = "registry:3@sha256:82f6ff4a7f982960c8aa51617fea3aabc485df6e55cce80d22
 SQUID = "ubuntu/squid:6.10-24.10_beta@sha256:c9f5212b147a766529c7b026e2bebed37b998d33d0066b658596af5eba7cc65c"
 
 
-def run(*args, data=None, env=None):
-    command = subprocess.run(args, input=data, stdout=subprocess.PIPE, text=True, env=env, timeout=900)
+def run(*args, data=None, env=None, cwd=None):
+    command = subprocess.run(args, input=data, stdout=subprocess.PIPE, text=True, env=env, cwd=cwd, timeout=900)
     if command.returncode:
         raise RuntimeError(f"{command.args} exited {command.returncode}\n{command.stdout}")
     return command.stdout.strip()
@@ -101,6 +101,10 @@ def proof(cli, work, stack):
         descriptor, = json.load(tar.extractfile("index.json"))["manifests"]
         assert descriptor["mediaType"] == "application/vnd.oci.image.index.v1+json", descriptor
         base_digest = descriptor["digest"]
+        def blob(digest):
+            return json.load(tar.extractfile("blobs/" + digest.replace(":", "/")))
+        native, = [m for m in blob(base_digest)["manifests"] if m.get("platform", {}).get("architecture") == ARCH]
+        print(f"{ARCH} base compressed layer bytes {sum(layer['size'] for layer in blob(native['digest'])['layers'])}", flush=True)
 
     # A private kubeconfig keeps all kubectl operations on this ephemeral cluster.
     os.environ["KUBECONFIG"] = str(work/"kubeconfig")
@@ -179,13 +183,11 @@ def proof(cli, work, stack):
         shutil.copyfile(HERE/entry, project/entry)
         (project/pin).write_text(first+"\n")
         if app == "node":
-            locks = cli/"pkg/installation/testdata/automatic-types"
-            manifest = json.loads((locks/"package-lock.json").read_text())["packages"][""]
-            manifest.pop("engines")  # Exercise the project's selected pin and the separate LTS fallback.
-            manifest["type"] = "module"
-            manifest["packageManager"] = "pnpm@9.15.9"
+            sdk = json.loads((cli/"tooling/typescript/package.json").read_text())["devDependencies"]["holon-sh"]
+            manifest = {"name": "check", "type": "module", "packageManager": "pnpm@9.15.9",
+                        "dependencies": {"holon-sh": sdk}, "engines": {"node": "22"}}
             (project/"package.json").write_text(json.dumps(manifest))
-            shutil.copyfile(locks/"pnpm-lock.yaml", project/"pnpm-lock.yaml")
+            run("npm", "exec", "--yes", "--package=pnpm@9.15.9", "--", "pnpm", "install", "--lockfile-only", cwd=project)
         else:
             (project/"pyproject.toml").write_text('[project]\nname="check"\nversion="0.0.0"\nrequires-python=">=3.12"\ndependencies=["holon-sh==0.0.1.dev26"]\n')
             run("uv", "lock", "--directory", project, "--default-index", "https://pypi.org/simple")
@@ -201,11 +203,18 @@ def proof(cli, work, stack):
             check_response(url, resolved, "saved")
             assert elapsed < 1, f"{app} source-only save took {elapsed:.3f}s"
 
+            if app == "node":
+                (project/pin).unlink()
+                pin = ".node-version"
             (project/pin).write_text(second+"\n")
             submit(url, project, entry, f"{app} version change")
             check_response(url, second+".", "saved")
             if app == "node":
                 (project/pin).unlink()
+                submit(url, project, entry, "Node from package.json engines")
+                check_response(url, "22.", "saved")
+                del manifest["engines"]
+                (project/"package.json").write_text(json.dumps(manifest))
                 submit(url, project, entry, "Node without a version declaration")
                 latest = next(v["version"][1:] for v in request("https://nodejs.org/dist/index.json") if v["lts"])
                 check_response(url, latest, "saved")
