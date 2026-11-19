@@ -71,8 +71,10 @@ func Run(ctx context.Context) error {
 		BaseContext: func(net.Listener) context.Context { return ctx },
 	}
 	served := make(chan error, 1)
+	s.turn <- struct{}{}
 	go func() { served <- server.Serve(listener) }()
 	err = s.boot(ctx)
+	<-s.turn
 	if err == nil {
 		select {
 		case err = <-served:
@@ -118,8 +120,6 @@ func (s *supervisor) boot(ctx context.Context) error {
 	if s.record == nil {
 		return nil
 	}
-	s.turn <- struct{}{}
-	defer func() { <-s.turn }()
 	found, err := s.fetch(ctx)
 	if err != nil || !found {
 		return err
@@ -202,12 +202,8 @@ func (s *supervisor) build(r *http.Request) (int, runtimecontract.BuildReply) {
 	if err == nil {
 		err = errors.Join(s.decode(runtimecontract.PlanFile, &plan), s.decode(runtimecontract.BuildFile, &build))
 	}
-	switch {
-	case err != nil || build.Freeze == nil:
-	case s.record == nil:
+	if err == nil && build.Freeze != nil && s.record == nil {
 		err = errors.New("no repository is recorded for this app")
-	case !protocol.IsValidDigestImage(os.Getenv(runtimecontract.BaseImageEnv)):
-		err = errors.New(runtimecontract.BaseImageEnv + " must name the image this pod runs by digest")
 	}
 	if err != nil {
 		return fail(http.StatusBadRequest, err.Error())
