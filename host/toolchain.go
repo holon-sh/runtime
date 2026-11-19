@@ -60,6 +60,15 @@ func (s *supervisor) prepare(ctx context.Context, plan runtimecontract.Plan, out
 		if err := s.run(ctx, plan.Install.Commands, output, env...); err != nil {
 			return err
 		}
+		// uv sync compiles packages but skips the downloaded standard library.
+		// Cache only the installed interpreter for dev restarts. Source stays live.
+		if len(env) == 0 && len(plan.Start) != 0 && plan.Start[0] == ".venv/bin/python" {
+			cache := []string{plan.Start[0], "-IS", "-c", `import compileall, sysconfig
+compileall.compile_dir(sysconfig.get_path("stdlib"), quiet=2)`}
+			if err := s.run(ctx, [][]string{cache}, output); err != nil {
+				return err
+			}
+		}
 		s.installed = next
 	}
 	return s.run(ctx, plan.Prepare, output, env...)
