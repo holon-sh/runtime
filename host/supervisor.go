@@ -256,6 +256,10 @@ func (s *supervisor) command(ctx context.Context, argv []string, env ...string) 
 	if len(argv) == 0 {
 		return &exec.Cmd{Err: errors.New("the plan has an empty command")}
 	}
+	// pnpm's script-free install leaves a shell launcher that expects POSIX execvp.
+	if argv[0] == "pnpm" {
+		argv = append([]string{"/usr/bin/env"}, argv...)
+	}
 	command := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	command.Dir = s.root
 	command.Env = slices.Concat(os.Environ(), s.environment(), env)
