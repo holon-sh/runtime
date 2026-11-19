@@ -351,7 +351,7 @@ func TestBuild(t *testing.T) {
 	}
 	freeze := runtimecontract.Build{Freeze: &runtimecontract.Freeze{Dependencies: []string{"lib"}}}
 	tools := []string{"python3", "-c", `import os
-assert os.environ["SOURCE_DATE_EPOCH"] == "0" and os.environ["UV_PYTHON_DOWNLOADS"] == "never"
+assert os.environ["SOURCE_DATE_EPOCH"] == "0" and os.environ.get("UV_PYTHON_DOWNLOADS") != "never"
 os.mkdir("lib")
 open("lib/tool", "w").write("tool")
 os.chmod("lib/tool", 0o755)

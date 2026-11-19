@@ -17,7 +17,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
-	"slices"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -38,7 +39,7 @@ type supervisor struct {
 	record    *runtimecontract.OverlayRecord
 	written   []string
 	unpacked  digest.Digest
-	installed runtimecontract.Install
+	installed *runtimecontract.Install
 }
 
 // Run serves PORT and proxies it to the app, which it starts in the source directory with a loopback HOST and PORT of
@@ -72,17 +73,17 @@ func Run(ctx context.Context) error {
 	}
 	served := make(chan error, 1)
 	go func() { served <- server.Serve(listener) }()
-	err = s.boot(ctx)
-	if err == nil {
-		select {
-		case err = <-served:
-		case <-ctx.Done():
-			err = ctx.Err()
-		}
+	defer s.stop()
+	defer server.Close()
+	if err := s.boot(ctx); err != nil {
+		return err
 	}
-	_ = server.Close()
-	s.stop()
-	return err
+	select {
+	case err := <-served:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (s *supervisor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -93,14 +94,10 @@ func (s *supervisor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer func() { <-s.turn }()
-		var status int
-		var reply any
-		if r.URL.Path == runtimecontract.BuildPath {
-			status, reply = s.build(r)
-		} else {
-			status, reply = s.reload(r)
-		}
-		writeReply(w, status, reply)
+		status, reply := s.update(r)
+		w.Header().Set(protocol.HeaderContentType, protocol.MIMEApplicationJSON)
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(reply)
 		return
 	}
 	app := s.app.Load()
@@ -112,122 +109,90 @@ func (s *supervisor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	app.proxy.ServeHTTP(w, r)
 }
 
-// boot starts the app from the overlay the platform recorded. Without one, or while the registry does not hold it
-// yet, the app waits for the first reload.
-func (s *supervisor) boot(ctx context.Context) error {
-	if s.record == nil {
-		return nil
+// update streams a clean build or replaces the running app from a new source overlay.
+func (s *supervisor) update(r *http.Request) (int, runtimecontract.BuildReply) {
+	var body io.Reader = r.Body
+	var identity digest.Digest
+	var build *runtimecontract.Build
+	if r.URL.Path == runtimecontract.BuildPath {
+		s.stop()
+		if err := s.empty(); err != nil {
+			return failure(http.StatusInternalServerError, err.Error())
+		}
+		build = new(runtimecontract.Build)
+	} else {
+		overlay, err := io.ReadAll(body)
+		if err != nil {
+			return failure(http.StatusBadRequest, "read source: "+err.Error())
+		}
+		identity = digest.FromBytes(overlay)
+		if s.app.Load() != nil && s.unpacked == identity {
+			return http.StatusOK, runtimecontract.BuildReply{}
+		}
+		s.stop()
+		body = bytes.NewReader(overlay)
 	}
-	s.turn <- struct{}{}
-	defer func() { <-s.turn }()
-	found, err := s.fetch(ctx)
-	if err != nil || !found {
-		return err
+	if err := s.unpack(body); err != nil {
+		return failure(http.StatusBadRequest, err.Error())
 	}
-	if status, reply := s.launch(ctx); status != http.StatusOK {
-		fmt.Fprint(os.Stderr, reply.Output)
-		fmt.Fprintln(os.Stderr, "application did not start:", reply.Error)
-	}
-	return nil
+	s.unpacked = identity
+	return s.execute(r.Context(), build, r.Header.Get(runtimecontract.BuildTokenHeader))
 }
 
-// reload replaces the app with one running from the posted overlay, and answers once it accepts connections. An app
-// that does not start stays down until the next reload.
-func (s *supervisor) reload(r *http.Request) (int, runtimecontract.ReloadReply) {
-	overlay, err := io.ReadAll(r.Body)
-	if err != nil {
-		return http.StatusBadRequest, runtimecontract.ReloadReply{Error: "read source: " + err.Error()}
-	}
-	if s.app.Load() != nil && s.unpacked == digest.FromBytes(overlay) {
-		return http.StatusOK, runtimecontract.ReloadReply{}
-	}
-	s.stop()
-	if _, err := s.unpack(bytes.NewReader(overlay)); err != nil {
-		return http.StatusBadRequest, runtimecontract.ReloadReply{Error: err.Error()}
-	}
-	return s.launch(r.Context())
+func failure(status int, message string) (int, runtimecontract.BuildReply) {
+	return status, runtimecontract.BuildReply{ReloadReply: runtimecontract.ReloadReply{Error: message}}
 }
 
-func (s *supervisor) launch(ctx context.Context) (int, runtimecontract.ReloadReply) {
-	var output tail
+var buildEnvironment = []string{"SOURCE_DATE_EPOCH=0"}
+
+func (s *supervisor) execute(ctx context.Context, build *runtimecontract.Build, token string) (int, runtimecontract.BuildReply) {
 	var plan runtimecontract.Plan
 	err := s.decode(runtimecontract.PlanFile, &plan)
-	if err == nil && !reflect.DeepEqual(plan.Install, s.installed) {
-		s.installed = runtimecontract.Install{}
-		if err = s.run(ctx, plan.Install.Commands, &output); err == nil {
-			s.installed = plan.Install
-		}
-	}
-	if err == nil {
-		err = s.run(ctx, plan.Prepare, &output)
-	}
-	if err != nil {
-		return http.StatusInternalServerError, runtimecontract.ReloadReply{Error: "the install or build failed: " + err.Error(), Output: string(output)}
-	}
-	c, err := s.start(plan.Start)
-	if err != nil {
-		return http.StatusInternalServerError, runtimecontract.ReloadReply{Error: err.Error()}
-	}
-	status, problem := c.ready(ctx)
-	if status != http.StatusOK {
-		c.stop()
-		return status, runtimecontract.ReloadReply{Error: problem}
-	}
-	s.app.Store(c)
-	go func() {
-		<-c.done
-		if s.app.CompareAndSwap(c, nil) {
-			fmt.Fprintln(os.Stderr, "application exited:", c.command.ProcessState)
-		}
-	}()
-	return status, runtimecontract.ReloadReply{Output: string(output)}
-}
+	var env []string
 
-var buildEnvironment = []string{"SOURCE_DATE_EPOCH=0", "UV_PYTHON_DOWNLOADS=never"}
-
-func (s *supervisor) build(r *http.Request) (int, runtimecontract.BuildReply) {
-	fail := func(status int, message string) (int, runtimecontract.BuildReply) {
-		return status, runtimecontract.BuildReply{ReloadReply: runtimecontract.ReloadReply{Error: message}}
-	}
-	s.stop()
-	if err := s.empty(); err != nil {
-		return fail(http.StatusInternalServerError, err.Error())
-	}
-	var plan runtimecontract.Plan
-	var build runtimecontract.Build
-	_, err := s.unpack(r.Body)
-	if err == nil {
-		err = errors.Join(s.decode(runtimecontract.PlanFile, &plan), s.decode(runtimecontract.BuildFile, &build))
-	}
-	switch {
-	case err != nil || build.Freeze == nil:
-	case s.record == nil:
-		err = errors.New("no repository is recorded for this app")
-	case !protocol.IsValidDigestImage(os.Getenv(runtimecontract.BaseImageEnv)):
-		err = errors.New(runtimecontract.BaseImageEnv + " must name the image this pod runs by digest")
-	}
-	if err != nil {
-		return fail(http.StatusBadRequest, err.Error())
+	if build != nil {
+		switch err := errors.Join(err, s.decode(runtimecontract.BuildFile, build)); {
+		case err != nil:
+			return failure(http.StatusBadRequest, err.Error())
+		case build.Freeze == nil:
+		case s.record == nil:
+			return failure(http.StatusBadRequest, "no repository is recorded for this app")
+		case !protocol.IsValidDigestImage(os.Getenv(runtimecontract.BaseImageEnv)):
+			return failure(http.StatusBadRequest, runtimecontract.BaseImageEnv+" must name the image this pod runs by digest")
+		}
+		env = buildEnvironment
+		defer func() { s.installed = nil }()
 	}
 	var output tail
-	if err := s.run(r.Context(), slices.Concat(plan.Install.Commands, plan.Prepare), &output, buildEnvironment...); err != nil {
+	if err == nil {
+		err = s.prepare(ctx, plan, &output, env...)
+	}
+	if err != nil {
 		return http.StatusInternalServerError, runtimecontract.BuildReply{ReloadReply: runtimecontract.ReloadReply{Error: "the install or build failed: " + err.Error(), Output: string(output)}}
 	}
+
+	if build != nil {
+		return s.finish(ctx, build, token)
+	}
+	return s.start(ctx, plan.Start, string(output))
+}
+
+func (s *supervisor) finish(ctx context.Context, build *runtimecontract.Build, token string) (int, runtimecontract.BuildReply) {
 	var reply runtimecontract.BuildReply
 	if build.Freeze != nil {
-		image, err := s.freeze(r.Context(), r.Header.Get(runtimecontract.BuildTokenHeader), build.Freeze.Dependencies)
+		image, err := s.freeze(ctx, token, build.Freeze.Dependencies)
 		if err != nil {
-			return fail(http.StatusInternalServerError, "freeze the app: "+err.Error())
+			return failure(http.StatusInternalServerError, "freeze the app: "+err.Error())
 		}
 		reply.Image = image.String()
 	}
 	if len(build.Run) != 0 {
-		command := s.command(r.Context(), build.Run, buildEnvironment...)
+		command := s.command(ctx, build.Run, buildEnvironment...)
 		var stderr tail
 		command.Stderr = &stderr
 		stdout, err := command.Output()
 		if command.ProcessState == nil {
-			return fail(http.StatusInternalServerError, "start the run command: "+err.Error())
+			return failure(http.StatusInternalServerError, "start the run command: "+err.Error())
 		}
 		reply.Ran = &runtimecontract.Ran{ExitCode: command.ProcessState.ExitCode(), Stdout: string(stdout), Stderr: string(stderr)}
 	}
@@ -235,7 +200,7 @@ func (s *supervisor) build(r *http.Request) (int, runtimecontract.BuildReply) {
 }
 
 func (s *supervisor) empty() error {
-	s.written, s.unpacked, s.installed = nil, "", runtimecontract.Install{}
+	s.written, s.unpacked, s.installed = nil, "", nil
 	return errors.Join(os.RemoveAll(s.root), os.MkdirAll(s.root, 0o700))
 }
 
@@ -245,6 +210,30 @@ func (s *supervisor) decode(name string, value any) error {
 		return err
 	}
 	return protocol.DecodeJSONStrict(data, value)
+}
+
+// Install and prepare use the same commands in a live reload and a clean build.
+func (s *supervisor) prepare(ctx context.Context, plan runtimecontract.Plan, output io.Writer, env ...string) error {
+	if !reflect.DeepEqual(s.installed, &plan.Install) {
+		s.installed = nil
+		commands := plan.Install.Commands
+		interpreter, _ := os.Readlink(filepath.Join(s.root, ".venv/bin/python"))
+		relative, _ := filepath.Rel(s.root, interpreter)
+		managed, _ := filepath.Match(".toolchain/python/*/bin/python*", relative)
+		if managed {
+			selected, _ := s.command(ctx, []string{"uv", "python", "find", "--no-python-downloads"}, env...).Output()
+			target, _ := filepath.EvalSymlinks(strings.TrimSpace(string(selected)))
+			if target != interpreter {
+				version := filepath.Base(filepath.Dir(filepath.Dir(interpreter)))
+				commands = append([][]string{{"uv", "python", "uninstall", "--install-dir", ".toolchain/python", "--", version}}, commands...)
+			}
+		}
+		if err := s.run(ctx, commands, output, env...); err != nil {
+			return err
+		}
+		s.installed = &plan.Install
+	}
+	return s.run(ctx, plan.Prepare, output, env...)
 }
 
 func (s *supervisor) run(ctx context.Context, commands [][]string, output io.Writer, env ...string) error {
@@ -282,19 +271,20 @@ type child struct {
 	done    chan struct{}
 }
 
-func (s *supervisor) start(argv []string) (*child, error) {
-	address, err := loopbackAddress()
+func (s *supervisor) start(ctx context.Context, argv []string, output string) (int, runtimecontract.BuildReply) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		return nil, err
+		return failure(http.StatusInternalServerError, err.Error())
 	}
-	_, port, _ := net.SplitHostPort(address)
-	command := s.command(context.Background(), argv, "HOST=127.0.0.1", "PORT="+port)
+	address := listener.Addr().(*net.TCPAddr)
+	_ = listener.Close()
+	command := s.command(context.Background(), argv, "HOST=127.0.0.1", "PORT="+strconv.Itoa(address.Port))
 	command.Stdout, command.Stderr = os.Stdout, os.Stderr
 	if err := command.Start(); err != nil {
-		return nil, fmt.Errorf("start application: %w", err)
+		return failure(http.StatusInternalServerError, "start application: "+err.Error())
 	}
-	target := &url.URL{Scheme: "http", Host: address}
-	c := &child{command: command, address: address, done: make(chan struct{}), proxy: &httputil.ReverseProxy{
+	target := &url.URL{Scheme: "http", Host: address.String()}
+	c := &child{command: command, address: address.String(), done: make(chan struct{}), proxy: &httputil.ReverseProxy{
 		Rewrite: func(p *httputil.ProxyRequest) {
 			p.SetURL(target)
 			p.Out.Host = p.In.Host
@@ -307,11 +297,23 @@ func (s *supervisor) start(argv []string) (*child, error) {
 			http.Error(w, "Application unavailable", http.StatusBadGateway)
 		},
 	}}
+	published := make(chan struct{})
+	defer close(published)
 	go func() {
 		_ = command.Wait()
 		close(c.done)
+		<-published
+		if s.app.CompareAndSwap(c, nil) {
+			fmt.Fprintln(os.Stderr, "application exited:", c.command.ProcessState)
+		}
 	}()
-	return c, nil
+	status, problem := c.ready(ctx)
+	if status != http.StatusOK {
+		c.stop()
+		return failure(status, problem)
+	}
+	s.app.Store(c)
+	return status, runtimecontract.BuildReply{ReloadReply: runtimecontract.ReloadReply{Output: output}}
 }
 
 // ready waits until the app accepts connections, and fails once it exits or ctx ends first.
@@ -342,22 +344,6 @@ func (c *child) stop() {
 	}
 	_ = syscall.Kill(group, syscall.SIGKILL)
 	<-c.done
-}
-
-// loopbackAddress reserves a free loopback port for the app.
-func loopbackAddress() (string, error) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = listener.Close() }()
-	return listener.Addr().String(), nil
-}
-
-func writeReply(w http.ResponseWriter, status int, reply any) {
-	w.Header().Set(protocol.HeaderContentType, protocol.MIMEApplicationJSON)
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(reply)
 }
 
 const tailBytes = 4 << 10

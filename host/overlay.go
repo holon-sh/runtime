@@ -27,51 +27,63 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
-func (s *supervisor) fetch(ctx context.Context) (bool, error) {
+// boot starts the app from its recorded overlay. A missing tag or blob leaves it
+// waiting for the first reload.
+func (s *supervisor) boot(ctx context.Context) error {
+	if s.record == nil {
+		return nil
+	}
+	s.turn <- struct{}{}
+	defer func() { <-s.turn }()
 	var manifest ocispec.Manifest
 	tagged, err := s.get(ctx, "manifests", s.record.Tag)
 	if tagged == nil {
-		return false, err
+		return err
 	}
-	err = json.NewDecoder(tagged.Body).Decode(&manifest)
-	_ = tagged.Body.Close()
+	err = json.NewDecoder(tagged).Decode(&manifest)
+	_ = tagged.Close()
 	if err != nil || len(manifest.Layers) == 0 || !protocol.ValidDigest(manifest.Layers[0].Digest.String()) {
-		return false, errors.New("the tag names no overlay")
+		return errors.New("the tag names no overlay")
 	}
-	blob, err := s.get(ctx, "blobs", manifest.Layers[0].Digest.String())
+	want := manifest.Layers[0].Digest
+	blob, err := s.get(ctx, "blobs", want.String())
 	if blob == nil {
-		return false, err
+		return err
 	}
-	defer func() { _ = blob.Body.Close() }()
-	unpacked, err := s.unpack(blob.Body)
-	if err == nil && unpacked != manifest.Layers[0].Digest {
-		err = errors.New("digest mismatch")
+	defer blob.Close()
+	verifier := want.Verifier()
+	if err := s.unpack(io.TeeReader(blob, verifier)); err != nil {
+		return err
 	}
-	return err == nil, err
+	if !verifier.Verified() {
+		return errors.New("digest mismatch")
+	}
+	s.unpacked = want
+	if status, reply := s.execute(ctx, nil, ""); status != http.StatusOK {
+		fmt.Fprintf(os.Stderr, "%sapplication did not start: %s\n", reply.Output, reply.Error)
+	}
+	return nil
 }
 
 // unpack removes what the previous overlay wrote, keeping what the app made beside it, such as its installed
-// dependencies, and writes overlay into the source directory. It returns the overlay's digest.
-func (s *supervisor) unpack(overlay io.Reader) (digest.Digest, error) {
+// dependencies, and writes overlay into the source directory.
+func (s *supervisor) unpack(overlay io.Reader) error {
 	root, err := os.OpenRoot(s.root)
 	if err != nil {
-		return "", err
+		return err
 	}
 	defer func() { _ = root.Close() }()
 	slices.Sort(s.written)
 	for _, name := range slices.Backward(s.written) {
 		_ = root.Remove(name)
 	}
-	digester := digest.SHA256.Digester()
-	stream := io.TeeReader(overlay, digester.Hash())
-	if s.written, err = extract(stream, root); err == nil {
-		_, err = io.Copy(io.Discard, stream)
+	if s.written, err = extract(overlay, root); err == nil {
+		_, err = io.Copy(io.Discard, overlay)
 	}
 	if err != nil {
-		return "", fmt.Errorf("unpack source: %w", err)
+		return fmt.Errorf("unpack source: %w", err)
 	}
-	s.unpacked = digester.Digest()
-	return s.unpacked, nil
+	return nil
 }
 
 // extract writes a zstd tar's entries under root, replacing what the app made at the same path, and returns their
@@ -133,9 +145,10 @@ func (s *supervisor) freeze(ctx context.Context, token string, dependencies []st
 		return "", err
 	}
 	defer func() { _ = root.Close() }()
-	source := map[string]bool{path.Dir(runtimecontract.PlanFile): true}
-	for _, name := range dependencies {
-		source[name] = true
+	excluded := map[string]bool{path.Dir(runtimecontract.PlanFile): true}
+	var tools []string
+	if slices.Contains(dependencies, ".venv") {
+		tools, _ = fs.Glob(root.FS(), ".toolchain/python")
 	}
 	image := ocispec.Image{
 		Platform: ocispec.Platform{Architecture: runtime.GOARCH, OS: runtime.GOOS},
@@ -148,16 +161,13 @@ func (s *supervisor) freeze(ctx context.Context, token string, dependencies []st
 		MediaType:   ocispec.MediaTypeImageManifest,
 		Annotations: map[string]string{ocispec.AnnotationBaseImageDigest: base},
 	}
-	for _, selected := range []struct {
-		starts   []string
-		excluded map[string]bool
-	}{{dependencies, nil}, {[]string{"."}, source}} {
-		if len(selected.starts) == 0 {
+	for _, starts := range [][]string{tools, dependencies, {"."}} {
+		if len(starts) == 0 {
 			continue
 		}
 		var diffID digest.Digest
 		layer, err := s.push(ctx, token, ocispec.MediaTypeImageLayerZstd, func(w io.Writer) (err error) {
-			diffID, err = s.layer(w, root.FS(), selected.starts, selected.excluded, len(manifest.Layers) == 0)
+			diffID, err = s.layer(w, root.FS(), starts, excluded, len(manifest.Layers) == 0)
 			return err
 		})
 		if err != nil {
@@ -165,6 +175,9 @@ func (s *supervisor) freeze(ctx context.Context, token string, dependencies []st
 		}
 		manifest.Layers = append(manifest.Layers, layer)
 		image.RootFS.DiffIDs = append(image.RootFS.DiffIDs, diffID)
+		for _, name := range starts {
+			excluded[name] = true
+		}
 	}
 	config, _ := json.Marshal(image)
 	manifest.Config, err = s.push(ctx, token, ocispec.MediaTypeImageConfig, func(w io.Writer) error {
@@ -182,7 +195,7 @@ func (s *supervisor) freeze(ctx context.Context, token string, dependencies []st
 	return reference, err
 }
 
-func (s *supervisor) get(ctx context.Context, kind, reference string) (*http.Response, error) {
+func (s *supervisor) get(ctx context.Context, kind, reference string) (io.ReadCloser, error) {
 	request := s.request(ctx, s.record.Token, http.MethodGet, s.record.Location().JoinPath(kind, reference), nil)
 	request.Header.Set("Accept", ocispec.MediaTypeImageManifest)
 	response, err := (&http.Client{Transport: s.transport}).Do(request)
@@ -190,7 +203,7 @@ func (s *supervisor) get(ctx context.Context, kind, reference string) (*http.Res
 		return nil, errors.New("registry unavailable")
 	}
 	if response.StatusCode == http.StatusOK {
-		return response, nil
+		return response.Body, nil
 	}
 	_ = response.Body.Close()
 	if response.StatusCode == http.StatusNotFound {
@@ -268,10 +281,10 @@ func (s *supervisor) layer(w io.Writer, fsys fs.FS, starts []string, excluded ma
 		if err != nil {
 			return err
 		}
-		if excluded[name] && entry.IsDir() {
-			return fs.SkipDir
-		}
 		if excluded[name] {
+			if entry.IsDir() {
+				return fs.SkipDir
+			}
 			return nil
 		}
 		info, err := entry.Info()
