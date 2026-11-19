@@ -113,7 +113,6 @@ func setup(t *testing.T, port, root string, record *runtimecontract.OverlayRecor
 	if err := os.Mkdir(filepath.Join(seed, ".holon"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	// The selected executable runs the install command supplied by each fixture.
 	if err := os.Symlink("/usr/bin/env", filepath.Join(seed, ".holon", "cached-node")); err != nil {
 		t.Fatal(err)
 	}
