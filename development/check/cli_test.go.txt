@@ -1,0 +1,61 @@
+// Compiled into the released CLI's installation tests with go test -overlay.
+// This keeps the CLI's private plan, archive and OCI assembly paths authoritative.
+package installation
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+
+	"oras.land/oras-go/v2"
+	"oras.land/oras-go/v2/content/oci"
+
+	"github.com/holon-sh/cli/pkg/recipe"
+	"github.com/holon-sh/protocol/runtimecontract"
+	"github.com/opencontainers/go-digest"
+	"oras.land/oras-go/v2/registry/remote"
+)
+
+func TestSourceImageContract(t *testing.T) {
+	ctx := t.Context()
+	root, entry := os.Getenv("PROJECT"), os.Getenv("ENTRY")
+	check := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	repository := func(name string) *remote.Repository {
+		r, err := remote.NewRepository(os.Getenv("REGISTRY") + "/" + name)
+		check(err)
+		r.PlainHTTP = true
+		return r
+	}
+	if archive := os.Getenv("BASE_OCI"); archive != "" {
+		store, err := oci.NewFromTar(ctx, archive)
+		check(err)
+		_, err = oras.Copy(ctx, store, os.Getenv("BASE_DIGEST"), repository("base"), "check", oras.DefaultCopyOptions)
+		check(err)
+		return
+	}
+	if frozen := os.Getenv("FROZEN"); frozen != "" {
+		target := repository(os.Getenv("APP"))
+		image, err := assembleImage(ctx, target, repository("base"), digest.Digest(frozen), recipe.Start(entry), nil)
+		check(err)
+		check(target.Tag(ctx, image, "production"))
+		return
+	}
+
+	plan, err := overlayPlan(root, entry, false)
+	check(err)
+	if os.Getenv("BUILD") == "1" {
+		r, err := recipe.Read(os.DirFS(root))
+		check(err)
+		plan = (sourceBuild{entry: entry, recipe: r}).plan(r.Deploy.Build)
+		check(writeHolonFile(root, runtimecontract.BuildFile, runtimecontract.Build{Freeze: &r.Deploy.Freeze}))
+	}
+	check(writeHolonFile(root, runtimecontract.PlanFile, plan))
+	_, file, err := packOverlay(ctx, filepath.Clean(root))
+	check(err)
+	check(os.Rename(file, os.Getenv("OVERLAY")))
+}
