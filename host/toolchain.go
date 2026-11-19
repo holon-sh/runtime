@@ -2,6 +2,7 @@ package host
 
 import (
 	"context"
+	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,9 @@ import (
 )
 
 const toolchainDir = ".toolchain"
+
+//go:embed pnpm/config.yaml
+var pnpmDefaults embed.FS
 
 type installation struct {
 	runtimecontract.Install
@@ -152,6 +156,11 @@ func (result *nodeRange) UnmarshalJSON(data []byte) error {
 var managerVersion = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+(sha224|sha256|sha384|sha512)\.[A-Fa-f0-9]+)?$`)
 
 func (s *supervisor) resolveNode(ctx context.Context, node nodeProject, output io.Writer) error {
+	if node.manager == "pnpm" {
+		if err := os.CopyFS(filepath.Join(filepath.Dir(s.root), ".config"), pnpmDefaults); err != nil && !errors.Is(err, os.ErrExist) {
+			return err
+		}
+	}
 	managerDir := filepath.Join(filepath.Dir(s.root), ".cache", "holon-manager")
 	if err := errors.Join(os.RemoveAll(managerDir), os.RemoveAll(filepath.Join(s.root, "node_modules"))); err != nil {
 		return err
