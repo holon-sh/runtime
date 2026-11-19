@@ -2,10 +2,6 @@ package host
 
 import (
 	"context"
-	"crypto"
-	_ "crypto/sha256"
-	_ "crypto/sha512"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,7 +23,8 @@ type installation struct {
 }
 
 type nodeProject struct {
-	manager, pin, version string
+	manager, pin string
+	versions     [3]string
 }
 
 func (s *supervisor) environment() []string {
@@ -106,8 +103,8 @@ func (s *supervisor) nodeProject(commands [][]string) (nodeProject, error) {
 		}
 		project.pin = version
 	}
-	project.version = manifest.Engines.Node
-	for _, name := range []string{".nvmrc", ".node-version"} {
+	project.versions[2] = manifest.Engines.Node
+	for i, name := range []string{".nvmrc", ".node-version"} {
 		data, err := os.ReadFile(filepath.Join(s.root, name))
 		if errors.Is(err, os.ErrNotExist) {
 			continue
@@ -115,10 +112,7 @@ func (s *supervisor) nodeProject(commands [][]string) (nodeProject, error) {
 		if err != nil {
 			return project, err
 		}
-		if value := strings.TrimSpace(string(data)); value != "" {
-			project.version = value
-			break
-		}
+		project.versions[i] = strings.TrimSpace(string(data))
 	}
 	return project, nil
 }
@@ -131,7 +125,7 @@ func (s *supervisor) resolveNode(ctx context.Context, node nodeProject, output i
 		return err
 	}
 	install := []string{"fnm", "install", "--progress", "never"}
-	if node.version == "" {
+	if node.versions == [3]string{} {
 		install = append(install, "--lts")
 	}
 	if err := s.run(ctx, [][]string{install}, output); err != nil {
@@ -158,26 +152,12 @@ func (s *supervisor) resolveNode(ctx context.Context, node nodeProject, output i
 			return err
 		}
 		spec = filepath.Join(managerDir, node.manager+"-"+version+".tgz")
-		if err := checkIntegrity(spec, integrity); err != nil {
-			return err
+		algorithm, sum, _ := strings.Cut(integrity, ".")
+		check := s.command(ctx, []string{algorithm + "sum", "--check", "--status"})
+		check.Stdin = strings.NewReader(sum + "  " + spec + "\n")
+		if err := check.Run(); err != nil {
+			return fmt.Errorf("%s does not match packageManager checksum %s: %w", filepath.Base(spec), integrity, err)
 		}
 	}
 	return npm("install", "--global", "--prefix", managerDir, "--ignore-scripts", spec)
-}
-
-func checkIntegrity(file, integrity string) error {
-	algorithm, want, _ := strings.Cut(integrity, ".")
-	hash := map[string]crypto.Hash{"sha224": crypto.SHA224, "sha256": crypto.SHA256, "sha384": crypto.SHA384, "sha512": crypto.SHA512}[algorithm].New()
-	f, err := os.Open(file)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = f.Close() }()
-	if _, err := io.Copy(hash, f); err != nil {
-		return err
-	}
-	if !strings.EqualFold(hex.EncodeToString(hash.Sum(nil)), want) {
-		return fmt.Errorf("%s does not match packageManager checksum %s", filepath.Base(file), integrity)
-	}
-	return nil
 }
