@@ -270,6 +270,36 @@ def proof(cli, work, stack):
         run("kubectl", "exec", pod, "--", *probe, registry)
         run("kubectl", "delete", "pod", pod, "--wait=false")
 
+    # A Python app can consume Node in its page build without shipping it.
+    hybrid = work/"hybrid"
+    shutil.copytree(work/"python", hybrid)
+    (hybrid/"package.json").write_text(json.dumps({"name": "page", "private": True, "engines": {"node": "22"},
+        "dependencies": {"ms": "2.1.3"}, "scripts": {"build": "node page.cjs"}}))
+    (hybrid/"page.cjs").write_text("const fs = require('fs'); fs.mkdirSync('dist',{recursive:true}); "
+        "fs.writeFileSync('dist/page.json', JSON.stringify({ minute: require('ms')('1m'), node: process.version }));")
+    (hybrid/"server.py").write_text("from pathlib import Path\nfrom mcp.server import MCPServer\n"
+        "server = MCPServer('page')\nfrontend = Path(__file__).with_name('dist')\n")
+    build_pod("hybrid-build", "hybrid")
+    with port_forward("hybrid-build") as url:
+        reply, _ = submit(url, hybrid, "server.py", "Python with Node page build", build=True)
+    digest = reply["image"]
+    run("kubectl", "delete", "pod", "hybrid-build", "--wait=false")
+    released(FROZEN=digest, APP="hybrid", ENTRY="server.py")
+    start_pod("hybrid-offline", cache_image("hybrid:production"), {"HOST": "0.0.0.0"}, production=True)
+    with port_forward("hybrid-offline") as url:
+        page = request(url+"/page.json")
+        assert page["minute"] == 60000 and page["node"].startswith("v22."), page
+    manifest = request(f"http://{host}/v2/hybrid/manifests/{digest}", headers={"Accept":"application/vnd.oci.image.manifest.v1+json"})
+    names = set()
+    for layer in manifest["layers"]:
+        with urlopen(f"http://{host}/v2/hybrid/blobs/{layer['digest']}", timeout=240) as src, (work/"layer.zst").open("wb") as dest:
+            shutil.copyfileobj(src, dest)
+        names.update(n.rstrip("/") for n in run("tar", "-tf", work/"layer.zst").splitlines())
+    assert {"app/source/.venv/bin/python", "app/source/dist/page.json"} <= names and any(
+        n.startswith("app/source/.toolchain/python/") for n in names), "missing Python toolchain, venv or built page"
+    assert not any(n == prefix or n.startswith(prefix+"/") for n in names
+        for prefix in ["app/source/.toolchain/node", "app/source/node_modules"]), "Node present in a frozen layer"
+    print(f"{ARCH} offline hybrid answered {page}; all {len(manifest['layers'])} frozen layers contain no Node installation", flush=True)
     access = run("docker", "exec", name+"-proxy", "cat", "/var/log/squid/access.log")
     assert "TCP_DENIED" not in access and "nodejs.org:443" in access and "releases.astral.sh:443" in access, access
     slow = {app: samples for app, samples in timings.items() if max(samples) >= 1}
