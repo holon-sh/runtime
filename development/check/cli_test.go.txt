@@ -34,13 +34,13 @@ func TestSourceImageContract(t *testing.T) {
 	if archive := os.Getenv("BASE_OCI"); archive != "" {
 		store, err := oci.NewFromTar(ctx, archive)
 		check(err)
-		_, err = oras.Copy(ctx, store, os.Getenv("BASE_DIGEST"), repository("base"), "check", oras.DefaultCopyOptions)
+		_, err = oras.Copy(ctx, store, os.Getenv("BASE_DIGEST"), repository(os.Getenv("BASE_REPOSITORY")), "check", oras.DefaultCopyOptions)
 		check(err)
 		return
 	}
 	if frozen := os.Getenv("FROZEN"); frozen != "" {
 		target := repository(os.Getenv("APP"))
-		image, err := assembleImage(ctx, target, repository("base"), digest.Digest(frozen), recipe.Start(entry), nil)
+		image, err := assembleImage(ctx, target, repository(os.Getenv("BASE_REPOSITORY")), digest.Digest(frozen), recipe.Start(entry), nil)
 		check(err)
 		check(target.Tag(ctx, image, "production"))
 		return

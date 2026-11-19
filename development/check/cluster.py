@@ -18,7 +18,6 @@ from urllib.request import Request, urlopen
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 ARCH = {"x86_64": "amd64", "aarch64": "arm64", "arm64": "arm64"}[platform.machine()]
-BASELINE = "source-image:dev20"
 REGISTRY = "registry:3@sha256:82f6ff4a7f982960c8aa51617fea3aabc485df6e55cce80d22deb1de36f1bc3c"
 SQUID = "ubuntu/squid:6.10-24.10_beta@sha256:c9f5212b147a766529c7b026e2bebed37b998d33d0066b658596af5eba7cc65c"
 
@@ -89,24 +88,12 @@ def policy(mode, allowed):
 def proof(cli, baseline, work, stack):
     name = "source-" + work.name[-8:].lower().replace("_", "x")
     node = f"k3d-{name}-server-0"
-    archive = work / "base.tar"
     binary = work / "released-cli.test"
     overlay = work / "source.tar.zst"
     go_overlay = work / "go-overlay.json"
     virtual = cli / "pkg/installation/source_image_test.go"
     go_overlay.write_text(json.dumps({"Replace": {str(virtual): str(HERE / "cli_test.go.txt")}}))
     run("go", "-C", cli, "test", "-c", "-overlay", go_overlay, "-o", binary, "./pkg/installation")
-    run("docker", "buildx", "build", "--platform", "linux/"+ARCH, "--provenance=true", "-t", "proof:base",
-        "--output", f"type=oci,dest={archive}", "-f", ROOT/"development/Dockerfile", ROOT)
-    with tarfile.open(archive) as tar:
-        descriptor, = json.load(tar.extractfile("index.json"))["manifests"]
-        assert descriptor["mediaType"] == "application/vnd.oci.image.index.v1+json", descriptor
-        base_digest = descriptor["digest"]
-        def blob(digest):
-            return json.load(tar.extractfile("blobs/" + digest.replace(":", "/")))
-        native, = [m for m in blob(base_digest)["manifests"] if m.get("platform", {}).get("architecture") == ARCH]
-        print(f"{ARCH} base compressed layer bytes {sum(layer['size'] for layer in blob(native['digest'])['layers'])}", flush=True)
-
     # A private kubeconfig keeps all kubectl operations on this ephemeral cluster.
     os.environ["KUBECONFIG"] = str(work/"kubeconfig")
     stack.callback(run, "k3d", "cluster", "delete", name)
@@ -132,10 +119,8 @@ def proof(cli, baseline, work, stack):
     policy("offline", [])
 
     def released(**variables):
-        run(binary, "-test.run=^TestSourceImageContract$", env={**os.environ, "REGISTRY": host,
+        run(binary, "-test.run=^TestSourceImageContract$", env={**os.environ, "REGISTRY": host, "BASE_REPOSITORY": "base",
             "OVERLAY": str(overlay), **{k: str(v) for k, v in variables.items()}})
-
-    released(BASE_OCI=archive, BASE_DIGEST=base_digest)
 
     def cache_image(ref):
         # The node imports the image. The app's network policy applies from its first instruction.
@@ -143,17 +128,36 @@ def proof(cli, baseline, work, stack):
         run("docker", "exec", node, "ctr", "-n", "k8s.io", "images", "pull", "--plain-http", "--platform", "linux/"+ARCH, ref)
         return ref
 
-    base = cache_image("base@"+base_digest)
+    def build_base(source, label):
+        archive = work/(label+".tar")
+        run("docker", "buildx", "build", "--platform", "linux/"+ARCH, "--provenance=true", "-t", "proof:base",
+            "--output", f"type=oci,dest={archive}", "-f", source/"development/Dockerfile", source)
+        with tarfile.open(archive) as tar:
+            descriptor, = json.load(tar.extractfile("index.json"))["manifests"]
+            assert descriptor["mediaType"] == "application/vnd.oci.image.index.v1+json", descriptor
+            base_digest = descriptor["digest"]
+            def blob(digest):
+                return json.load(tar.extractfile("blobs/" + digest.replace(":", "/")))
+            native, = [m for m in blob(base_digest)["manifests"] if m.get("platform", {}).get("architecture") == ARCH]
+            print(f"{ARCH} {label} compressed base layer bytes {sum(layer['size'] for layer in blob(native['digest'])['layers'])}", flush=True)
+        released(BASE_OCI=archive, BASE_DIGEST=base_digest, BASE_REPOSITORY=label)
+        return cache_image(label+"@"+base_digest)
+
+    base = build_base(ROOT, "base")
+    old_base = build_base(baseline, "oldbase")
     def build_pod(pod, app, image=base):
         record = json.dumps({"registry": f"http://{registry}:5000", "repository": app, "tag": "session", "token": "local"})
         run("kubectl", "create", "configmap", pod, "--from-literal=overlay.json="+record)
         proxy_url = f"http://{proxy}:3128"
+        creating = time.monotonic()
         start_pod(pod, image, {"HOLON_BASE_IMAGE": image, "HOLON_OVERLAY_FILE": "/record/overlay.json",
                   "HTTP_PROXY": proxy_url, "HTTPS_PROXY": proxy_url, "http_proxy": proxy_url,
                   "https_proxy": proxy_url, "NO_PROXY": registry, "no_proxy": registry})
+        pod_ready = time.monotonic()-creating
         status = run("kubectl", "exec", pod, "--", "timeout", "10", "bash", "-c",
                      'exec 3<>/dev/tcp/$1/3128; printf "CONNECT nodejs.org:443 HTTP/1.1\\r\\nHost: nodejs.org:443\\r\\n\\r\\n" >&3; head -1 <&3', "check-proxy", proxy)
         assert "200" in status, status
+        return pod_ready
 
     def submit(url, project, entry, phase, *, build=False):
         with tempfile.TemporaryDirectory(dir=work) as staged:
@@ -165,7 +169,7 @@ def proof(cli, baseline, work, stack):
         started = time.monotonic()
         reply = request(url+"/.holon/"+("build" if build else "reload"), data=body, headers=headers)
         seconds = time.monotonic()-started
-        print(f"{ARCH} {phase}: {seconds:.3f}s", flush=True)
+        print(f"{ARCH} {phase} overlay POST-to-ready: {seconds:.3f}s", flush=True)
         return reply, seconds
 
     def check_response(url, version, marker, *, production=False):
@@ -181,10 +185,12 @@ def proof(cli, baseline, work, stack):
         samples = []
         for edit in range(1, 4):
             marker = f"edit-{edit}"
+            changed = time.monotonic()
             (project/entry).write_text(initial.replace('"first"', json.dumps(marker)))
             reply, elapsed = submit(url, project, entry, phase+" "+marker)
             assert not reply.get("output"), reply
             check_response(url, resolved, marker)
+            print(f"{ARCH} {phase} {marker} file-write to observed response {time.monotonic()-changed:.3f}s", flush=True)
             samples.append(elapsed)
         print(f"{ARCH} {phase} seconds {samples}", flush=True)
         return samples
@@ -208,12 +214,9 @@ def proof(cli, baseline, work, stack):
             run("uv", "lock", "--directory", project, "--default-index", "https://pypi.org/simple")
 
         if app == "python":
-            # Rebuild the chart pin's public source without granting this pull request registry credentials.
-            run("docker", "buildx", "build", "--load", "-t", BASELINE, "-f", baseline/"development/Dockerfile", baseline)
-            run("k3d", "image", "import", BASELINE, "-c", name)
             control = work/"published"
             shutil.copytree(project, control)
-            build_pod("python-published", app, BASELINE)
+            build_pod("python-published", app, old_base)
             with port_forward("python-published") as url:
                 submit(url, control, entry, "dev.20 rebuild Python cold")
                 version = check_response(url, first+".", "first")
@@ -238,6 +241,11 @@ def proof(cli, baseline, work, stack):
                 submit(url, project, entry, "Node from package.json engines")
                 check_response(url, "22.", "edit-3")
                 del manifest["engines"]
+                manifest["devEngines"] = {"runtime": [{"name": "node", "version": "^24"}]}
+                (project/"package.json").write_text(json.dumps(manifest))
+                submit(url, project, entry, "Node from package.json devEngines.runtime")
+                check_response(url, "24.", "edit-3")
+                del manifest["devEngines"]
                 (project/"package.json").write_text(json.dumps(manifest))
                 submit(url, project, entry, "Node without a version declaration")
                 latest = next(v["version"][1:] for v in request("https://nodejs.org/dist/index.json") if v["lts"])
@@ -302,6 +310,83 @@ def proof(cli, baseline, work, stack):
     assert not any(n == prefix or n.startswith(prefix+"/") for n in names
         for prefix in ["app/source/.toolchain/node", "app/source/node_modules"]), "Node present in a frozen layer"
     print(f"{ARCH} offline hybrid answered {page}; all {len(manifest['layers'])} frozen layers contain no Node installation", flush=True)
+    # Both images run exactly the versions of the currently supported project. Reuse image layers on
+    # the same node and registry across trials, but give each dev/build its own empty /app and /tmp.
+    versions_pod = "baseline-versions"
+    build_pod(versions_pod, "versions", old_base)
+    def version(program, *args):
+        return run("kubectl", "exec", versions_pod, "--", program, *args)
+    node_version = version("node", "-p", "process.versions.node")
+    manager_version = version("pnpm", "--version")
+    python_version = version("python3.13", "-c", "import platform; print(platform.python_version())")
+    run("kubectl", "delete", "pod", versions_pod, "--wait=false")
+    print(f"BENCH {ARCH} versions node={node_version} pnpm={manager_version} python={python_version}", flush=True)
+
+    def timed(fn, *args, **kwargs):
+        started = time.monotonic()
+        value = fn(*args, **kwargs)
+        return value, time.monotonic()-started
+
+    for app, entry, version_file, expected in [
+        ("node", "server.js", ".nvmrc", node_version),
+        ("python", "server.py", ".python-version", python_version),
+    ]:
+        project = work/("benchmark-"+app)
+        project.mkdir()
+        shutil.copyfile(HERE/entry, project/entry)
+        (project/version_file).write_text(expected+"\n")
+        if app == "node":
+            sdk = json.loads((cli/"tooling/typescript/package.json").read_text())["devDependencies"]["holon-sh"]
+            (project/"package.json").write_text(json.dumps({"name":"check", "type":"module",
+                "packageManager":"pnpm@"+manager_version, "dependencies":{"holon-sh":sdk}}))
+            run("npm", "exec", "--yes", "--package=pnpm@"+manager_version, "--", "pnpm", "install", "--lockfile-only", cwd=project)
+        else:
+            for filename in ["pyproject.toml", "uv.lock"]:
+                shutil.copyfile(work/"python"/filename, project/filename)
+
+        def observed(url, marker, *, production=False):
+            answer = request(url+"/runtime.json")
+            assert answer["version"] == expected and answer["marker"] == marker and answer["uid"] == 10001, answer
+            if app == "node":
+                assert answer["installer"] == (None if production else "pnpm@"+manager_version), answer
+
+        for rep in range(3):
+            variants = [("dev20", old_base, "oldbase"), ("candidate", base, "base")]
+            if rep % 2:
+                variants.reverse()
+            for side, image, base_repository in variants:
+                sample = f"{app}-{side}-{rep}"
+                dev, build, production = (sample+"-"+phase for phase in ("dev", "build", "prod"))
+                measurements = {}
+                shutil.copyfile(HERE/entry, project/entry)
+                measurements["dev_pod_ready"] = build_pod(dev, sample, image)
+                with port_forward(dev) as url:
+                    ((_, post), total) = timed(submit, url, project, entry, sample+" cold dev")
+                    measurements.update(dev_cold_cli_and_ready=total, dev_cold_post=post)
+                    observed(url, "first")
+                    started = time.monotonic()
+                    (project/entry).write_text((project/entry).read_text().replace('"first"', '"saved"'))
+                    _, post = submit(url, project, entry, sample+" save")
+                    observed(url, "saved")
+                    measurements.update(save_write_to_observed=time.monotonic()-started, save_post=post)
+                run("kubectl", "delete", "pod", dev, "--wait=false")
+                measurements["build_pod_ready"] = build_pod(build, sample, image)
+                with port_forward(build) as url:
+                    ((reply, post), total) = timed(submit, url, project, entry, sample+" deploy build", build=True)
+                    measurements.update(deploy_cli_and_freeze=total, build_freeze_post=post)
+                _, measurements["cli_assemble"] = timed(released, FROZEN=reply["image"], APP=sample, ENTRY=entry,
+                                                         BASE_REPOSITORY=base_repository)
+                frozen, measurements["pull_assembled"] = timed(cache_image, sample+":production")
+                began = time.monotonic()
+                start_pod(production, frozen, {"HOST":"0.0.0.0"}, production=True)
+                with port_forward(production) as url:
+                    observed(url, "saved", production=True)
+                measurements["production_ready_and_observed"] = time.monotonic()-began
+                measurements["deploy_total"] = sum(measurements[k] for k in
+                    ["build_pod_ready","deploy_cli_and_freeze","cli_assemble","pull_assembled","production_ready_and_observed"])
+                elapsed = {key: round(value, 3) for key, value in measurements.items()}
+                print("BENCH", ARCH, app, side, rep+1, json.dumps(elapsed), flush=True)
+                run("kubectl", "delete", "pod", build, production, "--wait=false")
     access = run("docker", "exec", name+"-proxy", "cat", "/var/log/squid/access.log")
     assert "TCP_DENIED" not in access and "nodejs.org:443" in access and "releases.astral.sh:443" in access, access
     slow = {app: samples for app, samples in timings.items() if max(samples) >= 1}
