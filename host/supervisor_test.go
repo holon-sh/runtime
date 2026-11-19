@@ -241,6 +241,23 @@ func TestReload(t *testing.T) {
 	}
 }
 
+func TestPnpmLauncher(t *testing.T) {
+	s := supervisor{root: t.TempDir()}
+	t.Setenv("PATH", s.root)
+	commands := [][]string{{"pnpm", "a b", "$HOME"}, {"/bin/sh", "-c", "echo complete"}}
+	var output bytes.Buffer
+	if err := s.run(t.Context(), commands, &output); err == nil || !strings.Contains(output.String(), "pnpm") || strings.Contains(output.String(), "complete") {
+		t.Fatalf("missing pnpm: %v, output %q", err, &output)
+	}
+	if err := os.WriteFile(filepath.Join(s.root, "pnpm"), []byte(`printf '<%s>\n' "$@"`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	output.Reset()
+	if err := s.run(t.Context(), commands, &output); err != nil || output.String() != "<a b>\n<$HOME>\ncomplete\n" {
+		t.Fatalf("pnpm launcher: %v, output %q", err, &output)
+	}
+}
+
 func TestBootStartsTheRecordedOverlay(t *testing.T) {
 	blobs := map[string][]byte{}
 	tags := map[string]string{"tampered": "sha256:" + strings.Repeat("0", 64), "malformed": "sha256:../../other"}
