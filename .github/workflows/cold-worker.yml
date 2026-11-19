@@ -1,7 +1,7 @@
 name: Cold worker
 on:
   pull_request:
-    paths: ['development/check/cold.py', '.github/workflows/cold-worker.yml']
+    paths: ['development/check/cold.py', 'development/check/workers.json', '.github/workflows/cold-worker.yml']
 permissions:
   contents: read
   packages: read
