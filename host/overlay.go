@@ -149,7 +149,7 @@ func (s *supervisor) freeze(ctx context.Context, token string, dependencies []st
 	manifest := ocispec.Manifest{
 		Versioned:   specs.Versioned{SchemaVersion: 2},
 		MediaType:   ocispec.MediaTypeImageManifest,
-		Annotations: map[string]string{ocispec.AnnotationBaseImageDigest: base},
+		Annotations: map[string]string{ocispec.AnnotationBaseImageDigest: s.productionBase(dependencies, base)},
 	}
 	for _, starts := range [][]string{tools, dependencies, {"."}} {
 		if len(starts) == 0 {

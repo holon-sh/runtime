@@ -13,14 +13,31 @@ ADD --checksum=sha256:7807664f39d39fc518da1c35ba0181e4b3267603c4b1dedeb4b5fc6ae4
 ARG TARGETARCH
 RUN unzip -q /fnm-$TARGETARCH.zip -d /out && chmod 0755 /out/fnm
 
-FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS core
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libatomic1 netbase tzdata && rm -rf /var/lib/apt/lists/*
-COPY --from=ghcr.io/astral-sh/uv:0.13.1@sha256:4a1f3666816dafadd20ceb71eac9a7d56d7ef30279f7d64048519ab901ada336 /uv /uvx /usr/local/bin/
-COPY --from=fnm /out/fnm /usr/local/bin/fnm
-COPY --from=runtime /holon-mcp-runtime /holon-mcp-runtime
 ENV HOLON_RELOAD_DIR=/app/source PYTHONDONTWRITEBYTECODE=1
-ENV PATH=/app/.cache/holon-manager/bin:${HOLON_RELOAD_DIR}/.toolchain/node/aliases/default/bin:${PATH}
+ENV PATH=/app/.cache/holon-manager/bin:${HOLON_RELOAD_DIR}/.toolchain/node/bin:${PATH}
 WORKDIR /app
 USER 10001:10001
 STOPSIGNAL SIGTERM
+
+FROM scratch AS worker
+COPY --from=ghcr.io/astral-sh/uv:0.13.1@sha256:4a1f3666816dafadd20ceb71eac9a7d56d7ef30279f7d64048519ab901ada336 /uv /uvx /usr/local/bin/
+COPY --from=fnm /out/fnm /usr/local/bin/fnm
+COPY --from=runtime /holon-mcp-runtime /holon-mcp-runtime
+
+# Migrate the interpreters already shipped, plus upstream's latest LTS at release time.
+FROM ghcr.io/holon-sh/development@sha256:799756844538e51f867b2ecb0f82bd311a2090a8bf476c11141778509742975a AS seed
+USER 0
+COPY --from=worker / /worker/
+COPY development/package.py /package.py
+RUN FNM_DIR=/tmp/latest /worker/usr/local/bin/fnm install --lts --progress never \
+ && set -- /opt/uv/python/cpython-*/bin/python3 \
+ && "$1" /package.py seed /out
+
+FROM scratch AS layers
+COPY --from=seed /out/ /
+
+FROM core AS development
+COPY --from=worker / /
 ENTRYPOINT ["/holon-mcp-runtime"]
