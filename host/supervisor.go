@@ -222,7 +222,7 @@ func (s *supervisor) build(r *http.Request) (int, runtimecontract.BuildReply) {
 		reply.Image = image.String()
 	}
 	if len(build.Run) != 0 {
-		command, _ := s.command(r.Context(), build.Run, buildEnvironment...)
+		command := s.command(r.Context(), build.Run, buildEnvironment...)
 		var stderr tail
 		command.Stderr = &stderr
 		stdout, err := command.Output()
@@ -249,10 +249,7 @@ func (s *supervisor) decode(name string, value any) error {
 
 func (s *supervisor) run(ctx context.Context, commands [][]string, output io.Writer, env ...string) error {
 	for _, argv := range commands {
-		command, err := s.command(ctx, argv, env...)
-		if err != nil {
-			return err
-		}
+		command := s.command(ctx, argv, env...)
 		command.Stdout, command.Stderr = output, output
 		if err := command.Run(); err != nil {
 			return err
@@ -261,15 +258,15 @@ func (s *supervisor) run(ctx context.Context, commands [][]string, output io.Wri
 	return nil
 }
 
-func (s *supervisor) command(ctx context.Context, argv []string, env ...string) (*exec.Cmd, error) {
+func (s *supervisor) command(ctx context.Context, argv []string, env ...string) *exec.Cmd {
 	if len(argv) == 0 {
-		return nil, errors.New("the plan has an empty command")
+		return &exec.Cmd{Err: errors.New("the plan has an empty command")}
 	}
 	command := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	command.Dir, command.Env = s.root, append(append(os.Environ(), "PWD="+s.root), env...)
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	command.Cancel = func() error { return syscall.Kill(-command.Process.Pid, syscall.SIGKILL) }
-	return command, nil
+	return command
 }
 
 func (s *supervisor) stop() {
@@ -291,10 +288,7 @@ func (s *supervisor) start(argv []string) (*child, error) {
 		return nil, err
 	}
 	_, port, _ := net.SplitHostPort(address)
-	command, err := s.command(context.Background(), argv, "HOST=127.0.0.1", "PORT="+port)
-	if err != nil {
-		return nil, err
-	}
+	command := s.command(context.Background(), argv, "HOST=127.0.0.1", "PORT="+port)
 	command.Stdout, command.Stderr = os.Stdout, os.Stderr
 	if err := command.Start(); err != nil {
 		return nil, fmt.Errorf("start application: %w", err)
