@@ -18,6 +18,7 @@ from urllib.request import Request, urlopen
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 ARCH = {"x86_64": "amd64", "aarch64": "arm64", "arm64": "arm64"}[platform.machine()]
+PUBLISHED_BASE = "ghcr.io/holon-sh/development@sha256:799756844538e51f867b2ecb0f82bd311a2090a8bf476c11141778509742975a"
 REGISTRY = "registry:3@sha256:82f6ff4a7f982960c8aa51617fea3aabc485df6e55cce80d22deb1de36f1bc3c"
 SQUID = "ubuntu/squid:6.10-24.10_beta@sha256:c9f5212b147a766529c7b026e2bebed37b998d33d0066b658596af5eba7cc65c"
 
@@ -143,11 +144,11 @@ def proof(cli, work, stack):
         return ref
 
     base = cache_image("base@"+base_digest)
-    def build_pod(pod, app):
+    def build_pod(pod, app, image=base):
         record = json.dumps({"registry": f"http://{registry}:5000", "repository": app, "tag": "session", "token": "local"})
         run("kubectl", "create", "configmap", pod, "--from-literal=overlay.json="+record)
         proxy_url = f"http://{proxy}:3128"
-        start_pod(pod, base, {"HOLON_BASE_IMAGE": base, "HOLON_OVERLAY_FILE": "/record/overlay.json",
+        start_pod(pod, image, {"HOLON_BASE_IMAGE": image, "HOLON_OVERLAY_FILE": "/record/overlay.json",
                   "HTTP_PROXY": proxy_url, "HTTPS_PROXY": proxy_url, "http_proxy": proxy_url,
                   "https_proxy": proxy_url, "NO_PROXY": registry, "no_proxy": registry})
         status = run("kubectl", "exec", pod, "--", "timeout", "10", "bash", "-c",
@@ -175,6 +176,20 @@ def proof(cli, work, stack):
         print(f"{ARCH} app answered {body}", flush=True)
         return body["version"]
 
+    def source_edits(url, project, entry, phase, resolved):
+        initial = (project/entry).read_text()
+        samples = []
+        for edit in range(1, 4):
+            marker = f"edit-{edit}"
+            (project/entry).write_text(initial.replace('"first"', json.dumps(marker)))
+            reply, elapsed = submit(url, project, entry, phase+" "+marker)
+            assert not reply.get("output"), reply
+            check_response(url, resolved, marker)
+            samples.append(elapsed)
+        print(f"{ARCH} {phase} seconds {samples}", flush=True)
+        return samples
+
+    timings = {}
     for app, entry, pin, first, second in [
         ("node", "server.js", ".nvmrc", "22", "24"), ("python", "server.py", ".python-version", "3.12", "3.13"),
     ]:
@@ -192,32 +207,39 @@ def proof(cli, work, stack):
             (project/"pyproject.toml").write_text('[project]\nname="check"\nversion="0.0.0"\nrequires-python=">=3.12"\ndependencies=["holon-sh==0.0.1.dev26"]\n')
             run("uv", "lock", "--directory", project, "--default-index", "https://pypi.org/simple")
 
+        if app == "python":
+            run("docker", "exec", node, "ctr", "-n", "k8s.io", "images", "pull", "--platform", "linux/"+ARCH, PUBLISHED_BASE)
+            control = work/"published"
+            shutil.copytree(project, control)
+            build_pod("python-published", app, PUBLISHED_BASE)
+            with port_forward("python-published") as url:
+                submit(url, control, entry, "published Python cold")
+                version = check_response(url, first+".", "first")
+                source_edits(url, control, entry, "published Python source-only", version)
+            run("kubectl", "delete", "pod", "python-published", "--wait=false")
+
         pod = app+"-dev"
         build_pod(pod, app)
         with port_forward(pod) as url:
             submit(url, project, entry, f"{app} cold")
             resolved = check_response(url, first+".", "first")
-            (project/entry).write_text((project/entry).read_text().replace('"first"', '"saved"'))
-            reply, elapsed = submit(url, project, entry, f"{app} source-only save")
-            assert not reply.get("output"), reply
-            check_response(url, resolved, "saved")
-            assert elapsed < 1, f"{app} source-only save took {elapsed:.3f}s"
+            timings[app] = source_edits(url, project, entry, app+" source-only", resolved)
 
             if app == "node":
                 (project/pin).unlink()
                 pin = ".node-version"
             (project/pin).write_text(second+"\n")
             submit(url, project, entry, f"{app} version change")
-            check_response(url, second+".", "saved")
+            check_response(url, second+".", "edit-3")
             if app == "node":
                 (project/pin).unlink()
                 submit(url, project, entry, "Node from package.json engines")
-                check_response(url, "22.", "saved")
+                check_response(url, "22.", "edit-3")
                 del manifest["engines"]
                 (project/"package.json").write_text(json.dumps(manifest))
                 submit(url, project, entry, "Node without a version declaration")
                 latest = next(v["version"][1:] for v in request("https://nodejs.org/dist/index.json") if v["lts"])
-                check_response(url, latest, "saved")
+                check_response(url, latest, "edit-3")
         run("kubectl", "delete", "pod", pod, "--wait=false")
         (project/pin).write_text(first+"\n")
 
@@ -239,7 +261,7 @@ def proof(cli, work, stack):
         pod = app+"-offline"
         start_pod(pod, frozen, {"HOST":"0.0.0.0"}, production=True)
         with port_forward(pod) as url:
-            check_response(url, resolved, "saved", production=True)
+            check_response(url, resolved, "edit-3", production=True)
         # The same live registry accepted both build pushes. Offline pods must fail to connect to it.
         if app == "node":
             probe = ["node", "-e", "const s=require('net').connect(5000,process.argv[1],()=>process.exit(1));s.on('error',()=>{});s.setTimeout(2500,()=>s.destroy())"]
@@ -250,6 +272,8 @@ def proof(cli, work, stack):
 
     access = run("docker", "exec", name+"-proxy", "cat", "/var/log/squid/access.log")
     assert "TCP_DENIED" not in access and "nodejs.org:443" in access and "releases.astral.sh:443" in access, access
+    slow = {app: samples for app, samples in timings.items() if max(samples) >= 1}
+    assert not slow, f"source-only edits must finish in under a second: {slow}"
 
 
 if __name__ == "__main__":
