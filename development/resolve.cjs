@@ -45,7 +45,7 @@ function selectNode() {
 
 function selectManager() {
   const spec = project.packageManager || manager;
-  const pin = /^(npm|pnpm)(?:@(\d+\.\d+\.\d+(?:-[\w.-]+)?)(?:\+(sha224|sha256|sha384|sha512)\.([\da-f]+))?)?$/.exec(spec);
+  const pin = /^(npm|pnpm)(?:@(\d+\.\d+\.\d+(?:-[\w.-]+)?)(?:\+(sha224|sha256|sha384|sha512)\.([\da-fA-F]+))?)?$/.exec(spec);
   if (!pin || pin[1] !== manager) throw new Error('invalid packageManager declaration: ' + spec);
   if (manager === 'npm' && !pin[3]) {
     const bundled = path.join(tools, 'node/aliases/default/lib/node_modules/npm/package.json');
