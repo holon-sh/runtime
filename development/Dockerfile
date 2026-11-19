@@ -18,13 +18,9 @@ FROM ghcr.io/holon-sh/development@sha256:799756844538e51f867b2ecb0f82bd311a2090a
 
 FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libatomic1 netbase tzdata && rm -rf /var/lib/apt/lists/*
-RUN --mount=from=cache,target=/donor set -eu; cd /donor; \
-    cp -a --parents opt/uv/python usr/local/bin/python3.* /; hardlink /opt/uv/python
-RUN --mount=from=cache,target=/donor set -eu; cd /donor; \
-    cp -a --parents usr/local/bin/node usr/local/bin/npm usr/local/bin/npx usr/local/bin/pnpm usr/local/bin/pnpx usr/local/include/node \
-      usr/local/lib/node_modules/npm usr/local/lib/node_modules/pnpm usr/local/bin/uv usr/local/bin/uvx /; \
-    node=/opt/holon/node/versions/$(node --version); mkdir -p "$node"; ln -s /usr/local "$node/installation"; \
-    hardlink /usr/local
+RUN --mount=from=cache,source=/opt,target=/donor cp -a /donor/. /opt/ && hardlink /opt
+RUN --mount=from=cache,source=/usr/local,target=/donor cp -a /donor/. /usr/local/ && hardlink /usr/local \
+    && version=/opt/holon/node/versions/$(node --version) && mkdir -p "$version" && ln -s /usr/local "$version/installation"
 COPY --from=fnm /out/fnm /usr/local/bin/fnm
 COPY --from=runtime /holon-mcp-runtime /holon-mcp-runtime
 COPY development/resolve.cjs /usr/local/lib/holon/resolve.cjs
