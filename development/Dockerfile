@@ -7,14 +7,15 @@ COPY host host
 ARG TARGETARCH
 RUN CGO_ENABLED=0 GOARCH=$TARGETARCH go build -trimpath -buildvcs=false -ldflags='-s -w' -o /holon-mcp-runtime ./cmd/holon-mcp-runtime
 
-# Carry the interpreters and package managers shipped in the previous release.
-FROM ghcr.io/holon-sh/development@sha256:799756844538e51f867b2ecb0f82bd311a2090a8bf476c11141778509742975a AS cache
-FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libatomic1 netbase tzdata && rm -rf /var/lib/apt/lists/*
-RUN --mount=from=cache,target=/donor cd /donor && cp -a --parents opt usr/local / && hardlink /opt /usr/local
+FROM node:24.22.0-bookworm-slim@sha256:91acba91b842bec0bf7ea6f5e09c644c7ccad72c4996ed9616d861d1c7cd60d4
+RUN apt-get update && apt-get install -y ca-certificates netbase && rm -rf /var/lib/apt/lists/*
+COPY --from=ghcr.io/astral-sh/uv:0.13.1@sha256:4a1f3666816dafadd20ceb71eac9a7d56d7ef30279f7d64048519ab901ada336 /uv /uvx /usr/local/bin/
+ENV UV_COMPILE_BYTECODE=1 PYTHONDONTWRITEBYTECODE=1
+RUN UV_PYTHON_INSTALL_DIR=/opt/uv/python UV_PYTHON_BIN_DIR=/usr/local/bin uv python install 3.13 3.15 \
+ && npm install -g pnpm@10.34.9 && npm cache clean --force && chmod -R a+rX /opt/uv
 COPY --from=runtime /holon-mcp-runtime /holon-mcp-runtime
-ENV HOME=/app XDG_CACHE_HOME=/app/.cache HOLON_RELOAD_DIR=/app/source UV_PYTHON_INSTALL_DIR=.toolchain/python \
-    UV_COMPILE_BYTECODE=1 PYTHONDONTWRITEBYTECODE=1 npm_config_cache=/app/.cache/npm \
+ENV HOME=/app npm_config_cache=/app/.cache/npm \
+    UV_PYTHON_INSTALL_DIR=/app/source/.toolchain/python HOLON_RELOAD_DIR=/app/source \
     npm_config_audit=false npm_config_fund=false npm_config_update_notifier=false
 WORKDIR /app
 USER 10001:10001
