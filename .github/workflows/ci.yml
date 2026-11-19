@@ -42,7 +42,7 @@ jobs:
             --tmpfs /tmp:uid=10001,gid=10001,size=64m -p 127.0.0.1::3000 development)
           trap 'docker rm -f "$container" >/dev/null' EXIT
           url=http://$(docker port "$container" 3000/tcp)
-          curl --fail-with-body -sS --retry 2 --retry-connrefused --max-time 180 \
+          curl --fail-with-body -sS --retry 2 --retry-all-errors --max-time 180 \
             -H 'Content-Type: application/vnd.holon.source-overlay.v0.tar+zstd' --data-binary @../source.tar.zst "$url/.holon/reload"
           lts=$(curl -fsS --max-time 30 https://nodejs.org/dist/index.json | jq -er 'first(.[] | select(.lts)).version')
           curl -fsS "$url" | grep -Fx "10001 $lts"
