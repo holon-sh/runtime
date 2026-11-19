@@ -15,12 +15,16 @@ RUN unzip -q /fnm-$TARGETARCH.zip -d /out && chmod 0755 /out/fnm
 
 # Seed optional resolver caches from the donor's installed toolchains.
 FROM ghcr.io/holon-sh/development@sha256:799756844538e51f867b2ecb0f82bd311a2090a8bf476c11141778509742975a AS cache
+FROM node:lts-trixie-slim@sha256:e6bedef217677b276c591795e169840edd9096dbf13f29df8ef8d1856b8820bc AS lts
 
 FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libatomic1 netbase tzdata && rm -rf /var/lib/apt/lists/*
 RUN --mount=from=cache,source=/opt,target=/donor cp -a /donor/. /opt/ && hardlink /opt
 RUN --mount=from=cache,source=/usr/local,target=/donor cp -a /donor/. /usr/local/ && hardlink /usr/local \
     && version=/opt/holon/node/versions/$(node --version) && mkdir -p "$version" && ln -s /usr/local "$version/installation"
+RUN --mount=from=lts,source=/usr/local,target=/donor set -eu; cd /donor; \
+    target=/opt/holon/node/versions/$(bin/node --version)/installation; \
+    if [ ! -e "$target" ]; then mkdir -p "$target"; cp -a --parents bin/node bin/npm bin/npx lib/node_modules/npm include/node "$target/"; fi
 COPY --from=fnm /out/fnm /usr/local/bin/fnm
 COPY --from=runtime /holon-mcp-runtime /holon-mcp-runtime
 COPY development/resolve.cjs /usr/local/lib/holon/resolve.cjs
