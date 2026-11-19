@@ -111,6 +111,8 @@ func run(t *testing.T, record *runtimecontract.OverlayRecord) *running {
 func setup(t *testing.T, port, root string, record *runtimecontract.OverlayRecord) {
 	t.Setenv("PORT", port)
 	t.Setenv(reloadDirEnv, root)
+	t.Setenv("UV_PYTHON_INSTALL_DIR", filepath.Join(root, ".toolchain", "python"))
+	t.Setenv("FNM_DIR", filepath.Join(root, ".toolchain", "node"))
 	t.Setenv(runtimecontract.OverlayFileEnv, "")
 	if record != nil {
 		file := filepath.Join(t.TempDir(), "overlay")

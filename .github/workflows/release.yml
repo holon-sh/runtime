@@ -23,14 +23,16 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      - uses: oras-project/setup-oras@v2
+      - name: Publish the development image
+        id: image
+        uses: docker/build-push-action@v7
         with:
-          version: 1.3.1
-      - name: Publish the worker and its production bases
-        env:
-          IMAGE: ghcr.io/holon-sh/development:${{ github.ref_name }}
-        run: |
-          digest=$(python3 development/package.py "$RUNNER_TEMP/development")
-          oras cp --from-oci-layout "$RUNNER_TEMP/development/release:release" "$IMAGE"
-          test "$(oras resolve "$IMAGE")" = "$digest"
-          echo "ghcr.io/holon-sh/development@$digest" >> "$GITHUB_STEP_SUMMARY"
+          context: .
+          file: development/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/holon-sh/development:${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Report the digest the holon chart pins
+        run: echo "ghcr.io/holon-sh/development@${{ steps.image.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
