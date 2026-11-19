@@ -12,11 +12,20 @@ jobs:
       matrix:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 35
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: holon-sh/cli
+          ref: 755f19bb78a017fd6dff35da741129ed719a811c
+          path: .cli
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: .cli/go.mod
       - uses: docker/login-action@v4
         with:
           registry: ghcr.io
