@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/holon-sh/protocol/runtimecontract"
@@ -25,6 +26,7 @@ type installation struct {
 type nodeProject struct {
 	manager, pin string
 	versions     [3]string
+	dev          nodeRanges
 }
 
 func (s *supervisor) environment() []string {
@@ -90,6 +92,7 @@ func (s *supervisor) nodeProject(commands [][]string) (nodeProject, error) {
 	var manifest struct {
 		PackageManager string
 		Engines        struct{ Node string }
+		DevEngines     struct{ Runtime nodeRanges }
 	}
 	data, err := os.ReadFile(filepath.Join(s.root, "package.json"))
 	if err == nil {
@@ -105,6 +108,7 @@ func (s *supervisor) nodeProject(commands [][]string) (nodeProject, error) {
 		}
 		project.pin = version
 	}
+	project.dev = manifest.DevEngines.Runtime
 	project.versions[2] = manifest.Engines.Node
 	for i, name := range []string{".nvmrc", ".node-version"} {
 		data, err := os.ReadFile(filepath.Join(s.root, name))
@@ -119,6 +123,30 @@ func (s *supervisor) nodeProject(commands [][]string) (nodeProject, error) {
 	return project, nil
 }
 
+// npm accepts one runtime declaration or several alternatives and evaluates
+// onFail itself. Only ranges for Node affect its installation.
+type nodeRanges []string
+
+func (ranges *nodeRanges) UnmarshalJSON(data []byte) error {
+	var alternatives []struct{ Name, Version string }
+	if data[0] != '[' {
+		data = slices.Concat([]byte{'['}, data, []byte{']'})
+	}
+	if err := json.Unmarshal(data, &alternatives); err != nil {
+		return err
+	}
+	for _, alternative := range alternatives {
+		if alternative.Name == "node" {
+			if alternative.Version == "" {
+				*ranges = nil
+				return nil
+			}
+			*ranges = append(*ranges, alternative.Version)
+		}
+	}
+	return nil
+}
+
 var managerVersion = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+(sha224|sha256|sha384|sha512)\.[A-Fa-f0-9]+)?$`)
 
 func (s *supervisor) resolveNode(ctx context.Context, node nodeProject, output io.Writer) error {
@@ -126,18 +154,14 @@ func (s *supervisor) resolveNode(ctx context.Context, node nodeProject, output i
 	if err := errors.Join(os.RemoveAll(managerDir), os.RemoveAll(filepath.Join(s.root, "node_modules"))); err != nil {
 		return err
 	}
-	install := []string{"fnm", "install", "--progress", "never"}
-	if node.versions == [3]string{} {
-		install = append(install, "--lts")
+	if err := os.MkdirAll(managerDir, 0o755); err != nil {
+		return err
 	}
-	if err := s.run(ctx, [][]string{install}, output); err != nil {
+	if err := s.installNode(ctx, node, managerDir, output); err != nil {
 		return err
 	}
 	if node.manager == "npm" && node.pin == "" {
 		return nil
-	}
-	if err := os.MkdirAll(managerDir, 0o755); err != nil {
-		return err
 	}
 	npm := func(args ...string) error {
 		cmd := s.command(ctx, append([]string{"npm"}, args...))
@@ -162,4 +186,25 @@ func (s *supervisor) resolveNode(ctx context.Context, node nodeProject, output i
 		}
 	}
 	return npm("install", "--global", "--prefix", managerDir, "--ignore-scripts", spec)
+}
+
+func (s *supervisor) installNode(ctx context.Context, node nodeProject, scratch string, output io.Writer) error {
+	install := []string{"fnm", "install", "--progress", "never"}
+	if node.versions != [3]string{} {
+		return s.run(ctx, [][]string{install}, output)
+	}
+	// fnm parses npm ranges from engines.node, including ranges its positional
+	// argument cannot express. Keep the project's manifest untouched.
+	for _, version := range node.dev {
+		manifest, _ := json.Marshal(map[string]any{"engines": map[string]string{"node": version}})
+		if err := os.WriteFile(filepath.Join(scratch, "package.json"), manifest, 0o600); err != nil {
+			return err
+		}
+		cmd := s.command(ctx, install)
+		cmd.Dir, cmd.Stdout, cmd.Stderr = scratch, output, output
+		if err := cmd.Run(); err == nil {
+			return nil
+		}
+	}
+	return s.run(ctx, [][]string{append(install, "--lts")}, output)
 }
