@@ -122,6 +122,21 @@ def proof(cli, baseline, work, stack):
         run(binary, "-test.run=^TestSourceImageContract$", env={**os.environ, "REGISTRY": host, "BASE_REPOSITORY": "base",
             "OVERLAY": str(overlay), **{k: str(v) for k, v in variables.items()}})
 
+    def direct_production(sample, expected):
+        # Measure the application separately from the kubelet's one-second probe.
+        ref = host+"/"+sample+":production"
+        run("docker", "pull", ref)
+        started = time.monotonic()
+        cid = run("docker", "run", "-d", "--read-only", "--user", "10001:10001",
+                  "--cap-drop", "ALL", "--network", "none", "--tmpfs", "/tmp:rw,exec,size=64m", ref)
+        try:
+            script = 'until test -s /tmp/runtime.json; do sleep 0.02; done; cat /tmp/runtime.json'
+            answer = json.loads(run("docker", "exec", cid, "timeout", "30", "sh", "-ec", script))
+            assert (answer["uid"], answer["version"], answer["marker"]) == (10001, expected, "saved"), answer
+            return time.monotonic()-started
+        finally:
+            run("docker", "rm", "-f", cid)
+
     def cache_image(ref):
         # The node imports the image. The app's network policy applies from its first instruction.
         ref = f"{registry}:5000/{ref}"
@@ -136,7 +151,10 @@ def proof(cli, baseline, work, stack):
             run("docker", "buildx", "build", "--platform", "linux/"+ARCH, "--provenance=true", "-t", "proof:base",
                 "--output", f"type=oci,dest={archive}", "-f", source/"development/Dockerfile", source)
         with tarfile.open(archive) as tar:
-            descriptor, = json.load(tar.extractfile("index.json"))["manifests"]
+            descriptors = json.load(tar.extractfile("index.json"))["manifests"]
+            if label == "base":
+                descriptors = [d for d in descriptors if d.get("annotations", {}).get("org.opencontainers.image.ref.name") == "release"]
+            descriptor, = descriptors
             assert descriptor["mediaType"] == "application/vnd.oci.image.index.v1+json", descriptor
             base_digest = descriptor["digest"]
             def blob(digest):
@@ -351,7 +369,7 @@ def proof(cli, baseline, work, stack):
             answer = request(url+"/runtime.json")
             assert answer["version"] == expected and answer["marker"] == marker and answer["uid"] == 10001, answer
 
-        for rep in range(3):
+        for rep in range(5):
             variants = [("dev20", old_base, "oldbase"), ("candidate", base, "base")]
             if rep % 2:
                 variants.reverse()
@@ -396,6 +414,12 @@ def proof(cli, baseline, work, stack):
                 measurements["production_ready_and_observed"] = time.monotonic()-began
                 measurements["deploy_total"] = sum(measurements[k] for k in
                     ["build_pod_ready","deploy_cli_and_freeze","cli_assemble","pull_assembled","production_ready_and_observed"])
+                if side == "candidate":
+                    absent = ["/holon-mcp-runtime", "/usr/local/bin/fnm", "/usr/local/bin/uv", "/opt/holon/managers"]
+                    absent.append("/opt/uv/python" if app == "node" else "/opt/holon/node")
+                    run("kubectl", "exec", production, "--", "sh", "-ec",
+                        'for file do test ! -e "$file"; done', "check-production", *absent)
+                measurements["direct_offline_start_and_marker"] = direct_production(sample, expected)
                 elapsed = {key: round(value, 3) for key, value in measurements.items()}
                 print("BENCH", ARCH, app, side, rep+1, json.dumps(elapsed), flush=True)
                 run("kubectl", "delete", "pod", build, production, "--wait=false")
