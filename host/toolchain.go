@@ -1,6 +1,7 @@
 package host
 
 import (
+	"cmp"
 	"context"
 	"embed"
 	"encoding/json"
@@ -206,14 +207,10 @@ func (s *supervisor) resolveNode(ctx context.Context, node nodeProject, output i
 // consulting fnm. Ranges and the LTS default must see the current upstream index.
 func (s *supervisor) selectNode(ctx context.Context, node nodeProject, scratch string, output io.Writer) error {
 	selected := filepath.Join(s.root, toolchainDir, "node")
-	for _, version := range node.versions {
-		if version != "" {
-			cached := nodeVersions + "/v" + strings.TrimPrefix(version, "v") + "/installation"
-			if cache.Bases[cached] != "" {
-				return link(cached, selected)
-			}
-			break
-		}
+	version := cmp.Or(node.versions[0], node.versions[1], node.versions[2], string(node.dev))
+	cached := nodeVersions + "/v" + strings.TrimPrefix(version, "v") + "/installation"
+	if cache.Bases[cached] != "" {
+		return link(cached, selected)
 	}
 	tree, err := os.MkdirTemp(filepath.Dir(s.root), ".fnm-")
 	if err != nil {
