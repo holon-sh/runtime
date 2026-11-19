@@ -2,13 +2,11 @@
 
 ## Building
 
-Run `go test ./...` to test the supervisor. To build the release image for Linux amd64 and arm64, install Docker Buildx, ORAS, and Python. Run the command from the repository root.
+Run `go test -race ./...` to test the supervisor. Build the development image with Docker Buildx.
 
 ```sh
-python3 development/package.py out/development
+docker buildx build --platform linux/amd64,linux/arm64 -f development/Dockerfile .
 ```
-
-The command writes an OCI layout at `out/development/release` with the tag `release`. It contains the source worker and the production bases the CLI selects when assembling an app.
 
 ## Community
 
