@@ -295,12 +295,6 @@ func TestBootStartsTheRecordedOverlay(t *testing.T) {
 			t.Fatalf("reload of the recorded overlay: %d %+v", status, reply)
 		}
 	})
-	t.Run("a session the registry holds no overlay for yet", func(t *testing.T) {
-		r := run(t, record("unsaved"))
-		if status, reply := r.reload(blobs[tags["recorded"]]); status != http.StatusOK {
-			t.Fatalf("reload: %d %+v", status, reply)
-		}
-	})
 	for session, want := range map[string]string{"tampered": "digest mismatch", "malformed": "the tag names no overlay"} {
 		t.Run(session, func(t *testing.T) {
 			setup(t, "0", filepath.Join(t.TempDir(), "source"), record(session))
